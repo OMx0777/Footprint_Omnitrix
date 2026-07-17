@@ -17,6 +17,21 @@
     --btn-color: #131722;
     --green-body: #089981;
     --red-body: #f23645;
+    --panel-bg: #f8f9fd;
+}
+
+body.dark-theme {
+    --bg-color: #131722;
+    --text-color: #d1d4dc;
+    --text-muted: #787b86;
+    --header-bg: #1e222d;
+    --border-color: #2a2e39;
+    --highlight: #2962FF;
+    --select-bg: #1e222d;
+    --select-hover: #2a2e39;
+    --btn-bg: #2a2e39;
+    --btn-color: #d1d4dc;
+    --panel-bg: #1e222d;
 }
 
 body {
@@ -65,6 +80,33 @@ body {
 
 .symbol-search:hover, .timeframe-selector:hover {
     background-color: var(--select-hover);
+}
+
+.mode-selector {
+    display: flex;
+    align-items: center;
+    background: var(--panel-bg);
+    border-radius: 6px;
+    padding: 2px;
+    gap: 2px;
+}
+.mode-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    border-radius: 4px;
+    cursor: pointer;
+    user-select: none;
+    transition: all 0.2s;
+}
+.mode-btn:hover {
+    color: var(--text-color);
+}
+.mode-btn.active {
+    background: var(--bg-color);
+    color: var(--text-color);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.1);
 }
 
 .icon-search {
@@ -124,3 +166,50 @@ canvas {
     width: 100%;
     height: 100%;
 }
+
+.theme-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--text-color);
+}
+.theme-toggle:hover {
+    background-color: var(--select-hover);
+}
+
+.sidebar-left {
+    width: 52px;
+    background-color: var(--header-bg);
+    border-right: 1px solid var(--border-color);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding-top: 8px;
+    gap: 8px;
+    z-index: 5;
+}
+.tool-btn {
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--text-muted);
+}
+.tool-btn:hover {
+    background-color: var(--select-hover);
+    color: var(--text-color);
+}
+.tool-btn.active {
+    color: var(--highlight);
+    background-color: rgba(41, 98, 255, 0.1);
+}
+
+
+
