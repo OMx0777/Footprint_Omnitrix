@@ -51,10 +51,11 @@
             <div class="tool-btn" title="Trend Line"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="7" y1="17" x2="17" y2="7"/></svg></div>
             <div class="tool-btn" title="Horizontal Ray"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/></svg></div>
         </div>
-        <div class="chart-container">
-            <canvas id="footprint-canvas"></canvas>
+        <div class="chart-container" id="chart-container">
+            <!-- LWC will be injected here -->
         </div>
     </div>
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
     <script src="app.js"></script>
 </body>
 </html>
