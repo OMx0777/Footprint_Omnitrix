@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Omnitrix Footprint Charts</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="light-theme">
+    <div class="toolbar-top">
+        <div class="toolbar-section">
+            <div class="symbol-search">
+                <div class="icon-search">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18"><path fill="currentColor" d="M12.5 11h-.79l-.28-.27A6.471 6.471 0 0 0 13 6.5 6.5 6.5 0 1 0 6.5 13c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L17.49 16l-4.99-5zm-6 0C4.01 11 2 8.99 2 6.5S4.01 2 6.5 2 11 4.01 11 6.5 8.99 11 6.5 11z"/></svg>
+                </div>
+                <select id="symbol-select">
+                    <option value="">Waiting for data...</option>
+                </select>
+            </div>
+            <div class="divider"></div>
+            <div class="timeframe-selector">
+                <select id="timeframe-select">
+                    <option value="1">1m</option>
+                    <option value="5">5m</option>
+                    <option value="15">15m</option>
+                    <option value="30">30m</option>
+                    <option value="60">1h</option>
+                </select>
+            </div>
+        </div>
+        <div class="toolbar-section">
+            <div id="status" class="status disconnected">Disconnected</div>
+        </div>
+    </div>
+    <div class="main-content">
+        <div class="chart-container">
+            <canvas id="footprint-canvas"></canvas>
+        </div>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>
