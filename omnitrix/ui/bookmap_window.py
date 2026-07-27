@@ -104,7 +104,7 @@ class BookmapWindow(QMainWindow):
         tb.addWidget(self.btn_in)
 
         self.setStyleSheet(
-            "QMainWindow{background:#000000;}"
+            "QMainWindow{background:#1A2226;}"
             "QToolBar{background:#0C111A;border:none;padding:4px;spacing:4px;}"
             "QLabel{color:#C7CCD6;font-size:13px;font-weight:600;}"
             "QComboBox{background:#1C2230;color:#EFEFEF;border:1px solid #2A3140;"

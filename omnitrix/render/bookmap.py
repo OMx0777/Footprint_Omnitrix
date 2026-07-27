@@ -18,37 +18,59 @@ from PyQt6.QtCore import QRectF, QPointF, Qt
 from PyQt6.QtGui import (QColor, QPainter, QFont, QPen, QBrush, QRadialGradient,
                          QImage)
 
-# Bookmap draws executions as flat, semi-transparent volume dots — green for
-# aggressive buys, red for aggressive sells — over a black field. They are not
-# shaded spheres: a gradient reads as a 3D bauble and fights the heatmap for
-# attention, which is exactly what made this pane look unlike the real product.
-BUY_BUBBLE = QColor(64, 232, 140)      # green — lifted the ask
-SELL_BUBBLE = QColor(238, 74, 88)      # red   — hit the bid
-BID_LINE = QColor(126, 178, 250)
-ASK_LINE = QColor(246, 104, 118)
+# Sampled from a real Bookmap ESU6:CME capture, not chosen by eye.
+#
+# Executions are shaded spheres with a highlight, NOT flat discs — measured by
+# taking a radial cut through a bubble: luminance runs 30 -> 150 -> 92 across
+# the diameter, which a flat fill cannot produce. Colours are the measured
+# green/red pair.
+BUY_BUBBLE = QColor(54, 179, 109)      # #36B36D — lifted the ask
+SELL_BUBBLE = QColor(242, 82, 66)      # #F25242 — hit the bid
+# Best bid / best ask trace the same aggression palette, a little deeper so the
+# stepped channel reads under the dots rather than competing with them.
+BID_LINE = QColor(47, 168, 95)
+ASK_LINE = QColor(224, 74, 60)
 
-# Bookmap's canvas is black. The previous deep-blue field was chosen so the
-# uncovered price area would blend with the ramp's zero stop, but it also
-# swallowed the bottom third of the scale and gave the whole pane a blue cast
-# the real product does not have. Black plus a ramp that starts near-black
-# keeps the field seamless *and* restores the full dynamic range.
-BOOKMAP_BG = "#000000"
+# The empty book is #1A2226 — a very dark blue-grey, not pure black. Sampled
+# from several genuinely empty regions of the capture; the quantised mode of the
+# whole field agrees at #181824. Pure black made the uncovered area read as a
+# hole punched in the chart.
+BOOKMAP_BG = "#1A2226"
 
 
 def _build_bookmap_lut() -> list[QColor]:
-    # Bookmap's thermal ramp: near-black -> blue -> cyan -> green -> yellow ->
-    # orange -> white-hot. Ordinary resting size sits in the blue/cyan band and
-    # only genuine walls burn through to yellow and white, which is what gives
-    # the real heatmap its black canvas with bright liquidity threads.
+    """Bookmap's measured thermal ramp.
+
+    Two things the eyeballed version got wrong, both corrected from the capture:
+
+      * **There is no green in the field.** A hue census over the heat area
+        returns blue 54%, red 4.6%, yellow/orange 4.0%, white 1.6% and green
+        0.8% — and that 0.8% is the trade dots, not liquidity.
+      * **The top of the ramp is RED (252,12,0), not white.** White sits in the
+        upper-middle, *below* yellow: the measured wall bands run
+        #E7EBE5 -> #FFFB00 -> #FFA500 -> #FF2900 as size rises.
+
+    The blues are cyan-toned, not royal: the red channel is ~0 throughout while
+    green climbs 36->180 and blue 48->216, so the field is an azure ramp. Over
+    half the ramp's length is blue because that is where the ordinary book
+    actually lives (measured mode: rgb(0,96,132)..rgb(0,120,180)).
+    """
     stops = [
-        (0.00, (6, 10, 20)),       # effectively background — empty/thin book
-        (0.18, (16, 42, 96)),      # thin book
-        (0.38, (24, 96, 190)),     # ordinary resting size
-        (0.56, (30, 172, 196)),    # building
-        (0.72, (86, 206, 110)),    # notable
-        (0.85, (238, 214, 66)),    # heavy
-        (0.94, (246, 138, 42)),    # hot spot
-        (1.00, (255, 250, 240)),   # white-hot — wall
+        (0.00, (26, 34, 38)),      # #1A2226 — empty book (== background)
+        (0.08, (12, 36, 48)),      # faintest resting size
+        (0.18, (12, 48, 60)),
+        (0.28, (12, 60, 84)),
+        (0.38, (0, 84, 120)),      # ordinary book — the field's mode
+        (0.48, (0, 96, 144)),
+        (0.58, (0, 120, 180)),
+        (0.66, (0, 132, 192)),
+        (0.72, (48, 156, 204)),    # building
+        (0.78, (96, 180, 216)),
+        (0.83, (180, 216, 228)),   # pale
+        (0.87, (228, 228, 228)),   # white
+        (0.91, (240, 240, 84)),    # yellow
+        (0.95, (252, 108, 0)),     # orange
+        (1.00, (252, 12, 0)),      # red — the heaviest wall
     ]
     lut: list[QColor] = []
     for i in range(256):
@@ -161,12 +183,13 @@ class BookHeatmapItem(_BufItem):
     def __init__(self, tick: float):
         super().__init__(tick)
         self.alpha = 255
-        # Contrast exponent applied AFTER the log normalise. log1p alone maps an
-        # ordinary 900-share level against a 40k wall to ~0.64 of the ramp, so
-        # the entire book rendered as bright cyan and nothing stood out. >1
-        # pushes routine depth back down into the navy floor and leaves the top
-        # of the ramp for real walls, which is how the real heatmap reads.
-        self.gamma = 1.8
+        # Contrast exponent applied AFTER the log normalise. Tuned against the
+        # reference capture rather than by eye: there the ordinary book sits at
+        # luminance 68-99, i.e. ~0.45-0.55 of this ramp, and is plainly blue —
+        # NOT pushed down into the floor. log1p alone puts a typical level near
+        # 0.64, so only a mild correction is wanted. (1.8 was far too strong and
+        # crushed the routine book to near-black.)
+        self.gamma = 1.15
         self._buf = None   # kept alive: QImage wraps this memory, never copies
         self.setZValue(-20)
 
@@ -373,20 +396,30 @@ class BubbleItem(_BufItem):
 
     @staticmethod
     def _sphere(p: QPainter, pt: QPointF, r: float, base: QColor) -> None:
-        """A Bookmap volume dot: flat, semi-transparent, thin brighter rim.
+        """A Bookmap volume dot: a shaded sphere with a top-left highlight.
 
-        Translucency is the point — overlapping prints at the same price
-        accumulate into a denser blob, which is how a burst of aggression reads
-        on the real chart. The old shaded-sphere styling made every print look
-        like a discrete 3D marble and hid that.
+        Measured, not assumed. A radial cut through a bubble in the reference
+        capture gives luminance 30 -> 83 -> 150 -> 96 -> 92 across the diameter,
+        with the peak offset from centre — that is a lit sphere. A flat disc
+        would be constant. Slight translucency lets overlapping prints build up
+        without hiding the liquidity field behind them.
         """
-        fill = QColor(base.red(), base.green(), base.blue(), 165)
-        p.setBrush(QBrush(fill))
-        if r < 3.0:
+        if r < 2.5:
+            # Below a few pixels the gradient is not resolvable, and building one
+            # per bubble on a dense tape is pure cost.
+            p.setBrush(QBrush(base))
             p.setPen(Qt.PenStyle.NoPen)
-        else:
-            rim = base.lighter(125)
-            p.setPen(QPen(QColor(rim.red(), rim.green(), rim.blue(), 210), 1.0))
+            p.drawEllipse(pt, r, r)
+            return
+        grad = QRadialGradient(pt.x() - r * 0.35, pt.y() - r * 0.4, r * 1.5)
+        hi = base.lighter(160)
+        grad.setColorAt(0.0, QColor(min(255, hi.red()), min(255, hi.green()),
+                                    min(255, hi.blue()), 245))
+        grad.setColorAt(0.45, QColor(base.red(), base.green(), base.blue(), 225))
+        dk = base.darker(180)
+        grad.setColorAt(1.0, QColor(dk.red(), dk.green(), dk.blue(), 215))
+        p.setBrush(QBrush(grad))
+        p.setPen(QPen(QColor(dk.red(), dk.green(), dk.blue(), 230), 0.6))
         p.drawEllipse(pt, r, r)
 
 

@@ -33,10 +33,8 @@ class HeatmapItem(pg.GraphicsObject):
         # BEHIND the footprint clusters and must not compete with them. At full
         # opacity the shared ramp swamped the cells it is meant to contextualise.
         self.alpha = 150
-        # >1 so routine depth stays in the navy floor and only walls burn
-        # through — matches BookHeatmapItem. (Was 0.55, which lifted everything
-        # into the bright half of the ramp and washed the field out.)
-        self.gamma = 1.8
+        # Matches BookHeatmapItem, which is tuned against a real Bookmap capture.
+        self.gamma = 1.15
         self._bounds = QRectF()
         self.setZValue(-10)        # behind the footprint
 
