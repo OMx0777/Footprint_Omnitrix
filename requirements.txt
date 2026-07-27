@@ -1,0 +1,7 @@
+# Core GUI + charting
+PyQt6>=6.6
+pyqtgraph>=0.13
+numpy>=1.24
+
+# Live Takion named pipes (Windows only; not needed for synthetic/replay mode)
+pywin32>=306 ; sys_platform == "win32"

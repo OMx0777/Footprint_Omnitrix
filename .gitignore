@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Captured sessions (Recorder output) — data, not source
+*.omni
+
+# Logs / scratch
+*.log
+output.log
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
