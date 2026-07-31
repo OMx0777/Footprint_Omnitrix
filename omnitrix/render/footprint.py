@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pyqtgraph as pg
 from PyQt6.QtCore import QRectF, QPointF, Qt
-from PyQt6.QtGui import QFont, QColor, QPainter
+from PyQt6.QtGui import QFont, QColor, QPainter, QFontMetrics
 
 from .theme import Theme, DARK
 
@@ -22,6 +22,9 @@ from .theme import Theme, DARK
 class FootprintItem(pg.GraphicsObject):
     BOX_W = 0.66                      # column block width in x-units
     CANDLE_GAP = 0.06                 # gap between candle and block
+    # Narrower than this (screen px across the whole block) and no cell label
+    # can fit, so skip the text pass entirely rather than emit clipped digits.
+    MIN_LABEL_PX = 26.0
 
     def __init__(self, tick: float, theme: Theme = DARK):
         super().__init__()
@@ -38,6 +41,11 @@ class FootprintItem(pg.GraphicsObject):
         self.stacked_min = 3
         self.va_pct = 0.70
         self.font = QFont("Consolas", 8, QFont.Weight.Bold)
+        # User toggle for every number on the chart (cells, profile/delta
+        # values, and the per-bar delta/volume footer). Some readers want the
+        # shapes only.
+        self.show_numbers = True
+        self._fm = QFontMetrics(self.font)
         self._bounds = QRectF()
 
     # ---- external setters ------------------------------------------------
@@ -109,7 +117,17 @@ class FootprintItem(pg.GraphicsObject):
         if vb is None:
             return
         px_w, px_h = vb.viewPixelSize()
-        show_text = px_h < tick * 0.72          # only label when rows are tall enough
+        # Label only when a number will actually FIT, vertically AND
+        # horizontally. Testing row height alone was why numbers appeared
+        # half-drawn: a row can be tall enough while its column is far too
+        # narrow, and Qt then clips the string mid-digit rather than dropping
+        # it. Everything downstream re-checks the exact string against the exact
+        # rect, so a wide value is omitted instead of being cut in half.
+        self._fm = QFontMetrics(self.font)
+        box_px = self.BOX_W / max(px_w, 1e-12)
+        show_text = (self.show_numbers
+                     and px_h < tick * 0.72
+                     and box_px >= self.MIN_LABEL_PX)
 
         xr = vb.viewRange()[0]
         x_lo = max(0, int(xr[0]) - 1)
@@ -219,23 +237,44 @@ class FootprintItem(pg.GraphicsObject):
         if show_text:
             self._paint_footer(p, tr, x, bar, half, tick)
 
+    def _fits(self, rect: QRectF, text: str) -> bool:
+        """Does `text` fit inside `rect` (screen px) without being clipped?
+
+        Qt happily draws a partial glyph when the rect is too small, which is
+        exactly the "numbers show up half" symptom. One space of padding each
+        side keeps adjacent columns from reading as a single run of digits.
+        """
+        fm = self._fm
+        return (rect.width() >= fm.horizontalAdvance(text) + 2
+                and rect.height() >= fm.height() - 2)
+
     def _cell_two(self, p, tr, x, y, tick, half, sell_v, buy_v, color) -> None:
+        rb = tr.mapRect(QRectF(x - half, y, half - 0.05, tick))
+        ra = tr.mapRect(QRectF(x + 0.05, y, half - 0.05, tick))
+        s_txt, b_txt = _fmt(sell_v), _fmt(buy_v)
+        s_ok, b_ok = self._fits(rb, s_txt), self._fits(ra, b_txt)
+        if not (s_ok or b_ok):
+            return
         p.save()
         p.resetTransform()
         p.setFont(self.font)
         p.setPen(pg.mkPen(color))
-        rb = tr.mapRect(QRectF(x - half, y, half - 0.05, tick))
-        ra = tr.mapRect(QRectF(x + 0.05, y, half - 0.05, tick))
-        p.drawText(rb, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, _fmt(sell_v))
-        p.drawText(ra, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, _fmt(buy_v))
+        if s_ok:
+            p.drawText(rb, Qt.AlignmentFlag.AlignVCenter
+                       | Qt.AlignmentFlag.AlignRight, s_txt)
+        if b_ok:
+            p.drawText(ra, Qt.AlignmentFlag.AlignVCenter
+                       | Qt.AlignmentFlag.AlignLeft, b_txt)
         p.restore()
 
     def _cell_one(self, p, tr, x, y, tick, half, text, color, align_left=False) -> None:
+        r = tr.mapRect(QRectF(x - half + 0.03, y, self.BOX_W - 0.06, tick))
+        if not self._fits(r, text):
+            return
         p.save()
         p.resetTransform()
         p.setFont(self.font)
         p.setPen(pg.mkPen(color))
-        r = tr.mapRect(QRectF(x - half + 0.03, y, self.BOX_W - 0.06, tick))
         align = (Qt.AlignmentFlag.AlignVCenter |
                  (Qt.AlignmentFlag.AlignLeft if align_left else Qt.AlignmentFlag.AlignHCenter))
         p.drawText(r, align, text)
@@ -252,17 +291,30 @@ class FootprintItem(pg.GraphicsObject):
 
     def _paint_footer(self, p, tr, x, bar, half, tick) -> None:
         t = self.theme
-        r = tr.mapRect(QRectF(x - half, bar.low - tick * 2, self.BOX_W, tick * 2))
+        # Anchored to the bar's low in screen space and stacked by real font
+        # metrics. The old version offset by a hardcoded 10 px and 26 px, which
+        # only lined up at one font size and one zoom - at others the delta
+        # collided with the block above it or with the volume line below.
+        fm = self._fm
+        line = fm.height() + 1
+        base = tr.map(QPointF(float(x), bar.low - tick)).y()
+        w = tr.mapRect(QRectF(x - half, 0.0, self.BOX_W, tick)).width()
+        cx = tr.map(QPointF(float(x), 0.0)).x()
+
+        d = bar.delta
+        rows = ((f"Δ {'+' if d > 0 else ''}{_fmt(d)}",
+                 t.delta_up if d >= 0 else t.delta_dn),
+                (_fmt(bar.volume), t.cell_text))
         p.save()
         p.resetTransform()
         p.setFont(self.font)
-        d = bar.delta
-        p.setPen(pg.mkPen(t.delta_up if d >= 0 else t.delta_dn))
-        p.drawText(r.adjusted(0, 10, 0, 0), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter,
-                   f"Δ {'+' if d > 0 else ''}{_fmt(d)}")
-        p.setPen(pg.mkPen(t.cell_text))
-        p.drawText(r.adjusted(0, 26, 0, 0), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter,
-                   _fmt(bar.volume))
+        for i, (text, colour) in enumerate(rows):
+            if fm.horizontalAdvance(text) + 2 > w:
+                continue                       # omit rather than overlap
+            r = QRectF(cx - w / 2, base + i * line, w, line)
+            p.setPen(pg.mkPen(colour))
+            p.drawText(r, Qt.AlignmentFlag.AlignTop
+                       | Qt.AlignmentFlag.AlignHCenter, text)
         p.restore()
 
 

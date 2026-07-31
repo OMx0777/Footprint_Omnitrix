@@ -37,12 +37,39 @@ def _norm(p1, p2) -> tuple[list[float], list[float]]:
 
 
 class _DrawTool(pg.ROI):
-    """Shared plumbing: repaint on move/resize and draw upright text."""
+    """Shared plumbing: repaint on move/resize, upright text, select + delete.
+
+    Every tool takes TWO DATA POINTS, never a point plus a size. Mixing the two
+    was the bug behind "the drawings are broken": `_norm` sorts its two
+    arguments as absolute coordinates, so a caller passing a delta placed the
+    box somewhere else entirely — `_norm([100, 550], [20, 5])` yields a box at
+    x=20..100 rather than 100..120. Fib passed points and behaved; Long, Short
+    and Volume Profile passed deltas and landed in the wrong place.
+    """
+
+    SEL_PEN = pg.mkPen("#FFC43C", width=2)
 
     def __init__(self, pos, size, **kw):
         kw.setdefault("pen", pg.mkPen("#5C9DFF", width=1))
+        # ROI ships a right-click "Remove" entry and the matching signal; the
+        # window wires it up. There was previously no way to delete one drawing
+        # short of clearing them all.
+        kw.setdefault("removable", True)
         super().__init__(pos, size, **kw)
+        # Not overriding acceptedMouseButtons: ROI derives it from `translatable`
+        # and forcing it here breaks dragging the shape.
+        self._base_pen = self.pen
+        self.selected = False
         self.sigRegionChanged.connect(self._changed)
+
+    def set_selected(self, on: bool) -> None:
+        """Amber outline + visible handles while selected, so it is obvious
+        which drawing Delete is about to remove."""
+        self.selected = on
+        self.setPen(self.SEL_PEN if on else self._base_pen)
+        for h in self.handles:
+            h["item"].setVisible(on)
+        self.update()
 
     def _changed(self, *_) -> None:
         self.prepareGeometryChange()
@@ -124,6 +151,8 @@ class PositionDrawer(_DrawTool):
     """
 
     def __init__(self, p1, p2, is_long: bool = True, **kw):
+        # p1/p2 are two DATA POINTS (see _DrawTool); passing a delta here was
+        # the placement bug.
         pos, size = _norm(p1, p2)
         super().__init__(pos, size, **kw)
         self.is_long = is_long

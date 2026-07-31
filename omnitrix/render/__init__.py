@@ -11,6 +11,7 @@ from .bookmap import (
 from .profile import TPOItem, VolumeProfileItem
 from .drawings import FibRetracement, PositionDrawer, FixedVolumeProfile
 from .indicators import EMAItem, CPRItem
+from .tape import TapePrintsItem, TapeSpeedItem, TapeCvdItem
 
 __all__ = [
     "Theme", "DARK", "LIGHT", "FootprintItem", "HeatmapItem", "TimeAxis",
@@ -18,5 +19,6 @@ __all__ = [
     "ProjectionItem", "DomLadderItem", "VolumeBarsItem", "SRLinesItem",
     "TPOItem", "VolumeProfileItem",
     "FibRetracement", "PositionDrawer", "FixedVolumeProfile",
-    "EMAItem", "CPRItem"
+    "EMAItem", "CPRItem",
+    "TapePrintsItem", "TapeSpeedItem", "TapeCvdItem",
 ]

@@ -14,7 +14,7 @@ from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QEvent
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QMainWindow, QToolBar, QLabel, QComboBox, QCheckBox, QPushButton, QWidget,
-    QSizePolicy, QDockWidget, QLineEdit,
+    QSizePolicy, QDockWidget, QLineEdit, QGraphicsRectItem,
 )
 
 from ..engine import (
@@ -27,6 +27,7 @@ from ..render import (
 )
 from .settings_dialog import SettingsDialog
 from .bookmap_window import BookmapWindow
+from .tape_window import TapeWindow
 from .profile_window import ProfileWindow
 from .analytics_window import AnalyticsWindow
 from .monitor_window import MarketMonitorWindow
@@ -194,6 +195,20 @@ class OmnitrixWindow(QMainWindow):
         self.chk_va.toggled.connect(lambda v: self.fp.set_show_va(v))
         tb.addWidget(self.chk_va)
 
+        self.chk_numbers = QCheckBox("Numbers")
+        self.chk_numbers.setChecked(True)
+        self.chk_numbers.setToolTip(
+            "Show the volume numbers inside cells and the per-bar delta/volume "
+            "footer — applies to Footprint, Cluster, Profile and Delta modes")
+        self.chk_numbers.toggled.connect(self._on_numbers)
+        tb.addWidget(self.chk_numbers)
+
+        self.chk_cvd = QCheckBox("CVD pane")
+        self.chk_cvd.setChecked(True)
+        self.chk_cvd.setToolTip("Show the cumulative-delta sub-chart")
+        self.chk_cvd.toggled.connect(self._on_cvd_pane)
+        tb.addWidget(self.chk_cvd)
+
         self.chk_vwap = QCheckBox("VWAP")
         self.chk_vwap.setChecked(True)
         self.chk_vwap.toggled.connect(self._on_vwap_toggled)
@@ -220,6 +235,12 @@ class OmnitrixWindow(QMainWindow):
         self.btn_bookmap = QPushButton("Bookmap")
         self.btn_bookmap.clicked.connect(self._open_bookmap)
         tb.addWidget(self.btn_bookmap)
+
+        self.btn_tape = QPushButton("Tape")
+        self.btn_tape.setToolTip("Tape reader: every print, speed and running "
+                                 "delta on one time axis")
+        self.btn_tape.clicked.connect(self._open_tape)
+        tb.addWidget(self.btn_tape)
 
         self.btn_profile = QPushButton("Profile")
         self.btn_profile.clicked.connect(self._open_profile)
@@ -265,6 +286,7 @@ class OmnitrixWindow(QMainWindow):
         self.active_drawing_tool = None
         self.drawing_items = []
         self._drawing_start_point = None
+        self._selected_drawing = None
 
         # A narrow glyph strip, as every charting terminal has. Full-word buttons
         # made this a 166 px column stealing a tenth of the window from the
@@ -380,6 +402,15 @@ class OmnitrixWindow(QMainWindow):
         self.price_plot.addItem(self.hline, ignoreBounds=True)
 
         self.glw.scene().sigMouseMoved.connect(self._on_mouse_move)
+        # Rubber band shown between the two creation clicks.
+        self._preview = QGraphicsRectItem()
+        self._preview.setPen(pg.mkPen("#5C9DFF", width=1,
+                                      style=Qt.PenStyle.DashLine))
+        self._preview.setBrush(pg.mkBrush(92, 157, 255, 26))
+        self._preview.setZValue(80)
+        self._preview.setVisible(False)
+        self.price_plot.addItem(self._preview)
+
         self.glw.scene().sigMouseClicked.connect(self._on_mouse_click)
         self.price_plot.getViewBox().sigRangeChangedManually.connect(self._on_view)
 
@@ -654,6 +685,22 @@ class OmnitrixWindow(QMainWindow):
 
     # ---- TradingView-style ticker search --------------------------------
     def keyPressEvent(self, ev) -> None:
+        key = ev.key()
+        # Delete/Backspace removes the selected drawing. Checked before the
+        # ticker search so the shortcuts cannot be swallowed by it.
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self._delete_selected_drawing():
+                return
+        if key == Qt.Key.Key_Escape:
+            # Escape unwinds one step at a time: abandon a half-drawn shape,
+            # else disarm the tool, else drop the selection.
+            if self._drawing_start_point is not None:
+                self._cancel_draw()
+            elif self.active_drawing_tool is not None:
+                self._set_drawing_tool(None)
+            elif self._selected_drawing is not None:
+                self._select_drawing(None)
+            return
         # Start typing a letter anywhere on the chart to open the ticker search.
         if not self.sym_search.isVisible():
             t = ev.text()
@@ -781,6 +828,15 @@ class OmnitrixWindow(QMainWindow):
             w.raise_(); w.activateWindow(); return
         self._register_child("monitor", MarketMonitorWindow(self, self))
 
+    def _open_tape(self) -> None:
+        sym = self.active_symbol
+        if not sym:
+            return
+        if (w := self._child(f"tape:{sym}")) is not None:
+            w.raise_(); w.activateWindow(); return
+        win = TapeWindow(self._bookmap(sym), self.instruments.tick(sym), self)
+        self._register_child(f"tape:{sym}", win)
+
     def _open_bookmap(self) -> None:
         self.open_bookmap_for(self.active_symbol or "QQQ")
 
@@ -855,47 +911,115 @@ class OmnitrixWindow(QMainWindow):
             mp = self.price_plot.vb.mapSceneToView(pos)
             self.vline.setPos(mp.x())
             self.hline.setPos(mp.y())
+            if self._drawing_start_point is not None:
+                self._update_preview(mp)
 
     def _on_mouse_click(self, ev) -> None:
-        if not self.active_drawing_tool:
-            return
-            
         pos = ev.scenePos()
         if not self.price_plot.sceneBoundingRect().contains(pos):
             return
-            
+        if ev.button() != Qt.MouseButton.LeftButton:
+            return
+
+        # Not drawing: a click on empty chart clears the selection. Clicks that
+        # land on a drawing never reach here (the ROI accepts them and emits
+        # sigClicked), so this cannot deselect the thing just clicked.
+        if not self.active_drawing_tool:
+            if self._selected_drawing is not None:
+                self._select_drawing(None)
+            return
+
         mp = self.price_plot.vb.mapSceneToView(pos)
-        
-        if ev.button() == Qt.MouseButton.LeftButton:
-            if not self._drawing_start_point:
-                # First click: set start point
-                self._drawing_start_point = mp
-            else:
-                # Second click: finalize drawing
-                end_point = mp
-                start = self._drawing_start_point
-                self._drawing_start_point = None
-                
-                # Instantiate correct drawing tool
-                item = None
-                if self.active_drawing_tool == "Fib":
-                    item = FibRetracement([start.x(), start.y()], [end_point.x(), end_point.y()])
-                elif self.active_drawing_tool == "Long":
-                    item = PositionDrawer([start.x(), start.y()], [end_point.x() - start.x(), end_point.y() - start.y()], is_long=True)
-                elif self.active_drawing_tool == "Short":
-                    item = PositionDrawer([start.x(), start.y()], [end_point.x() - start.x(), end_point.y() - start.y()], is_long=False)
-                elif self.active_drawing_tool == "VP":
-                    item = FixedVolumeProfile(
-                        [start.x(), start.y()], 
-                        [end_point.x() - start.x(), end_point.y() - start.y()], 
-                        self._get_bars_for_vp, 
-                        self.instruments.tick(self.active_symbol)
-                    )
-                
-                if item:
-                    self.price_plot.addItem(item)
-                    self.drawing_items.append(item)
-                    self._set_drawing_tool(None) # Auto-revert to cursor
+        if self._drawing_start_point is None:
+            self._drawing_start_point = mp
+            self._preview.setVisible(True)
+            self._update_preview(mp)
+            return
+
+        start, end = self._drawing_start_point, mp
+        self._cancel_draw()
+        # Degenerate box: a double-click or a stray second click at the same
+        # spot used to create a zero-size ROI that could not be grabbed or
+        # removed. Treat it as a cancel.
+        if abs(end.x() - start.x()) < 1e-9 and abs(end.y() - start.y()) < 1e-9:
+            return
+
+        p1 = [start.x(), start.y()]
+        p2 = [end.x(), end.y()]          # two POINTS — never a delta
+        tool = self.active_drawing_tool
+        if tool == "Fib":
+            item = FibRetracement(p1, p2)
+        elif tool == "Long":
+            item = PositionDrawer(p1, p2, is_long=True)
+        elif tool == "Short":
+            item = PositionDrawer(p1, p2, is_long=False)
+        elif tool == "VP":
+            item = FixedVolumeProfile(p1, p2, self._get_bars_for_vp,
+                                      self.instruments.tick(self.active_symbol))
+        else:
+            return
+
+        self.price_plot.addItem(item)
+        self.drawing_items.append(item)
+        item.sigRemoveRequested.connect(self._remove_drawing)
+        item.sigClicked.connect(lambda it, _e: self._select_drawing(it))
+        self._select_drawing(item)
+        self._set_drawing_tool(None)          # auto-revert to the cursor
+
+    # ---- drawing selection / lifecycle -----------------------------------
+    def _select_drawing(self, item) -> None:
+        if self._selected_drawing is item:
+            return
+        prev = self._selected_drawing
+        if prev is not None and prev in self.drawing_items:
+            prev.set_selected(False)
+        self._selected_drawing = item
+        if item is not None:
+            item.set_selected(True)
+
+    def _remove_drawing(self, item) -> None:
+        if item is self._selected_drawing:
+            self._selected_drawing = None
+        if item in self.drawing_items:
+            self.drawing_items.remove(item)
+        self.price_plot.removeItem(item)
+
+    def _delete_selected_drawing(self) -> bool:
+        if self._selected_drawing is None:
+            return False
+        self._remove_drawing(self._selected_drawing)
+        return True
+
+    def _cancel_draw(self) -> None:
+        """Drop a half-drawn shape and hide the preview."""
+        self._drawing_start_point = None
+        self._preview.setVisible(False)
+
+    def _update_preview(self, mp) -> None:
+        """Rubber band from the first click to the cursor.
+
+        Without it the first click produced no feedback at all, so the tool felt
+        dead until the second click committed a shape whose extent had been pure
+        guesswork.
+        """
+        s = self._drawing_start_point
+        if s is None:
+            return
+        x0, x1 = sorted((s.x(), mp.x()))
+        y0, y1 = sorted((s.y(), mp.y()))
+        self._preview.setRect(QRectF(x0, y0, max(x1 - x0, 1e-9),
+                                     max(y1 - y0, 1e-9)))
+
+    def _on_numbers(self, on: bool) -> None:
+        self.fp.show_numbers = on
+        self.fp.update()
+
+    def _on_cvd_pane(self, on: bool) -> None:
+        self.cvd_plot.setVisible(on)
+        # Collapse the row too: hiding the plot alone leaves its band reserved,
+        # so the price chart does not reclaim the space.
+        self.glw.ci.layout.setRowStretchFactor(1, 1 if on else 0)
+        self.glw.ci.layout.setRowMinimumHeight(1, 0)
 
     def _get_bars_for_vp(self, x_min, x_max):
         s = self.series.get(self.active_symbol) if self.active_symbol else None
@@ -910,19 +1034,25 @@ class OmnitrixWindow(QMainWindow):
 
     def _set_drawing_tool(self, tool_name):
         self.active_drawing_tool = tool_name
-        self._drawing_start_point = None
+        self._cancel_draw()
         for tool, btn in self._tool_buttons.items():
             btn.setChecked(tool == tool_name)
-        vb = self.price_plot.getViewBox()
-        if tool_name is None:
-            vb.setMouseMode(pg.ViewBox.PanMode)
-        else:
-            vb.setMouseMode(pg.ViewBox.RectMode) # Prevents dragging from panning the chart while drawing
+        # Stay in PanMode throughout.
+        #
+        # Arming a tool used to switch the ViewBox to RectMode, which made a
+        # left-drag draw a zoom rectangle instead of the shape - so the chart
+        # jumped to a random zoom in the middle of drawing. Creation here is
+        # click, move, click; the ViewBox never needs to change behaviour, and
+        # the chart stays pannable while a tool is armed.
+        self.price_plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
+        self.glw.setCursor(Qt.CursorShape.ArrowCursor if tool_name is None
+                           else Qt.CursorShape.CrossCursor)
 
     def _clear_drawings(self):
-        for item in self.drawing_items:
+        for item in list(self.drawing_items):
             self.price_plot.removeItem(item)
         self.drawing_items.clear()
+        self._selected_drawing = None
         self._set_drawing_tool(None)
 
     def _on_view(self) -> None:
