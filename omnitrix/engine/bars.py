@@ -180,7 +180,12 @@ class BarSeries:
         self.bars: list[Bar] = []
         self._bar_by_ts: dict[int, Bar] = {}    # start_ts -> bar, for O(1) book routing
         self._version = 0                       # bumps whenever base bars change
-        self._agg_cache: dict[int, tuple[int, list[Bar]]] = {}
+        self._agg_cache: dict[int, tuple[int, list[Bar], int]] = {}
+        # Per-timeframe dirty watermark: the earliest base-bar start_ts modified
+        # since that timeframe's aggregate was last built. Lets `view` rebuild
+        # only the affected tail instead of re-folding the whole session.
+        self._tf_dirty: dict[int, int] = {}
+        self._evicted = 0          # bumped when max_bars drops a bar off the front
         self._ov_cache: dict[int, tuple[tuple, tuple]] = {}
 
         # ---- O(1) running session stats -------------------------------------
@@ -237,6 +242,7 @@ class BarSeries:
                 late.add(tr.price, ti, tr.size, tr.aggressor)
                 late.seal()     # re-seal: add() dirtied an already-finished bar
                 self._stat_trade(tr)
+                self._touch(bucket)
                 self._version += 1
             return              # too late to place: not charted, not counted
 
@@ -249,9 +255,11 @@ class BarSeries:
             if len(self.bars) > self.max_bars:
                 old = self.bars.pop(0)
                 self._bar_by_ts.pop(old.start_ts, None)
+                self._evicted += 1        # invalidates every cached prefix
 
         self.bars[-1].add(tr.price, ti, tr.size, tr.aggressor)
         self._stat_trade(tr)
+        self._touch(bucket)
         self._version += 1
 
     def add_book(self, bk) -> None:
@@ -261,24 +269,16 @@ class BarSeries:
         bar = self._bar_by_ts.get(bucket)
         if bar is None:
             return
-        to_index = self.instruments.to_index
-        sym = self.symbol
         # Compact storage, for the same reason as BookmapBuffer - and the cost
         # here is larger. `max_bars` is 12,000, and at a 10-second base bar
         # every bar receives a sweep, so a dict-per-bar is ~283 MB per symbol
         # at the cap against ~28 MB as int32 arrays.
-        merged: dict[int, int] = {}
-        for price, size in bk.bids.items():
-            merged[to_index(sym, price)] = size
-        for price, size in bk.asks.items():
-            merged[to_index(sym, price)] = size
-        if merged:
-            ti = np.fromiter(merged.keys(), dtype=np.int32, count=len(merged))
-            sz = np.fromiter(merged.values(), dtype=np.int32, count=len(merged))
-            order = np.argsort(ti, kind="stable")
-            bar.book = PriceLadder(ti[order], sz[order])
-        else:
-            bar.book = EMPTY_LADDER
+        #
+        # Shares the snapshot's cached ladder, so on the normal path (bookmap
+        # first, then here) this costs a dict lookup rather than a second full
+        # conversion of the same book.
+        bar.book = bk.ladder(self.instruments.tick(self.symbol))
+        self._touch(bar.start_ts)
         self._version += 1
 
     # ---- higher-timeframe view (memoized) --------------------------------
@@ -290,14 +290,51 @@ class BarSeries:
         if cached and cached[0] == self._version:
             return cached[1]
 
-        agg = self._aggregate(tf_s)
-        self._agg_cache[tf_s] = (self._version, agg)
+        # Rebuild only the dirty tail.
+        #
+        # The cache was keyed on `_version`, which increments on EVERY trade, so
+        # a live feed invalidated it constantly and each redraw re-folded the
+        # entire session. That cost grows linearly with uptime - measured 0.57 ms
+        # at one hour and 4.77 ms at seven, times five call sites per frame -
+        # which is exactly the "gets laggy after a few hours" report. Trades land
+        # in recent bars, so almost always only the last group changed.
+        agg = None
+        if cached is not None and cached[2] == self._evicted:
+            dirty = self._tf_dirty.get(tf_s)
+            if dirty is not None:
+                bucket = (dirty // tf_s) * tf_s
+                prev = cached[1]
+                k = len(prev)
+                while k > 0 and prev[k - 1].start_ts >= bucket:
+                    k -= 1
+                j = len(self.bars)
+                while j > 0 and self.bars[j - 1].start_ts >= bucket:
+                    j -= 1
+                agg = prev[:k] + self._aggregate(tf_s, j)
+        if agg is None:
+            agg = self._aggregate(tf_s)
+
+        self._agg_cache[tf_s] = (self._version, agg, self._evicted)
+        self._tf_dirty[tf_s] = None       # this timeframe is now clean
         return agg
 
-    def _aggregate(self, tf_s: int) -> list[Bar]:
+    def _touch(self, start_ts: int) -> None:
+        """Record that the base bar at `start_ts` changed.
+
+        Kept per cached timeframe rather than as one global watermark: two
+        timeframes are refreshed at different moments, and a single shared
+        watermark cleared by whichever read first would leave the other
+        rebuilding from a point after its own stale region.
+        """
+        d = self._tf_dirty
+        for tf, cur in d.items():
+            if cur is None or start_ts < cur:
+                d[tf] = start_ts
+
+    def _aggregate(self, tf_s: int, start: int = 0) -> list[Bar]:
         out: list[Bar] = []
         cur: Bar | None = None
-        for base in self.bars:
+        for base in self.bars[start:]:
             bucket = (base.start_ts // tf_s) * tf_s
             if cur is None or cur.start_ts != bucket:
                 if cur is not None:

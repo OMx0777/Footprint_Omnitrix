@@ -42,18 +42,29 @@ log = logging.getLogger(__name__)
 # Roughly 15 s of a very busy 100-symbol basket. Beyond this the GUI is not
 # keeping up and holding more events only makes the lag worse.
 # Backlog ceiling, in events. A queued BookSnapshot is ~22.7 kB (two ~128-level
-# dicts), so this is really a memory budget: 40,000 events is ~0.9 GB worst case
-# if every one is a book, versus 13.6 GB at the 600,000 it used to be. It is
-# still ~80 seconds of backlog at the measured live rate (100 symbols, ~500
-# events/sec), which is far longer than any drain stall we can survive anyway.
-EVENT_QUEUE_MAX = 40_000
+# dicts), so this is really a memory budget: 120,000 events is ~2.7 GB worst
+# case if every one is a book, versus 13.6 GB at the 600,000 it used to be.
+#
+# Raised from 40,000 after live 100-symbol sessions reported "dropped 14,817".
+# 40,000 was sized against the census AVERAGE of ~500 events/sec, but the DLL
+# sweeps far faster than its average at the open, and a queue is exactly the
+# thing that should absorb that. Dropping market data to save memory is the
+# wrong trade at this scale; the drain below is what keeps the backlog short.
+EVENT_QUEUE_MAX = 120_000
 
 # Wall-clock budget for one drain pass, in seconds. A COUNT cap cannot bound
-# time: at the measured 75 us/event, the old 40,000-event cap allowed a single
-# frame to block for 3.0 s. The GUI thread is the only thread that draws, so
-# that is a three-second freeze of the whole terminal. Whatever is not drained
-# this frame is drained on the next one, 33 ms later.
+# time: at 75 us/event the old 40,000-event cap allowed a single frame to block
+# for 3.0 s, and the GUI thread is the only thread that draws.
+#
+# Adaptive, because one fixed budget cannot serve both cases. 8 ms of a 33 ms
+# frame keeps the UI liquid when the feed is calm, but it caps throughput at
+# roughly 8/33 of what the machine could do — and when a burst arrives that
+# ceiling is precisely what turns a backlog into dropped data. So: spend the
+# small budget normally, and escalate to the large one while a backlog exists.
+# A late frame is recoverable; a dropped print is not.
 DRAIN_BUDGET_S = 0.008
+DRAIN_BUDGET_BUSY_S = 0.022
+DRAIN_BUSY_AT = 2_000            # backlog that switches to the busy budget
 
 TF_CHOICES = {
     "5s": 5, "10s": 10, "15s": 15, "30s": 30,
@@ -512,7 +523,9 @@ class OmnitrixWindow(QMainWindow):
     def _drain_and_draw(self) -> None:
         drained = 0
         q = self._event_q
-        deadline = time.perf_counter() + DRAIN_BUDGET_S
+        backlog = len(q)
+        budget = DRAIN_BUDGET_BUSY_S if backlog >= DRAIN_BUSY_AT else DRAIN_BUDGET_S
+        deadline = time.perf_counter() + budget
         while q:
             # Check the clock every 256 events rather than every event:
             # perf_counter() costs about as much as processing a Trade, so

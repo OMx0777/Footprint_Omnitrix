@@ -116,29 +116,16 @@ class BookmapBuffer:
 
     def add_book(self, bk) -> None:
         c = self._col(bk.ts_ms)
-        to_index = self.instruments.to_index
         sym = self.symbol
-        # Built into a dict first only to collapse the two sides onto one
-        # tick-index axis (a price can appear on both across venues); the dict
-        # is transient and dies here, while the PriceLadder is what persists
-        # for the column's whole life in the ring.
-        merged: dict[int, int] = {}
-        for price, size in bk.bids.items():
-            merged[to_index(sym, price)] = size
-        for price, size in bk.asks.items():
-            merged[to_index(sym, price)] = size
-        if merged:
-            ti = np.fromiter(merged.keys(), dtype=np.int32, count=len(merged))
-            sz = np.fromiter(merged.values(), dtype=np.int32, count=len(merged))
-            order = np.argsort(ti, kind="stable")   # ascending: `get` bisects
-            c.book = PriceLadder(ti[order], sz[order])
-        else:
-            c.book = EMPTY_LADDER
+        tick = self.instruments.tick(sym)
+        # One vectorised conversion, cached on the snapshot, so the BarSeries
+        # gets the same object for free instead of redoing the whole book.
+        c.book = bk.ladder(tick)
         c.sweeps += 1
         if bk.best_bid is not None:
-            c.bid_ti = to_index(sym, bk.best_bid)
+            c.bid_ti = round(bk.best_bid / tick)
         if bk.best_ask is not None:
-            c.ask_ti = to_index(sym, bk.best_ask)
+            c.ask_ti = round(bk.best_ask / tick)
 
     # ---- read access -----------------------------------------------------
     def columns(self) -> list[Column]:
