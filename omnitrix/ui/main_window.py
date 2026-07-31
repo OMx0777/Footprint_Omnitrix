@@ -4,15 +4,17 @@ fed by any engine Feed via a thread-safe queue drained on the GUI thread.
 
 from __future__ import annotations
 
+import logging
+import time
 from collections import deque
 from dataclasses import replace
 
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF
+from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QEvent
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QMainWindow, QToolBar, QLabel, QComboBox, QCheckBox, QPushButton, QWidget,
-    QSizePolicy, QDockWidget,
+    QSizePolicy, QDockWidget, QLineEdit,
 )
 
 from ..engine import (
@@ -34,13 +36,28 @@ from .tape_widget import TapeWidget
 from .stats_panel import StatsPanel
 from .signals_panel import SignalsPanel
 
+log = logging.getLogger(__name__)
+
 # Roughly 15 s of a very busy 100-symbol basket. Beyond this the GUI is not
 # keeping up and holding more events only makes the lag worse.
-EVENT_QUEUE_MAX = 600_000
+# Backlog ceiling, in events. A queued BookSnapshot is ~22.7 kB (two ~128-level
+# dicts), so this is really a memory budget: 40,000 events is ~0.9 GB worst case
+# if every one is a book, versus 13.6 GB at the 600,000 it used to be. It is
+# still ~80 seconds of backlog at the measured live rate (100 symbols, ~500
+# events/sec), which is far longer than any drain stall we can survive anyway.
+EVENT_QUEUE_MAX = 40_000
+
+# Wall-clock budget for one drain pass, in seconds. A COUNT cap cannot bound
+# time: at the measured 75 us/event, the old 40,000-event cap allowed a single
+# frame to block for 3.0 s. The GUI thread is the only thread that draws, so
+# that is a three-second freeze of the whole terminal. Whatever is not drained
+# this frame is drained on the next one, 33 ms later.
+DRAIN_BUDGET_S = 0.008
 
 TF_CHOICES = {
-    "10s": 10, "30s": 30, "1m": 60, "2m": 120, "3m": 180, "5m": 300,
-    "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400,
+    "5s": 5, "10s": 10, "15s": 15, "30s": 30,
+    "1m": 60, "2m": 120, "3m": 180, "5m": 300,
+    "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400,
 }
 
 # mode -> (footprint mode, draw footprint cells, heatmap visible)
@@ -85,6 +102,13 @@ class OmnitrixWindow(QMainWindow):
         # drain grows without limit: RAM climbs, latency climbs, and the chart
         # silently falls further behind real time with nothing to show for it.
         # A maxlen sheds the oldest events instead and reports the loss.
+        #
+        # The bound is in EVENTS but the memory is not: a BookSnapshot carries
+        # two ~128-entry dicts and measures ~22.7 kB, against a few hundred
+        # bytes for a Trade. At the old 600,000-event ceiling a full queue was
+        # 13.6 GB - the process would die of the safety valve long before the
+        # valve opened. Sized so that a FULL queue is bounded in bytes, not just
+        # in count; see EVENT_QUEUE_MAX.
         self._event_q: deque = deque(maxlen=EVENT_QUEUE_MAX)
         self._dropped = 0
 
@@ -274,6 +298,20 @@ class OmnitrixWindow(QMainWindow):
         self.glw = pg.GraphicsLayoutWidget()
         self.setCentralWidget(self.glw)
 
+        # TradingView-style ticker search: start typing a symbol anywhere on the
+        # chart and a floating box appears; Enter opens it, Escape cancels. A
+        # child of the chart widget so it floats over the plot; hidden until used.
+        self.sym_search = QLineEdit(self.glw)
+        self.sym_search.setPlaceholderText("Type ticker, Enter to open")
+        self.sym_search.setStyleSheet(
+            "QLineEdit { background:#12161F; color:#F0F0F0; border:2px solid #26A69A;"
+            " border-radius:8px; padding:8px 14px; font-size:15px; font-weight:700;"
+            " letter-spacing:1px; }")
+        self.sym_search.setFixedSize(240, 40)
+        self.sym_search.hide()
+        self.sym_search.returnPressed.connect(self._apply_sym_search)
+        self.sym_search.installEventFilter(self)
+
         self.price_plot = self.glw.addPlot(row=0, col=0)
         self.price_plot.showAxis("right")
         self.price_plot.hideAxis("left")
@@ -433,9 +471,23 @@ class OmnitrixWindow(QMainWindow):
 
     # ---- feed drain + redraw (GUI thread) --------------------------------
     def _tick(self) -> None:
+        try:
+            self._drain_and_draw()
+        except Exception:
+            # Belt and braces alongside the excepthook in app.py: keep the timer
+            # alive and the terminal on screen even if one frame throws.
+            log.exception("frame failed (recovering)")
+
+    def _drain_and_draw(self) -> None:
         drained = 0
         q = self._event_q
-        while q and drained < 40000:
+        deadline = time.perf_counter() + DRAIN_BUDGET_S
+        while q:
+            # Check the clock every 256 events rather than every event:
+            # perf_counter() costs about as much as processing a Trade, so
+            # calling it per event would double the drain cost to police it.
+            if not (drained & 255) and time.perf_counter() > deadline:
+                break
             ev = q.popleft()
             drained += 1
             if isinstance(ev, Trade):
@@ -452,11 +504,20 @@ class OmnitrixWindow(QMainWindow):
             else:  # BookSnapshot
                 self.latest_book[ev.symbol] = ev
                 self._bookmap(ev.symbol).add_book(ev)
+                # Register on depth too, not only on a trade. Trades are
+                # reconstructed from the L1 cumulative-volume delta, so a symbol
+                # that is quoting but has not printed yet produces NO trade at
+                # all - pre-market, thin names, or anything whose volume has not
+                # moved since we connected. Those symbols were streaming depth
+                # into a BookmapBuffer that nothing could ever select, because
+                # they never reached the combo box.
+                if ev.symbol not in self._known_symbols:
+                    self._register_symbol(ev.symbol)
                 s = self.series.get(ev.symbol)
                 if s is not None:
                     s.add_book(ev)
-                    if ev.symbol == self.active_symbol:
-                        self._dirty = True
+                if ev.symbol == self.active_symbol:
+                    self._dirty = True
 
         # Refresh the live indicator ~2x/sec even when no data is flowing, so
         # "waiting for Takion" is visible before the first tick arrives.
@@ -495,6 +556,22 @@ class OmnitrixWindow(QMainWindow):
         # must tolerate that or the GUI raises on the very next frame.
         s = self.series.get(self.active_symbol)
         if s is None:
+            # Selecting a symbol that has depth but no prints yet, or a tick
+            # change that dropped the series, used to `return` here - which left
+            # the PREVIOUS symbol's bars painted on screen under the new
+            # symbol's name. Clear instead, so an empty chart honestly means
+            # "no trades for this symbol yet".
+            self.fp.set_bars([])
+            self.heatmap.set_bars([])
+            self.time_axis.set_bars([])
+            for item in (self.cpr_item, self.ema9_item, self.ema21_item):
+                if item.isVisible():
+                    item.set_bars([])
+            self.vwap_curve.setData([], [])
+            self.cvd_curve.setData([], [])
+            for _, curve in self.vwap_bands:
+                curve.setData([], [])
+            self.lbl_stats.setText(f"  {self.active_symbol}   (no prints yet)  ")
             return
         bars = s.view(self.tf_s)
         self.fp.set_bars(bars)
@@ -574,6 +651,51 @@ class OmnitrixWindow(QMainWindow):
             self.fp.tick = self.instruments.tick(sym)
             self.auto_scroll = True
             self._dirty = True
+
+    # ---- TradingView-style ticker search --------------------------------
+    def keyPressEvent(self, ev) -> None:
+        # Start typing a letter anywhere on the chart to open the ticker search.
+        if not self.sym_search.isVisible():
+            t = ev.text()
+            if t and t.isalpha():
+                self._open_sym_search(t.upper())
+                return
+        super().keyPressEvent(ev)
+
+    def _open_sym_search(self, seed: str = "") -> None:
+        se = self.sym_search
+        gw = self.glw.width()
+        se.move(max(8, (gw - se.width()) // 2), 12)   # top-centre of the chart
+        se.setText(seed)
+        se.show()
+        se.raise_()
+        se.setFocus()
+        se.end(False)                                  # cursor to end
+
+    def _apply_sym_search(self) -> None:
+        sym = self.sym_search.text().strip().upper()
+        self.sym_search.hide()
+        self.glw.setFocus()
+        if not sym:
+            return
+        if self.sym_combo.findText(sym) < 0:           # unknown yet - add it
+            self._known_symbols.add(sym)
+            self.sym_combo.addItem(sym)
+        self.sym_combo.setCurrentText(sym)             # fires _on_symbol
+
+    def eventFilter(self, obj, ev):
+        if obj is self.sym_search and ev.type() == QEvent.Type.KeyPress:
+            if ev.key() == Qt.Key.Key_Escape:
+                self.sym_search.hide()
+                self.glw.setFocus()
+                return True
+        return super().eventFilter(obj, ev)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        if getattr(self, "sym_search", None) is not None and self.sym_search.isVisible():
+            gw = self.glw.width()
+            self.sym_search.move(max(8, (gw - self.sym_search.width()) // 2), 12)
 
     def _on_tf(self, txt: str) -> None:
         self.tf_s = TF_CHOICES.get(txt, 60)

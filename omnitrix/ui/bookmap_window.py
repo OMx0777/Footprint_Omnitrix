@@ -15,7 +15,9 @@ import time
 
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtWidgets import QMainWindow, QToolBar, QLabel, QComboBox, QPushButton
+from PyQt6.QtWidgets import (
+    QMainWindow, QToolBar, QLabel, QComboBox, QPushButton, QCheckBox,
+)
 
 from ..engine import BookmapBuffer, SRTracker
 from ..render import (
@@ -92,6 +94,19 @@ class BookmapWindow(QMainWindow):
         self.wall_combo.currentTextChanged.connect(self._on_wall)
         tb.addWidget(self.wall_combo)
 
+        # Honesty switch. The heatmap forward-fills a ladder across columns that
+        # received no sweep, which is right for a wall that is genuinely still
+        # resting - but it makes unmeasured time indistinguishable from stable
+        # time. On (the default) fades those columns; off restores the solid
+        # field for a cleaner screenshot.
+        self.chk_gaps = QCheckBox("Fade gaps")
+        self.chk_gaps.setChecked(True)
+        self.chk_gaps.setToolTip(
+            "Fade columns that received no book sweep, so liquidity that was "
+            "measured is visibly distinct from liquidity that was assumed")
+        self.chk_gaps.toggled.connect(self._on_gaps)
+        tb.addWidget(self.chk_gaps)
+
         self.btn_follow = QPushButton("⏵ Follow")
         self.btn_follow.clicked.connect(self._reset_view)
         tb.addWidget(self.btn_follow)
@@ -107,6 +122,8 @@ class BookmapWindow(QMainWindow):
             "QMainWindow{background:#1A2226;}"
             "QToolBar{background:#0C111A;border:none;padding:4px;spacing:4px;}"
             "QLabel{color:#C7CCD6;font-size:13px;font-weight:600;}"
+            "QCheckBox{color:#C7CCD6;font-size:13px;font-weight:600;"
+            " padding:0 6px;}"
             "QComboBox{background:#1C2230;color:#EFEFEF;border:1px solid #2A3140;"
             " border-radius:4px;padding:3px 8px;font-size:13px;}"
             "QPushButton{background:#1C2230;color:#EFEFEF;border:1px solid #2A3140;"
@@ -285,6 +302,18 @@ class BookmapWindow(QMainWindow):
             d = price - mid
             lines.append(f"{d:+,.{self._dp()}f} from last")
 
+        # How much of the column under the cursor was actually measured. A
+        # forward-filled column looks solid, so without this there is no way to
+        # tell an unbroken wall from a stretch where no sweep arrived.
+        hb = int(x)
+        hov = next((c for c in cols if c.bucket == hb), None)
+        if hov is None:
+            lines.append("no column — carried forward")
+        elif hov.sweeps == 0:
+            lines.append("no sweep — carried forward")
+        else:
+            lines.append(f"{hov.sweeps} sweep{'s' if hov.sweeps != 1 else ''}")
+
         self.readout.setText("\n".join(lines))
         self.readout.setPos(x, price)
         for it in (self.cx_v, self.cx_h, self.readout):
@@ -319,6 +348,10 @@ class BookmapWindow(QMainWindow):
         m = mult.get(txt, 0)
         self.bubbles.min_size = self.pie.min_size = self.bars.min_size = m
         self.bubbles.update(); self.pie.update(); self.bars.update()
+
+    def _on_gaps(self, on: bool):
+        self.heat.dim_unobserved = on
+        self.heat.update()
 
     def _on_wall(self, txt: str):
         mult, floor = {"Sensitive": (2.5, 2000),

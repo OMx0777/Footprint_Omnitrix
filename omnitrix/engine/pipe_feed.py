@@ -11,6 +11,8 @@ chart in the app works unchanged on real market data.
   \\.\pipe\TakionData    32-byte   '<8s8sdIc3x'
       symbol, mmid, price, size, side   (side 'B' bid, 'A' ask, 'C' = sweep
       complete -> emit the assembled BookSnapshot)
+      -> on a 'C' record the price field carries the sweep's epoch-ms
+         publish timestamp; see _sweep_ts().
 
 This process is the pipe *server*: it creates the pipes and waits for the DLL
 to connect, reconnecting automatically if Takion restarts.
@@ -22,6 +24,7 @@ import logging
 import struct
 import threading
 import time
+from dataclasses import replace
 
 from .model import Trade, BookSnapshot, Aggressor
 from .feed import Feed
@@ -40,6 +43,16 @@ def _cstr(b: bytes) -> str:
 
 _DAY_MS = 86_400_000
 _TS_SAMPLES = 25          # records median-averaged before locking the L1 offset
+# ...but do not wait forever for them. A single-symbol session can take tens of
+# seconds to produce 25 L1 records, and trades are withheld until the offset is
+# known, so lock early off a smaller sample rather than stall the chart.
+_TS_MIN_SAMPLES = 5
+_TS_MAX_WAIT_S = 5.0
+_TS_PENDING_MAX = 20_000  # hard bound on withheld trades (safety valve only)
+
+# Below this a 'C' marker's price field is not a timestamp (2001-09-09). A DLL
+# predating the sweep-stamping change sends 0.0 there.
+_MIN_EPOCH_MS = 1_000_000_000_000
 
 
 def _midnight_ms() -> int:
@@ -79,10 +92,16 @@ class PipeFeed(Feed):
         self._threads: list[threading.Thread] = []
         self._ts_offset: int | None = None      # see _align_ts()
         self._ts_samples: list[int] = []
+        self._ts_first_at: float | None = None
+        # Trades held until the clock offset locks - see _on_l1().
+        self._pending: list[tuple[Trade, int]] = []
         self._last_vol: dict[str, int] = {}
         self._bids: dict[str, dict[float, int]] = {}
         self._asks: dict[str, dict[float, int]] = {}
         self.connected = {"l1": False, "l2": False}
+        # "dll" | "receipt", logged once so a stale DLL is visible rather than
+        # silently degrading book timing back to arrival time.
+        self.sweep_clock: str | None = None
 
     # ---- lifecycle -------------------------------------------------------
     def start(self) -> None:
@@ -114,20 +133,30 @@ class PipeFeed(Feed):
         rather than the single first one: one stale or zero-ish `time_ms` at
         connect time would otherwise poison every timestamp for the whole
         session, with no way to recover.
+
+        Locks early (>= `_TS_MIN_SAMPLES` after `_TS_MAX_WAIT_S`) because
+        `_on_l1` withholds trades until the offset is known, and a quiet
+        single-symbol feed can take a long time to reach 25 records.
         """
         t = to_epoch_ms(raw_ms)
         if raw_ms <= 0:
             return t        # no usable timestamp: to_epoch_ms already gave now
         if self._ts_offset is None:
-            self._ts_samples.append(int(time.time() * 1000) - t)
-            if len(self._ts_samples) < _TS_SAMPLES:
+            now = time.time()
+            if self._ts_first_at is None:
+                self._ts_first_at = now
+            self._ts_samples.append(int(now * 1000) - t)
+            enough = len(self._ts_samples) >= _TS_SAMPLES
+            waited = (len(self._ts_samples) >= _TS_MIN_SAMPLES
+                      and now - self._ts_first_at >= _TS_MAX_WAIT_S)
+            if not (enough or waited):
                 return t                     # un-shifted until we are confident
             self._ts_samples.sort()
             diff = self._ts_samples[len(self._ts_samples) // 2]
             quarter = 15 * 60 * 1000
             self._ts_offset = int(round(diff / quarter)) * quarter
-            log.info("L1 clock offset locked at %+d min",
-                     self._ts_offset // 60000)
+            log.info("L1 clock offset locked at %+d min (from %d samples)",
+                     self._ts_offset // 60000, len(self._ts_samples))
         return t + self._ts_offset
 
     # ---- pipe plumbing ---------------------------------------------------
@@ -184,6 +213,34 @@ class PipeFeed(Feed):
     def _l2_loop(self) -> None:
         self._serve(L2_PIPE, L2.size, self._on_l2, "l2")
 
+    def _sweep_ts(self, marker_price: float) -> int:
+        """Timestamp for a completed sweep, in epoch milliseconds.
+
+        The DLL stamps the 'C' record's otherwise-unused price field with the
+        instant it published the sweep. Preferring that to local receipt time
+        removes the pipe's batching smear: the writer drains up to 4096 records
+        per WriteFile, so a whole batch used to arrive carrying near-identical
+        timestamps, and a batch spanning more than one bookmap column collapsed
+        several distinct books into one.
+
+        Both clocks are the same machine's wall clock, so this changes only the
+        precision of a book's placement in time, never its timezone - the L1
+        trade alignment in _align_ts() is unaffected.
+
+        A DLL predating the change sends 0.0; fall back to receipt time.
+        """
+        if marker_price >= _MIN_EPOCH_MS:
+            if self.sweep_clock is None:
+                self.sweep_clock = "dll"
+                log.info("sweep timestamps: from DLL (batch smear removed)")
+            return int(marker_price)
+        if self.sweep_clock is None:
+            self.sweep_clock = "receipt"
+            log.warning("sweep timestamps: falling back to receipt time - the "
+                        "deployed DLL predates sweep stamping, so heatmap "
+                        "timing carries pipe latency")
+        return int(time.time() * 1000)
+
     # ---- record handlers -------------------------------------------------
     def _on_l1(self, chunk: bytes, off: int) -> None:
         (sym_b, _o, _h, _l, last, bid, ask, cum_vol, time_ms,
@@ -206,8 +263,30 @@ class PipeFeed(Feed):
             aggr = Aggressor.SELL
         else:
             aggr = Aggressor.UNKNOWN
-        self._emit_trade(Trade(sym, float(last), size, aggr,
-                               self._align_ts(int(time_ms))))
+
+        raw = int(time_ms)
+        tr = Trade(sym, float(last), size, aggr, self._align_ts(raw))
+
+        # Withhold trades until the exchange-vs-local offset is known.
+        #
+        # _align_ts() returns the timestamp UN-SHIFTED while it is still
+        # measuring, which places those trades hours from the book clock (ET vs
+        # IST is 9.5 h). Emitting them created a bar far in the past at the head
+        # of the series - and because VWAP and CVD are cumulative from bar 0,
+        # that one bogus bar skewed both for the rest of the session.
+        #
+        # raw <= 0 has no offset to apply (to_epoch_ms already returned now), so
+        # it is emitted straight through.
+        if self._ts_offset is None and raw > 0:
+            if len(self._pending) < _TS_PENDING_MAX:
+                self._pending.append((tr, raw))
+            return
+
+        if self._pending:
+            held, self._pending = self._pending, []
+            for held_tr, held_raw in held:
+                self._emit_trade(replace(held_tr, ts_ms=self._align_ts(held_raw)))
+        self._emit_trade(tr)
 
     def _on_l2(self, chunk: bytes, off: int) -> None:
         sym_b, _mmid_b, price, size, side_b = L2.unpack_from(chunk, off)
@@ -221,7 +300,7 @@ class PipeFeed(Feed):
             asks = self._asks.pop(sym, {})
             if bids or asks:
                 self._emit_book(BookSnapshot(sym, bids, asks,
-                                             int(time.time() * 1000)))
+                                             self._sweep_ts(price)))
         elif side == "B":
             d = self._bids.setdefault(sym, {})
             d[price] = d.get(price, 0) + size * self.lot_multiplier

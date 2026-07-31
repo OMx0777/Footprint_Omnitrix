@@ -190,6 +190,14 @@ class BookHeatmapItem(_BufItem):
         # 0.64, so only a mild correction is wanted. (1.8 was far too strong and
         # crushed the routine book to near-black.)
         self.gamma = 1.15
+        # Fade columns that carry a forward-filled ladder but received no sweep
+        # of their own. Without this a gap in sampling and a period of genuinely
+        # stable liquidity render identically, so the field asserts things it
+        # never measured. Alpha is deliberately high enough that a faded band
+        # still reads as continuous liquidity - the point is to distinguish
+        # observed from inferred, not to punch holes in the chart.
+        self.dim_unobserved = True
+        self.unobserved_alpha = 96
         self._buf = None   # kept alive: QImage wraps this memory, never copies
         self.setZValue(-20)
 
@@ -220,7 +228,7 @@ class BookHeatmapItem(_BufItem):
 
         vmax = 1
         for c in vis:
-            m = max(c.book.values())
+            m = c.book.max_size()      # cached per ladder, not a rescan
             if m > vmax:
                 vmax = m
         # Logarithmic scale (as real Bookmap): ordinary resting size reads as
@@ -229,45 +237,79 @@ class BookHeatmapItem(_BufItem):
 
         buf = np.zeros((nrows, ncols), dtype=np.uint32)   # 0 = transparent
 
-        def _band(book, x0: int, x1: int) -> None:
-            """Paint one ladder across image columns [x0, x1)."""
-            if book is None or x1 <= x0:
-                return
-            n = len(book)
-            if not n:
-                return
-            ks = np.fromiter(book.keys(), dtype=np.int64, count=n) - ti_lo
-            vs = np.fromiter(book.values(), dtype=np.float64, count=n)
-            m = (ks >= 0) & (ks < nrows) & (vs > 0)
-            if not m.any():
-                return
-            norm = np.clip(np.log1p(vs[m]) / denom, 0.0, 1.0) ** self.gamma
-            idx = (norm * 255.0).astype(np.int32)
-            np.clip(idx, 0, 255, out=idx)
-            col = np.zeros(nrows, dtype=np.uint32)
-            col[ks[m]] = _LUT_ARGB[idx]
-            buf[:, x0:x1] = col[:, None]        # one ladder, tiled across time
-
         # A resting order stays on the ladder until a later sweep replaces it,
         # so its band must be unbroken across time. The buffer only forward-fills
         # when a column is *created*, which means any second that received no
         # trade and no sweep has no column at all — and the field rendered as
         # vertical stripes with black gutters between them, nothing like the
         # continuous heat field of the real product. Carry the last known ladder
-        # forward over those gaps here.
-        #
-        # Runs are flushed in blocks keyed on book *identity*, which the buffer's
-        # share-don't-copy discipline guarantees for consecutive columns, so this
-        # is also fewer numpy calls than the per-column version it replaces.
+        # forward over those gaps by collecting runs of identical book identity.
         by_bucket = {c.bucket: c for c in vis}
+        runs: list[tuple[object, int, int]] = []
         run_book = None
         run_start = 0
         for x in range(ncols):
             c = by_bucket.get(b0 + x)
             if c is not None and c.book is not run_book:
-                _band(run_book, run_start, x)
+                if run_book is not None and x > run_start:
+                    runs.append((run_book, run_start, x))
                 run_book, run_start = c.book, x
-        _band(run_book, run_start, ncols)
+        if run_book is not None and ncols > run_start:
+            runs.append((run_book, run_start, ncols))
+        runs = [r for r in runs if len(r[0])]
+        if not runs:
+            return
+
+        # ONE scatter for the whole field, not one numpy round-trip per column.
+        #
+        # At the live sweep rate no two consecutive columns share a ladder, so
+        # the run loop degenerated to a call per column: 1,400 `np.fromiter`
+        # pairs plus 1,400 small log/pow/LUT passes per frame, measured at 94 ms
+        # against an 80 ms timer. Concatenating first turns that into a handful
+        # of vectorised passes over the same points.
+        #
+        # Each run is painted into its FIRST column here; widening to the rest
+        # of the run is a memory copy below, which is far cheaper than putting
+        # the tiling into the scatter.
+        tis = [r[0].ti for r in runs]
+        szs = [r[0].sz for r in runs]
+        counts = np.fromiter((t.size for t in tis), dtype=np.int64,
+                             count=len(tis))
+        rows = np.concatenate(tis).astype(np.int64) - ti_lo
+        vs = np.concatenate(szs).astype(np.float64)
+        xs = np.repeat(np.fromiter((r[1] for r in runs), dtype=np.int64,
+                                   count=len(runs)), counts)
+
+        m = (rows >= 0) & (rows < nrows) & (vs > 0)
+        if m.any():
+            norm = np.clip(np.log1p(vs[m]) / denom, 0.0, 1.0) ** self.gamma
+            idx = (norm * 255.0).astype(np.int32)
+            np.clip(idx, 0, 255, out=idx)
+            buf[rows[m], xs[m]] = _LUT_ARGB[idx]
+
+        # Widen each run across the columns it covers (the forward-fill).
+        for _, x0, x1 in runs:
+            if x1 - x0 > 1:
+                buf[:, x0 + 1:x1] = buf[:, x0:x0 + 1]
+
+        # Mark what was actually measured. A column absent from `vis` entirely
+        # (no trade and no sweep in that second, so no Column was ever created)
+        # is unobserved too, and stays False here by construction.
+        if self.dim_unobserved:
+            seen = np.zeros(ncols, dtype=bool)
+            for c in vis:
+                if c.sweeps:
+                    i = c.bucket - b0
+                    if 0 <= i < ncols:
+                        seen[i] = True
+            if not seen.all():
+                gap = ~seen
+                sub = buf[:, gap]
+                lit = sub != 0                 # leave empty cells transparent
+                if lit.any():
+                    faded = ((sub & np.uint32(0x00FFFFFF))
+                             | np.uint32(self.unobserved_alpha << 24))
+                    buf[:, gap] = np.where(lit, faded, sub)
 
         self._buf = buf                    # QImage does not own the buffer
         img = QImage(buf.data, ncols, nrows, ncols * 4,

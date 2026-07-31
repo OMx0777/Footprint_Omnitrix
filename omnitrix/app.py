@@ -11,12 +11,42 @@ works identically on either feed.
 """
 
 import argparse
+import logging
 import sys
+import traceback
 
 from PyQt6.QtWidgets import QApplication
 
 from .engine import Instruments, SyntheticFeed, PipeFeed, Recorder, ReplayFeed
 from .ui import OmnitrixWindow
+
+log = logging.getLogger("omnitrix")
+
+
+def _install_excepthook() -> None:
+    """Stop one bad frame from killing the whole terminal.
+
+    PyQt6 routes an unhandled Python exception raised inside a slot or a
+    QGraphicsItem.paint() to qFatal(), which aborts the process immediately -
+    no traceback, no chance to save, mid-session. Verified: a single ValueError
+    in a QTimer slot terminates the app before the next line runs.
+
+    That is the wrong trade for a trading terminal. A stale indicator on one
+    frame is survivable; losing the chart mid-session because a book went empty
+    at an unexpected moment is not. Installing a hook makes Qt treat the
+    exception as handled, so the app logs it and keeps running.
+
+    This is a backstop, NOT a licence to leave exceptions unhandled - anything
+    that lands here is a real bug and the log line is how it gets found.
+    """
+    def hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        log.error("unhandled exception (survived):\n%s",
+                  "".join(traceback.format_exception(exc_type, exc, tb)))
+
+    sys.excepthook = hook
 
 
 def main() -> int:
@@ -34,6 +64,11 @@ def main() -> int:
     ap.add_argument("--speed", type=float, default=0.0,
                     help="replay speed (0 = instant, 1 = real time, 5 = 5x)")
     args = ap.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _install_excepthook()
 
     app = QApplication(sys.argv)
     instruments = Instruments(default_tick=args.tick)

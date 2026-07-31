@@ -128,7 +128,11 @@ class Instrument:
                     asz += self.rng.randint(60, 120) * 100      # the resist wall
                 out.append(L2.pack(sym8, venue, bpx, bsz, b"B"))
                 out.append(L2.pack(sym8, venue, apx, asz, b"A"))
-        out.append(L2.pack(sym8, b"", 0.0, 0, b"C"))            # sweep complete
+        # Sweep complete. The DLL stamps this record's price field with the
+        # epoch-ms instant it published the sweep, so the mock does too -
+        # otherwise it would silently exercise PipeFeed's receipt-time fallback
+        # rather than the path that actually runs against Takion.
+        out.append(L2.pack(sym8, b"", float(int(time.time() * 1000)), 0, b"C"))
         return out
 
 

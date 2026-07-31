@@ -22,7 +22,9 @@ Footprint cell layout, per tick index:
 
 from __future__ import annotations
 
-from .model import Trade, Aggressor
+import numpy as np
+
+from .model import Trade, Aggressor, PriceLadder, EMPTY_LADDER
 from .instruments import Instruments
 
 
@@ -41,7 +43,7 @@ class Bar:
         self.cells: dict[int, list[int]] = {}   # tick_index -> [sell_vol, buy_vol]
         self.volume = 0
         self.delta = 0                    # buy_vol - sell_vol, cumulative in-bar
-        self.book: dict[int, int] = {}    # tick_index -> resting L2 size (latest)
+        self.book: PriceLadder = EMPTY_LADDER  # tick_index -> resting L2 size
         self._dirty = True
         self._cache: dict = {}
 
@@ -261,12 +263,22 @@ class BarSeries:
             return
         to_index = self.instruments.to_index
         sym = self.symbol
-        book: dict[int, int] = {}
+        # Compact storage, for the same reason as BookmapBuffer - and the cost
+        # here is larger. `max_bars` is 12,000, and at a 10-second base bar
+        # every bar receives a sweep, so a dict-per-bar is ~283 MB per symbol
+        # at the cap against ~28 MB as int32 arrays.
+        merged: dict[int, int] = {}
         for price, size in bk.bids.items():
-            book[to_index(sym, price)] = size
+            merged[to_index(sym, price)] = size
         for price, size in bk.asks.items():
-            book[to_index(sym, price)] = size
-        bar.book = book
+            merged[to_index(sym, price)] = size
+        if merged:
+            ti = np.fromiter(merged.keys(), dtype=np.int32, count=len(merged))
+            sz = np.fromiter(merged.values(), dtype=np.int32, count=len(merged))
+            order = np.argsort(ti, kind="stable")
+            bar.book = PriceLadder(ti[order], sz[order])
+        else:
+            bar.book = EMPTY_LADDER
         self._version += 1
 
     # ---- higher-timeframe view (memoized) --------------------------------

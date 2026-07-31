@@ -4,8 +4,14 @@ Unlike `BarSeries` (which buckets into OHLC candles), this keeps a fine-grained
 per-time-column record suited to a Bookmap liquidity view:
 
   * `Column` per `col_dt` seconds holding the resting-liquidity book, executed
-    buy/sell volume by price, the best bid/ask, and total volume.
+    buy/sell volume by price, the best bid/ask, total volume, and how many book
+    sweeps were actually observed in that column.
   * a flat `trades` deque for drawing sized bubbles at their exact time.
+
+A column's book is forward-filled from its predecessor so a resting wall draws
+as one continuous band. That is right for liquidity that genuinely persists, but
+it makes "no sweep arrived" look identical to "nothing changed" - so `sweeps`
+records what was really measured and the renderer fades the rest.
 
 x-coordinate convention: the absolute column bucket `int(ts_s // col_dt)` is the
 x value, so columns and trade bubbles share one continuous time axis and scroll
@@ -17,21 +23,31 @@ from __future__ import annotations
 import bisect
 from collections import deque
 
-from .model import Aggressor
+import numpy as np
+
+from .model import Aggressor, PriceLadder, EMPTY_LADDER
 from .instruments import Instruments
 
 
 class Column:
-    __slots__ = ("bucket", "book", "buy", "sell", "bid_ti", "ask_ti", "vol")
+    __slots__ = ("bucket", "book", "buy", "sell", "bid_ti", "ask_ti", "vol",
+                 "sweeps")
 
     def __init__(self, bucket: int):
         self.bucket = bucket
-        self.book: dict[int, int] = {}      # tick_index -> resting size
+        self.book: PriceLadder = EMPTY_LADDER   # tick_index -> resting size
         self.buy: dict[int, int] = {}       # tick_index -> aggressive buy vol
         self.sell: dict[int, int] = {}      # tick_index -> aggressive sell vol
         self.bid_ti: int | None = None
         self.ask_ti: int | None = None
         self.vol = 0
+        # Book sweeps actually observed in this column. Deliberately NOT
+        # inherited by forward-fill: a column carrying the previous ladder
+        # because nothing arrived is a column we never measured, and 0 here is
+        # what lets the renderer say so rather than drawing an assumption as
+        # fact. >1 means several sweeps collapsed into this column and only the
+        # last survived.
+        self.sweeps = 0
 
 
 class BookmapBuffer:
@@ -72,8 +88,9 @@ class BookmapBuffer:
                 # renders as scattered dashes.
                 #
                 # The reference is shared, not copied: add_book rebinds c.book
-                # to a fresh dict rather than mutating, so no column can alter
-                # another's book, and forward-fill costs nothing.
+                # to a fresh PriceLadder rather than mutating, and a ladder is
+                # read-only by contract, so no column can alter another's book
+                # and forward-fill costs nothing.
                 prev = self.cols[self.order[pos - 1]]
                 c.book = prev.book
                 c.bid_ti = prev.bid_ti
@@ -101,12 +118,23 @@ class BookmapBuffer:
         c = self._col(bk.ts_ms)
         to_index = self.instruments.to_index
         sym = self.symbol
-        book: dict[int, int] = {}
+        # Built into a dict first only to collapse the two sides onto one
+        # tick-index axis (a price can appear on both across venues); the dict
+        # is transient and dies here, while the PriceLadder is what persists
+        # for the column's whole life in the ring.
+        merged: dict[int, int] = {}
         for price, size in bk.bids.items():
-            book[to_index(sym, price)] = size
+            merged[to_index(sym, price)] = size
         for price, size in bk.asks.items():
-            book[to_index(sym, price)] = size
-        c.book = book
+            merged[to_index(sym, price)] = size
+        if merged:
+            ti = np.fromiter(merged.keys(), dtype=np.int32, count=len(merged))
+            sz = np.fromiter(merged.values(), dtype=np.int32, count=len(merged))
+            order = np.argsort(ti, kind="stable")   # ascending: `get` bisects
+            c.book = PriceLadder(ti[order], sz[order])
+        else:
+            c.book = EMPTY_LADDER
+        c.sweeps += 1
         if bk.best_bid is not None:
             c.bid_ti = to_index(sym, bk.best_bid)
         if bk.best_ask is not None:
@@ -159,6 +187,9 @@ class BookmapBuffer:
             for ti, v in c.sell.items():
                 g.sell[ti] = g.sell.get(ti, 0) + v
             g.vol += c.vol
+            # Summed, so an aggregated column reports how many sweeps its whole
+            # span was built from - 0 still means "nothing was observed here".
+            g.sweeps += c.sweeps
             if c.bid_ti is not None:
                 g.bid_ti = c.bid_ti
             if c.ask_ti is not None:
