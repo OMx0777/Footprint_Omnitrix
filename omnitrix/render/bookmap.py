@@ -90,10 +90,56 @@ def _build_bookmap_lut() -> list[QColor]:
 
 _LUT = _build_bookmap_lut()
 
+
+def _pack(lut: list) -> np.ndarray:
+    """Pack a 256-colour ramp as opaque 0xAARRGGBB for image compositing."""
+    return np.array(
+        [(0xFF000000 | (c.red() << 16) | (c.green() << 8) | c.blue())
+         for c in lut], dtype=np.uint32)
+
+
+def _ramp(stops) -> list:
+    """Linear-interpolate (position, rgb) stops into a 256-entry ramp."""
+    out: list[QColor] = []
+    for i in range(256):
+        t = i / 255.0
+        for j in range(len(stops) - 1):
+            t0, c0 = stops[j]
+            t1, c1 = stops[j + 1]
+            if t0 <= t <= t1:
+                f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+                out.append(QColor(int(c0[0] + (c1[0] - c0[0]) * f),
+                                  int(c0[1] + (c1[1] - c0[1]) * f),
+                                  int(c0[2] + (c1[2] - c0[2]) * f)))
+                break
+    return out
+
+
 # Same ramp packed as opaque 0xAARRGGBB, for compositing the field as an image.
-_LUT_ARGB = np.array(
-    [(0xFF000000 | (c.red() << 16) | (c.green() << 8) | c.blue()) for c in _LUT],
-    dtype=np.uint32)
+_LUT_ARGB = _pack(_LUT)
+
+# Alternative looks. "Bookmap" is the measured reference and stays the default;
+# the rest are conveniences, not claims about any other product. Each entry is
+# (packed LUT, background). Light backgrounds invert the ramp's dark end so an
+# empty book matches the canvas rather than punching black holes in it.
+LOOK_LUTS: dict[str, tuple] = {
+    "Bookmap": (_LUT_ARGB, BOOKMAP_BG),
+    "Ice": (_pack(_ramp([
+        (0.00, (16, 20, 28)), (0.20, (18, 44, 74)), (0.45, (24, 88, 140)),
+        (0.65, (54, 148, 196)), (0.80, (140, 206, 230)), (0.90, (232, 240, 246)),
+        (1.00, (255, 255, 255))])), "#10141C"),
+    "Fire": (_pack(_ramp([
+        (0.00, (18, 14, 12)), (0.22, (60, 18, 8)), (0.45, (128, 40, 6)),
+        (0.66, (206, 88, 8)), (0.82, (242, 158, 22)), (0.92, (250, 216, 96)),
+        (1.00, (255, 255, 236))])), "#12100E"),
+    "Mono": (_pack(_ramp([
+        (0.00, (18, 20, 22)), (0.35, (70, 74, 80)), (0.65, (132, 138, 146)),
+        (0.85, (196, 200, 206)), (1.00, (255, 255, 255))])), "#121416"),
+    "Light": (_pack(_ramp([
+        (0.00, (245, 246, 248)), (0.15, (206, 222, 238)), (0.35, (150, 190, 224)),
+        (0.55, (86, 152, 206)), (0.72, (40, 110, 178)), (0.85, (232, 150, 30)),
+        (0.94, (226, 92, 20)), (1.00, (198, 24, 24))])), "#F5F6F8"),
+}
 
 
 _pb_memo: tuple = (None, None)
@@ -198,6 +244,19 @@ class BookHeatmapItem(_BufItem):
         # observed from inferred, not to punch holes in the chart.
         self.dim_unobserved = True
         self.unobserved_alpha = 96
+        # Price aggregation: how many ticks collapse into one drawn row.
+        # At 1 tick on a penny-quoted name every cent gets its own 1-pixel line,
+        # and zoomed out those lines overlap into mush. Bucketing to 10c or $1
+        # makes each band thick enough to read, and sizes are SUMMED within a
+        # bucket so a wall spread across several cents shows its true weight.
+        self.row_ticks = 1
+        # Live gradient: fade older columns so the field is dominated by current
+        # liquidity. 0 = off (every column equal, the classic view); 1 = only the
+        # newest columns carry full intensity. For scalpers who want the magnets
+        # that matter NOW rather than an even history.
+        self.recency = 0.0
+        self.min_alpha = 40
+        self.lut = _LUT_ARGB          # swappable colour ramp (see LOOK_LUTS)
         self._buf = None   # kept alive: QImage wraps this memory, never copies
         self.setZValue(-20)
 
@@ -214,28 +273,22 @@ class BookHeatmapItem(_BufItem):
         if not vis:
             return
 
-        # rows span only the visible price window
+        # Rows span only the visible price window, in units of `row_ticks` so a
+        # coarser price grid draws fewer, thicker bands.
+        rt = max(1, int(self.row_ticks))
         yr = vb.viewRange()[1]
         ti_lo = int(math.floor(yr[0] / tick)) - 1
         ti_hi = int(math.ceil(yr[1] / tick)) + 1
-        nrows = ti_hi - ti_lo + 1
+        # Floor-divide so bucket edges are absolute and do not slide as the view
+        # scrolls - otherwise a wall would shimmer between adjacent bands.
+        r_lo = ti_lo // rt
+        nrows = (ti_hi // rt) - r_lo + 1
         if nrows <= 0 or nrows > self.MAX_ROWS:
             return
         b0, b1 = vis[0].bucket, vis[-1].bucket
         ncols = b1 - b0 + 1
         if ncols <= 0:
             return
-
-        vmax = 1
-        for c in vis:
-            m = c.book.max_size()      # cached per ladder, not a rescan
-            if m > vmax:
-                vmax = m
-        # Logarithmic scale (as real Bookmap): ordinary resting size reads as
-        # quiet navy texture while walls saturate to white/amber/red.
-        denom = math.log1p(vmax) or 1.0
-
-        buf = np.zeros((nrows, ncols), dtype=np.uint32)   # 0 = transparent
 
         # A resting order stays on the ladder until a later sweep replaces it,
         # so its band must be unbroken across time. The buffer only forward-fills
@@ -275,22 +328,55 @@ class BookHeatmapItem(_BufItem):
         szs = [r[0].sz for r in runs]
         counts = np.fromiter((t.size for t in tis), dtype=np.int64,
                              count=len(tis))
-        rows = np.concatenate(tis).astype(np.int64) - ti_lo
+        rows = (np.concatenate(tis).astype(np.int64) // rt) - r_lo
         vs = np.concatenate(szs).astype(np.float64)
         xs = np.repeat(np.fromiter((r[1] for r in runs), dtype=np.int64,
                                    count=len(runs)), counts)
 
+        # Accumulate SIZE first, colourise after.
+        #
+        # With row_ticks > 1 several ladder levels land in one drawn row, and a
+        # bucket has to report their SUM - a $1 band holding 100 cents of 500
+        # lots is a 50,000-lot wall and must read as one. That also means vmax
+        # is a property of the aggregated field, not of any single level, so it
+        # cannot be taken from the per-ladder cached max any more.
+        # bincount, not np.add.at: same result, roughly two orders faster.
         m = (rows >= 0) & (rows < nrows) & (vs > 0)
-        if m.any():
-            norm = np.clip(np.log1p(vs[m]) / denom, 0.0, 1.0) ** self.gamma
-            idx = (norm * 255.0).astype(np.int32)
-            np.clip(idx, 0, 255, out=idx)
-            buf[rows[m], xs[m]] = _LUT_ARGB[idx]
+        acc = np.bincount((rows[m] * ncols + xs[m]), weights=vs[m],
+                          minlength=nrows * ncols).reshape(nrows, ncols)
 
-        # Widen each run across the columns it covers (the forward-fill).
+        # Widen each run across the columns it covers (the forward-fill), while
+        # it is still size rather than colour - one copy either way.
         for _, x0, x1 in runs:
             if x1 - x0 > 1:
-                buf[:, x0 + 1:x1] = buf[:, x0:x0 + 1]
+                acc[:, x0 + 1:x1] = acc[:, x0:x0 + 1]
+
+        vmax = float(acc.max()) or 1.0
+        # Logarithmic scale (as real Bookmap): ordinary resting size reads as
+        # quiet navy texture while walls saturate to white/amber/red.
+        denom = math.log1p(vmax) or 1.0
+        lit = acc > 0
+        buf = np.zeros((nrows, ncols), dtype=np.uint32)   # 0 = transparent
+        if lit.any():
+            norm = np.clip(np.log1p(acc[lit]) / denom, 0.0, 1.0) ** self.gamma
+            idx = (norm * 255.0).astype(np.int32)
+            np.clip(idx, 0, 255, out=idx)
+            buf[lit] = self.lut[idx]
+
+        # Live gradient: weight the field toward NOW.
+        #
+        # A scalper hunting magnets cares about the book in front of him, not an
+        # even-weighted history. Scaling alpha along x makes current liquidity
+        # dominate while older structure stays visible as context, so the same
+        # chart serves both readings without changing the colour language.
+        if self.recency > 0.0 and ncols > 1:
+            ramp = np.linspace(0.0, 1.0, ncols) ** (1.0 + 3.0 * self.recency)
+            a_lo = self.min_alpha / 255.0
+            fac = a_lo + (1.0 - a_lo) * ramp
+            alpha = (buf >> 24).astype(np.float64) * fac[None, :]
+            buf = ((buf & np.uint32(0x00FFFFFF))
+                   | (alpha.astype(np.uint32) << 24))
+            buf[~lit] = 0
 
         # Mark what was actually measured. A column absent from `vis` entirely
         # (no trade and no sweep in that second, so no Column was ever created)
@@ -319,8 +405,12 @@ class BookHeatmapItem(_BufItem):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         # Row 0 maps to the rect's top edge, i.e. the *lowest* price, which is
-        # the order the rows were filled in (ti - ti_lo).
-        p.drawImage(QRectF(b0, ti_lo * tick - tick / 2, ncols, nrows * tick), img)
+        # the order the rows were filled in. One row spans `row_ticks` ticks, so
+        # the rect has to be sized in bucket space or the field would be drawn
+        # at 1/row_ticks of its true height.
+        row_h = rt * tick
+        p.drawImage(QRectF(b0, r_lo * row_h - row_h / 2, ncols, nrows * row_h),
+                    img)
         if self.alpha < 255:
             p.setOpacity(1.0)
 
@@ -363,45 +453,55 @@ class BBOItem(_BufItem):
 _TRADE_SCAN_SLACK = 8.0
 
 
-class BubbleItem(_BufItem):
+class _TapeItem(_BufItem):
+    """Shared base for the three trade overlays (bubbles / pies / split bars).
+
+    They differ only in how a binned cell is drawn, so binning, filtering,
+    sizing and the hover index live here once.
+
+    The time bin is deliberately INDEPENDENT of the heatmap's column
+    aggregation. Tying them together meant that selecting a 1-minute bookmap
+    collapsed every print in that minute onto a single x, so the tape rendered
+    as a vertical stack of circles at one instant instead of a readable
+    left-to-right sequence. Now the heatmap can be coarse (to see structure)
+    while the tape stays fine (to see order flow), which is the combination a
+    scalper actually wants.
+    """
+
     def __init__(self, tick: float, buffer=None):
         super().__init__(tick)
         self.buffer = buffer
-        self.xscale = 1.0            # 1/agg — aligns bubbles with aggregated columns
-        self.min_r = 3.0
-        self.max_r = 26.0
-        self.min_size = 0           # hide clustered prints below this (noise filter)
-        self.cluster_bins = 3.0     # time bins per display column for clustering
-        self.max_bubbles = 320      # cap on bubbles drawn per frame (see paint)
+        self.xscale = 1.0        # 1/agg — maps base column units to display x
+        self.bin_cols = 1.0      # time bin width, in BASE column units
+        self.row_ticks = 1       # price bucket, in ticks
+        self.min_size = 0        # noise filter on the binned total
+        self.size_scale = 1.0    # user size multiplier
+        self.max_cells = 320
+        # (x_display, price, buy, sell) of everything drawn last frame, for the
+        # window's hover readout. Without this a bubble can be seen but not
+        # interrogated, and "how much of that was buying?" is the whole question.
+        self.drawn: list[tuple] = []
         self.setZValue(0)
 
-    def paint(self, p: QPainter, *args) -> None:
-        if self.buffer is None:
-            return
-        trades = self.buffer.trades
-        if not trades:
-            return
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        tick = self.tick
-        xs = self.xscale
+    def _cells(self) -> dict:
+        """(x_bin, price_bucket) -> [buy, sell] over the visible tape."""
+        if self.buffer is None or not self.buffer.trades:
+            return {}
         x_lo, x_hi = self._xrange()
-
-        # ---- cluster prints into (time-bin, price) cells (Bookmap volume-dots
-        # clustering): consolidates the swarm of tiny circles into meaningful
-        # bubbles, then a min-size threshold removes the rest of the noise. ----
-        cb = self.cluster_bins
-        cells: dict[tuple, list] = {}     # (xbin, ti) -> [buy, sell]
-        # Scan newest-first and stop once we are past the left edge: the tape
-        # holds up to 60k prints and walking all of them every frame dominated
-        # the frame time. The slack lets a print that arrived slightly out of
-        # order still be found before the scan gives up.
-        for x, ti, size, aggr in reversed(trades):
+        xs = self.xscale
+        inv = 1.0 / max(1e-9, self.bin_cols)
+        rt = max(1, int(self.row_ticks))
+        cells: dict[tuple, list] = {}
+        # Scan newest-first and stop once past the left edge: the tape holds up
+        # to 60k prints and walking all of them every frame dominated the frame
+        # time. The slack lets a slightly out-of-order print still be found.
+        for x, ti, size, aggr in reversed(self.buffer.trades):
             xd = x * xs
             if xd < x_lo - _TRADE_SCAN_SLACK:
                 break
             if xd > x_hi:
                 continue
-            key = (round(xd * cb), ti)
+            key = (int(math.floor(x * inv)), ti // rt)
             e = cells.get(key)
             if e is None:
                 e = cells[key] = [0, 0]
@@ -409,32 +509,56 @@ class BubbleItem(_BufItem):
                 e[1] += size
             else:
                 e[0] += size
+        return cells
+
+    def _binned(self) -> list[tuple]:
+        """[(x_display, price, buy, sell, total)] largest last, capped."""
+        cells = self._cells()
         if not cells:
+            return []
+        rt = max(1, int(self.row_ticks))
+        bc, xs, tick = self.bin_cols, self.xscale, self.tick
+        out = []
+        for (xb, tb), (b, s) in cells.items():
+            tot = b + s
+            if tot < self.min_size or tot <= 0:
+                continue
+            x = (xb + 0.5) * bc * xs                 # centre of the time bin
+            price = (tb + 0.5) * rt * tick           # centre of the price bucket
+            out.append((x, price, b, s, tot))
+        if not out:
+            return []
+        out.sort(key=lambda t: t[4])                 # big drawn last / on top
+        if len(out) > self.max_cells:
+            # A dense tape yields well over a thousand cells in view. Drawing
+            # them all is both the frame cost and a wall of tiny circles that
+            # buries the prints worth seeing - keep the largest. The size scale
+            # comes from what survives, so those still read against each other.
+            out = out[-self.max_cells:]
+        return out
+
+
+class BubbleItem(_TapeItem):
+    def __init__(self, tick: float, buffer=None):
+        super().__init__(tick, buffer)
+        self.min_r = 3.0
+        self.max_r = 26.0
+
+    def paint(self, p: QPainter, *args) -> None:
+        data = self._binned()
+        self.drawn = [(x, y, b, s) for x, y, b, s, _ in data]
+        if not data:
             return
-
-        agg = [(xb / cb, ti, b + s, b >= s) for (xb, ti), (b, s) in cells.items()
-               if (b + s) >= self.min_size]
-        if not agg:
-            return
-
-        # draw largest last so big prints sit on top
-        agg.sort(key=lambda t: t[2])
-        if len(agg) > self.max_bubbles:
-            # A dense tape yields well over a thousand clustered cells in view.
-            # Drawing them all is both the frame-time cost and the wall of tiny
-            # circles that buries the prints worth seeing - so keep the largest
-            # and drop the tail. The size scale is taken from what survives, so
-            # the ones that remain still read relative to each other.
-            agg = agg[-self.max_bubbles:]
-        smax = agg[-1][2] or 1
-
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        smax = data[-1][4] or 1
+        sc = self.size_scale
+        rmin, rmax = self.min_r * sc, self.max_r * sc
         tr = p.transform()
         p.resetTransform()
-        for xd, ti, total, is_buy in agg:
-            pt = tr.map(QPointF(xd, ti * tick))
-            r = self.min_r + (self.max_r - self.min_r) * math.sqrt(total / smax)
-            base = BUY_BUBBLE if is_buy else SELL_BUBBLE
-            self._sphere(p, pt, r, base)
+        for x, price, b, s, total in data:
+            pt = tr.map(QPointF(x, price))
+            r = rmin + (rmax - rmin) * math.sqrt(total / smax)
+            self._sphere(p, pt, r, BUY_BUBBLE if b >= s else SELL_BUBBLE)
 
     @staticmethod
     def _sphere(p: QPainter, pt: QPointF, r: float, base: QColor) -> None:
@@ -648,61 +772,70 @@ class ProjectionItem(pg.GraphicsObject):
             p.restore()
 
 
-class PieItem(_BufItem):
-    """One pie per time column at the column's volume-weighted price, split into
-    a blue (buy) and red (sell) wedge — reads the aggression ratio at a glance,
-    with no overlapping circles."""
+class PieItem(_TapeItem):
+    """One pie per time bin at that bin's volume-weighted price, split into a
+    green (buy) and red (sell) wedge — reads the aggression ratio at a glance.
 
-    def __init__(self, tick: float):
-        super().__init__(tick)
-        self.min_size = 0
+    Binned on the tape timeframe, not the heatmap column: at a 1-minute bookmap
+    a per-column pie gave one circle per minute, which is not a tape. Now the
+    pies march horizontally at whatever tape resolution is selected, each at its
+    own traded price.
+    """
+
+    def __init__(self, tick: float, buffer=None):
+        super().__init__(tick, buffer)
         self.min_r = 7.0
         self.max_r = 30.0
-        self.setZValue(0)
+
+    def _by_bin(self) -> list[tuple]:
+        """Collapse the price dimension: one entry per time bin, at its VWAP."""
+        cells = self._cells()
+        if not cells:
+            return []
+        rt = max(1, int(self.row_ticks))
+        bins: dict[int, list] = {}          # xb -> [buy, sell, price*vol]
+        for (xb, tb), (b, s) in cells.items():
+            price = (tb + 0.5) * rt * self.tick
+            e = bins.get(xb)
+            if e is None:
+                e = bins[xb] = [0, 0, 0.0]
+            e[0] += b; e[1] += s; e[2] += price * (b + s)
+        out = []
+        for xb, (b, s, pv) in bins.items():
+            tot = b + s
+            if tot < self.min_size or tot <= 0:
+                continue
+            x = (xb + 0.5) * self.bin_cols * self.xscale
+            out.append((x, pv / tot, b, s, tot))
+        out.sort(key=lambda t: t[4])
+        if len(out) > self.max_cells:
+            out = out[-self.max_cells:]
+        return out
 
     def paint(self, p: QPainter, *args) -> None:
-        if not self.cols:
-            return
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        tick = self.tick
-        x_lo, x_hi = self._xrange()
-
-        data = []
-        for c in self.cols:
-            if not (x_lo <= c.bucket <= x_hi):
-                continue
-            tb = sum(c.buy.values())
-            ts = sum(c.sell.values())
-            tot = tb + ts
-            if tot == 0 or tot < self.min_size:
-                continue
-            num = den = 0
-            for ti, v in c.buy.items():
-                num += ti * v; den += v
-            for ti, v in c.sell.items():
-                num += ti * v; den += v
-            if den == 0:
-                continue
-            data.append((c.bucket + 0.5, num / den, tb, ts, tot))
+        data = self._by_bin()
+        self.drawn = [(x, y, b, s) for x, y, b, s, _ in data]
         if not data:
             return
-        smax = max(d[4] for d in data) or 1
-        data.sort(key=lambda d: d[4])          # big pies on top
-
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        smax = data[-1][4] or 1
         tr = p.transform()
-        # One pie per column, so a pie wider than its column necessarily
-        # collides with its neighbours - which is the one thing this mode exists
-        # to avoid. Cap the radius at just under half a column's on-screen width
-        # so the row stays a clean sequence at any zoom level.
-        colw = abs(tr.map(QPointF(1.0, 0.0)).x() - tr.map(QPointF(0.0, 0.0)).x())
-        rmax = max(1.5, min(self.max_r, colw * 0.46))
-        rmin = min(self.min_r, rmax)
-
+        # A pie wider than its own time bin necessarily collides with its
+        # neighbours - the one thing this mode exists to avoid. Cap the radius
+        # at just under half a bin's on-screen width so the row stays a clean
+        # sequence at any zoom. The user's size multiplier is allowed to push
+        # past that (they asked for bigger), but the floor keeps it visible when
+        # zoomed out, which is where they reported losing the circles entirely.
+        binw = abs(tr.map(QPointF(self.bin_cols * self.xscale, 0.0)).x()
+                   - tr.map(QPointF(0.0, 0.0)).x())
+        sc = self.size_scale
+        rmax = max(2.5 * sc, min(self.max_r * sc, binw * 0.46 * sc))
+        rmin = min(self.min_r * sc, rmax)
         p.resetTransform()
-        for x, vti, tb, ts, tot in data:
-            pt = tr.map(QPointF(x, vti * tick))
+        for x, price, b, s, tot in data:
+            pt = tr.map(QPointF(x, price))
             r = rmin + (rmax - rmin) * math.sqrt(tot / smax)
-            self._glossy_pie(p, pt, r, tb / tot)
+            self._glossy_pie(p, pt, r, b / tot)
 
     @staticmethod
     def _glossy_pie(p: QPainter, pt: QPointF, r: float, buy_frac: float) -> None:
@@ -727,45 +860,29 @@ class PieItem(_BufItem):
         p.drawEllipse(pt, r, r)
 
 
-class BarsItem(_BufItem):
-    """One vertical split-bar per column at its VWAP price: blue segment ∝ buy
-    volume, red ∝ sell volume — a compact non-overlapping alternative."""
+class BarsItem(PieItem):
+    """One vertical split-bar per time bin at its VWAP price: green segment ∝
+    buy volume, red ∝ sell volume — a compact non-overlapping alternative.
 
-    def __init__(self, tick: float):
-        super().__init__(tick)
-        self.min_size = 0
-        self.setZValue(0)
+    Shares PieItem's per-bin aggregation; only the glyph differs.
+    """
 
     def paint(self, p: QPainter, *args) -> None:
-        if not self.cols:
+        data = self._by_bin()
+        self.drawn = [(x, y, b, s) for x, y, b, s, _ in data]
+        if not data:
             return
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        smax = data[-1][4] or 1
         tick = self.tick
-        x_lo, x_hi = self._xrange()
-        rows = []
-        for c in self.cols:
-            if not (x_lo <= c.bucket <= x_hi):
-                continue
-            tb = sum(c.buy.values()); ts = sum(c.sell.values()); tot = tb + ts
-            if tot == 0 or tot < self.min_size:
-                continue
-            num = den = 0
-            for ti, v in c.buy.items():
-                num += ti * v; den += v
-            for ti, v in c.sell.items():
-                num += ti * v; den += v
-            if den:
-                rows.append((c.bucket, num / den, tb, ts, tot))
-        if not rows:
-            return
-        smax = max(r[4] for r in rows) or 1
-        for bucket, vti, tb, ts, tot in rows:
-            y = vti * tick
-            h = tick * (0.6 + 6.0 * (tot / smax))          # bar half-height in price
-            frac = tb / tot
-            p.fillRect(QRectF(bucket + 0.2, y, 0.6, h * frac), QBrush(PIE_BUY))
-            p.fillRect(QRectF(bucket + 0.2, y - h * (1 - frac), 0.6, h * (1 - frac)),
-                       QBrush(PIE_SELL))
+        w = self.bin_cols * self.xscale * 0.6      # bar width in display x
+        sc = self.size_scale
+        for x, price, b, s, tot in data:
+            h = tick * (0.6 + 6.0 * sc * (tot / smax))     # half-height in price
+            frac = b / tot
+            p.fillRect(QRectF(x - w / 2, price, w, h * frac), QBrush(PIE_BUY))
+            p.fillRect(QRectF(x - w / 2, price - h * (1 - frac), w,
+                              h * (1 - frac)), QBrush(PIE_SELL))
 
 
 class DomLadderItem(pg.GraphicsObject):
@@ -776,21 +893,35 @@ class DomLadderItem(pg.GraphicsObject):
         self.col = None
         self.tick = tick
         self.vmax = 1                 # right edge the bars are anchored to
+        self.row_ticks = 1            # matches the heatmap's price aggregation
         self.font = QFont("Consolas", 8, QFont.Weight.Bold)
         self._bounds = QRectF()
+        self._rows: list[tuple[int, int]] = []   # (bucket, summed size)
 
     def set_col(self, col, tick=None) -> None:
         self.prepareGeometryChange()
         self.col = col
         if tick is not None:
             self.tick = tick
+        rt = max(1, int(self.row_ticks))
+        rows: dict[int, int] = {}
         if col and col.book:
-            lo = min(col.book) * self.tick
-            hi = max(col.book) * self.tick
-            self.vmax = max(col.book.values()) or 1
-            self._bounds = QRectF(0, lo - self.tick, self.vmax,
-                                  (hi - lo) + 2 * self.tick)
+            # Aggregated to the same price grid as the heatmap, so a level in
+            # the ladder lines up with the band it belongs to. Mismatched grids
+            # were worse than either grid alone.
+            for ti, size in col.book.items():
+                b = ti // rt
+                rows[b] = rows.get(b, 0) + size
+        if rows:
+            self._rows = sorted(rows.items())
+            row_h = rt * self.tick
+            lo = self._rows[0][0] * row_h
+            hi = self._rows[-1][0] * row_h
+            self.vmax = max(rows.values()) or 1
+            self._bounds = QRectF(0, lo - row_h, self.vmax,
+                                  (hi - lo) + 2 * row_h)
         else:
+            self._rows = []
             self.vmax = 1
             self._bounds = QRectF()
         self.update()
@@ -800,28 +931,35 @@ class DomLadderItem(pg.GraphicsObject):
 
     def paint(self, p: QPainter, *args) -> None:
         col = self.col
-        if col is None or not col.book:
+        if col is None or not self._rows:
             return
-        tick = self.tick
+        rt = max(1, int(self.row_ticks))
+        row_h = rt * self.tick
         mx = self.vmax
-        ask_ti = col.ask_ti if col.ask_ti is not None else 10 ** 12
+        ask_b = (col.ask_ti // rt) if col.ask_ti is not None else 10 ** 12
         tr = p.transform()
 
         # Bars are anchored at the right edge and grow *left*, so every level's
         # magnitude is read against the price axis it belongs to - the same way
         # a real DOM ladder is laid out. Solid (alpha 230) rather than washed
         # out, so the ladder holds its own next to the heatmap.
-        for ti, size in col.book.items():
-            color = ASK_LINE if ti >= ask_ti else BID_LINE
+        for b, size in self._rows:
+            color = ASK_LINE if b >= ask_b else BID_LINE
             c = QColor(color.red(), color.green(), color.blue(), 230)
-            p.fillRect(QRectF(mx - size, ti * tick - tick / 2, size, tick), c)
+            p.fillRect(QRectF(mx - size, b * row_h - row_h / 2, size, row_h), c)
 
         p.setFont(self.font)
         # Light text: it sits over the bar on wide levels and over the dark
         # background on thin ones, and stays readable on both.
         p.setPen(pg.mkPen("#EAEEF5"))
-        for ti, size in col.book.items():
-            rp = tr.map(QPointF(mx, ti * tick))
+        # Skip labels that cannot fit: at 1-tick rows on a zoomed-out ladder the
+        # numbers overlapped into an unreadable smear. One label per ~13 px.
+        rh_px = abs(tr.map(QPointF(0.0, row_h)).y() - tr.map(QPointF(0.0, 0.0)).y())
+        step = 1 if rh_px >= 13 else max(1, int(math.ceil(13.0 / max(1e-6, rh_px))))
+        for i, (b, size) in enumerate(self._rows):
+            if i % step:
+                continue
+            rp = tr.map(QPointF(mx, b * row_h))
             p.save(); p.resetTransform()
             p.drawText(QRectF(rp.x() - 62, rp.y() - 7, 58, 14),
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,

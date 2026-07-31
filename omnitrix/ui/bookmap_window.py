@@ -14,9 +14,9 @@ from __future__ import annotations
 import time
 
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QPointF, QEvent
 from PyQt6.QtWidgets import (
-    QMainWindow, QToolBar, QLabel, QComboBox, QPushButton, QCheckBox,
+    QMainWindow, QToolBar, QLabel, QComboBox, QPushButton, QCheckBox, QLineEdit,
 )
 
 from ..engine import BookmapBuffer, SRTracker
@@ -24,10 +24,38 @@ from ..render import (
     BookHeatmapItem, BBOItem, BubbleItem, PieItem, BarsItem, ProjectionItem,
     DomLadderItem, VolumeBarsItem, SRLinesItem,
 )
+from ..render.bookmap import LOOK_LUTS as LOOKS
+
+# label -> live-gradient strength for the heatmap's recency weighting
+RECENCY = {"Off": 0.0, "Light": 0.35, "Medium": 0.65, "Strong": 1.0}
 
 from ..render.bookmap import BOOKMAP_BG as BG
+
 # label -> aggregation factor over the 1s base columns
-TF = {"1s": 1, "2s": 2, "5s": 5, "10s": 10, "30s": 30, "1m": 60}
+TF = {"1s": 1, "5s": 5, "10s": 10, "30s": 30, "1m": 60, "5m": 300,
+      "10m": 600, "15m": 900, "30m": 1800, "1h": 3600}
+
+# label -> tape time bin, in base columns. Independent of TF on purpose: see
+# _TapeItem. "Live" is the finest the buffer can express (one base column).
+BUBBLE_TF = {"Live": 1, "1s": 1, "2s": 2, "3s": 3, "5s": 5, "10s": 10,
+             "30s": 30, "1m": 60, "5m": 300}
+
+# label -> price bucket in DOLLARS; converted to ticks against the instrument.
+PRICE_STEP = {"1 tick": 0.0, "1¢": 0.01, "5¢": 0.05, "10¢": 0.10,
+              "25¢": 0.25, "50¢": 0.50, "$1": 1.00}
+
+SIZE_STEPS = {"50%": 0.5, "75%": 0.75, "100%": 1.0, "150%": 1.5,
+              "200%": 2.0, "300%": 3.0, "400%": 4.0}
+
+# The longest timeframe only means something if the buffer holds that much
+# history. The base ring is sized for every streaming symbol at once, but a
+# Bookmap window is open on ONE symbol, so that symbol can afford a deep ring:
+# at ~2.3 kB per compact ladder this is ~33 MB, against ~3 MB for the default.
+HISTORY_COLS = 14400          # 4 hours of 1-second columns
+
+
+def _tf_seconds(agg: int, col_dt: float) -> float:
+    return agg * col_dt
 
 
 def _fmt(v: int) -> str:
@@ -44,10 +72,16 @@ class BookmapWindow(QMainWindow):
         self.buffer = buffer
         self.tick = tick
         self.agg = 1
+        self.bubble_bin = 1.0
+        self.row_ticks = 1
         self.setWindowTitle(f"Omnitrix Bookmap — {buffer.symbol}")
         self.resize(1500, 860)
         self._follow = True
         self._auto_y = True
+        # Deepen this symbol's ring so the long timeframes have data to
+        # aggregate; a 1-hour view over a 23-minute ring is one column.
+        if buffer.max_cols < HISTORY_COLS:
+            buffer.max_cols = HISTORY_COLS
 
         pg.setConfigOptions(useOpenGL=False, antialias=False)
         self._build_toolbar()
@@ -69,6 +103,27 @@ class BookmapWindow(QMainWindow):
         self.tf_combo.currentTextChanged.connect(self._on_tf)
         tb.addWidget(self.tf_combo)
 
+        # Tape resolution, separate from the heatmap timeframe above.
+        tb.addWidget(QLabel("   Tape "))
+        self.btf_combo = QComboBox()
+        self.btf_combo.addItems(list(BUBBLE_TF))
+        self.btf_combo.setToolTip(
+            "Time bin for the trade overlay, independent of the heatmap "
+            "timeframe — keeps prints spread left-to-right instead of stacking "
+            "into one vertical line on a coarse bookmap")
+        self.btf_combo.currentTextChanged.connect(self._on_btf)
+        tb.addWidget(self.btf_combo)
+
+        tb.addWidget(QLabel("   Price "))
+        self.step_combo = QComboBox()
+        self.step_combo.addItems(list(PRICE_STEP))
+        self.step_combo.setToolTip(
+            "Collapse this many ticks into one heatmap row. Coarser rows draw "
+            "thicker, readable bands instead of overlapping hairlines, and "
+            "sizes are summed within each band")
+        self.step_combo.currentTextChanged.connect(self._on_step)
+        tb.addWidget(self.step_combo)
+
         tb.addWidget(QLabel("   Type "))
         self.type_combo = QComboBox()
         # Bubbles first = default. Volume dots are what Bookmap actually draws;
@@ -76,6 +131,14 @@ class BookmapWindow(QMainWindow):
         self.type_combo.addItems(["Bubbles", "Pie", "Bars"])
         self.type_combo.currentTextChanged.connect(self._on_style)
         tb.addWidget(self.type_combo)
+
+        tb.addWidget(QLabel("   Size "))
+        self.size_combo = QComboBox()
+        self.size_combo.addItems(list(SIZE_STEPS))
+        self.size_combo.setCurrentText("100%")
+        self.size_combo.setToolTip("Scale the trade glyphs")
+        self.size_combo.currentTextChanged.connect(self._on_size)
+        tb.addWidget(self.size_combo)
 
         tb.addWidget(QLabel("   Min trade "))
         self.min_combo = QComboBox()
@@ -106,6 +169,36 @@ class BookmapWindow(QMainWindow):
             "measured is visibly distinct from liquidity that was assumed")
         self.chk_gaps.toggled.connect(self._on_gaps)
         tb.addWidget(self.chk_gaps)
+
+        self.chk_sr = QCheckBox("S/R")
+        self.chk_sr.setChecked(True)
+        self.chk_sr.setToolTip("Show the persistence-weighted support and "
+                               "resistance lines")
+        self.chk_sr.toggled.connect(self._on_sr)
+        tb.addWidget(self.chk_sr)
+
+        self.chk_vol = QCheckBox("Volume")
+        self.chk_vol.setChecked(True)
+        self.chk_vol.setToolTip("Show the bottom volume pane")
+        self.chk_vol.toggled.connect(self._on_volpane)
+        tb.addWidget(self.chk_vol)
+
+        tb.addWidget(QLabel("   Look "))
+        self.look_combo = QComboBox()
+        self.look_combo.addItems(list(LOOKS))
+        self.look_combo.setToolTip("Colour scheme for the liquidity field")
+        self.look_combo.currentTextChanged.connect(self._on_look)
+        tb.addWidget(self.look_combo)
+
+        tb.addWidget(QLabel(" Focus "))
+        self.recency_combo = QComboBox()
+        self.recency_combo.addItems(list(RECENCY))
+        self.recency_combo.setToolTip(
+            "Live gradient: fade older columns so the field is dominated by "
+            "current liquidity — makes the magnets in front of price stand out "
+            "instead of competing with history")
+        self.recency_combo.currentTextChanged.connect(self._on_recency)
+        tb.addWidget(self.recency_combo)
 
         self.btn_follow = QPushButton("⏵ Follow")
         self.btn_follow.clicked.connect(self._reset_view)
@@ -177,8 +270,8 @@ class BookmapWindow(QMainWindow):
         self.main.addItem(self.bbo)
         self.main.addItem(self.bubbles)
 
-        self.pie = PieItem(self.tick)
-        self.bars = BarsItem(self.tick)
+        self.pie = PieItem(self.tick, self.buffer)
+        self.bars = BarsItem(self.tick, self.buffer)
         self.main.addItem(self.pie)
         self.main.addItem(self.bars)
 
@@ -238,9 +331,63 @@ class BookmapWindow(QMainWindow):
         self.readout.setVisible(False)
         self.main.addItem(self.readout, ignoreBounds=True)
 
+        # TradingView-style ticker search: type a letter anywhere on the chart
+        # and a floating box appears; Enter opens that symbol's bookmap, Escape
+        # cancels. A child of the chart widget so it floats over the plot.
+        self.sym_search = QLineEdit(self.glw)
+        self.sym_search.setPlaceholderText("Type ticker, Enter to open")
+        self.sym_search.setStyleSheet(
+            "QLineEdit{background:#12161F;color:#F0F0F0;border:2px solid #26A69A;"
+            " border-radius:8px;padding:8px 14px;font-size:15px;font-weight:700;"
+            " letter-spacing:1px;}")
+        self.sym_search.setFixedSize(240, 40)
+        self.sym_search.hide()
+        self.sym_search.returnPressed.connect(self._apply_sym_search)
+        self.sym_search.installEventFilter(self)
+
         vb.sigRangeChangedManually.connect(self._on_manual)
         self.glw.scene().sigMouseClicked.connect(self._on_click)
         self.glw.scene().sigMouseMoved.connect(self._on_mouse_move)
+
+    # ---- ticker search ---------------------------------------------------
+    def keyPressEvent(self, ev) -> None:
+        if not self.sym_search.isVisible():
+            t = ev.text()
+            if t and t.isalpha():
+                se = self.sym_search
+                se.move(max(8, (self.glw.width() - se.width()) // 2), 12)
+                se.setText(t.upper())
+                se.show(); se.raise_(); se.setFocus(); se.end(False)
+                return
+        super().keyPressEvent(ev)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.sym_search and ev.type() == QEvent.Type.KeyPress:
+            if ev.key() == Qt.Key.Key_Escape:
+                self.sym_search.hide()
+                self.glw.setFocus()
+                return True
+        return super().eventFilter(obj, ev)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        se = getattr(self, "sym_search", None)
+        if se is not None and se.isVisible():
+            se.move(max(8, (self.glw.width() - se.width()) // 2), 12)
+
+    def _apply_sym_search(self) -> None:
+        sym = self.sym_search.text().strip().upper()
+        self.sym_search.hide()
+        self.glw.setFocus()
+        if not sym or sym == self.buffer.symbol:
+            return
+        # Routed through the main window, which owns the per-symbol buffers and
+        # the child-window registry - opening one from here directly would
+        # bypass both and leak a window per search.
+        owner = self.parent()
+        opener = getattr(owner, "open_bookmap_for", None)
+        if callable(opener):
+            opener(sym)
 
     # ---- interaction -----------------------------------------------------
     def _on_manual(self):
@@ -302,6 +449,18 @@ class BookmapWindow(QMainWindow):
             d = price - mid
             lines.append(f"{d:+,.{self._dp()}f} from last")
 
+        # What the trade glyph under the cursor is made of. "A big green circle"
+        # is only half the read - the split between aggressive buying and
+        # selling inside it is the other half, and there was no way to get it.
+        hit = self._glyph_at(x, price, vb)
+        if hit is not None:
+            gx, gy, gb, gs = hit
+            tot = gb + gs
+            lines.append(f"── trade  {tot:,} sh")
+            lines.append(f"   buy  {gb:,}   ({gb / tot * 100:.0f}%)")
+            lines.append(f"   sell {gs:,}   ({gs / tot * 100:.0f}%)")
+            lines.append(f"   delta {gb - gs:+,}")
+
         # How much of the column under the cursor was actually measured. A
         # forward-filled column looks solid, so without this there is no way to
         # tell an unbroken wall from a stretch where no sweep arrived.
@@ -318,6 +477,32 @@ class BookmapWindow(QMainWindow):
         self.readout.setPos(x, price)
         for it in (self.cx_v, self.cx_h, self.readout):
             it.setVisible(True)
+
+    def _glyph_at(self, x: float, price: float, vb):
+        """The trade glyph nearest the cursor, or None.
+
+        Matched in SCREEN space, not data space: a bubble is a circle of pixels,
+        so a tolerance in ticks would be wrong at one zoom and useless at
+        another. Whichever overlay is visible publishes what it drew last frame.
+        """
+        item = (self.bubbles if self.style == "Bubbles"
+                else self.pie if self.style == "Pie" else self.bars)
+        drawn = getattr(item, "drawn", None)
+        if not drawn:
+            return None
+        try:
+            cur = vb.mapViewToScene(QPointF(x, price))
+        except Exception:
+            return None
+        best, best_d2 = None, 26.0 ** 2        # ~26 px grab radius
+        for gx, gy, gb, gs in drawn:
+            pt = vb.mapViewToScene(QPointF(gx, gy))
+            dx = pt.x() - cur.x()
+            dy = pt.y() - cur.y()
+            d2 = dx * dx + dy * dy
+            if d2 < best_d2:
+                best, best_d2 = (gx, gy, gb, gs), d2
+        return best
 
     def _dp(self) -> int:
         """Decimal places implied by the tick size."""
@@ -340,6 +525,7 @@ class BookmapWindow(QMainWindow):
 
     def _on_tf(self, txt: str):
         self.agg = TF.get(txt, 1)
+        self._apply_tape()
         self._reset_view()
 
     def _on_minsize(self, txt: str):
@@ -352,6 +538,55 @@ class BookmapWindow(QMainWindow):
     def _on_gaps(self, on: bool):
         self.heat.dim_unobserved = on
         self.heat.update()
+
+    def _on_btf(self, txt: str):
+        self.bubble_bin = float(BUBBLE_TF.get(txt, 1))
+        self._apply_tape()
+        self.refresh()
+
+    def _on_step(self, txt: str):
+        dollars = PRICE_STEP.get(txt, 0.0)
+        # 0 means "one tick", whatever the instrument's tick happens to be.
+        rt = 1 if dollars <= 0 else max(1, int(round(dollars / self.tick)))
+        self.row_ticks = rt
+        self.heat.row_ticks = rt
+        self.dom_item.row_ticks = rt
+        self._apply_tape()
+        self.refresh()
+
+    def _on_size(self, txt: str):
+        sc = SIZE_STEPS.get(txt, 1.0)
+        for it in (self.bubbles, self.pie, self.bars):
+            it.size_scale = sc
+            it.update()
+
+    def _on_sr(self, on: bool):
+        self.sr_item.setVisible(on)
+
+    def _on_volpane(self, on: bool):
+        self.vol.setVisible(on)
+        # Collapse the row entirely, otherwise hiding the plot leaves its empty
+        # band holding a fifth of the window.
+        self.glw.ci.layout.setRowStretchFactor(1, 1 if on else 0)
+        self.glw.ci.layout.setRowMinimumHeight(1, 0)
+
+    def _on_look(self, txt: str):
+        lut, bg = LOOKS.get(txt, LOOKS["Bookmap"])
+        self.heat.lut = lut
+        self.glw.setBackground(bg)
+        self.heat.update()
+
+    def _on_recency(self, txt: str):
+        self.heat.recency = RECENCY.get(txt, 0.0)
+        self.heat.update()
+
+    def _apply_tape(self) -> None:
+        """Push the tape binning onto all three overlays at once."""
+        for it in (self.bubbles, self.pie, self.bars):
+            it.bin_cols = self.bubble_bin
+            it.row_ticks = self.row_ticks
+            it.xscale = 1.0 / self.agg
+            it.update()
 
     def _on_wall(self, txt: str):
         mult, floor = {"Sensitive": (2.5, 2000),
@@ -375,13 +610,14 @@ class BookmapWindow(QMainWindow):
             return
         self.heat.set_cols(cols)
         self.bbo.set_cols(cols)
-        self.bubbles.xscale = 1.0 / self.agg
-        if self.style == "Bubbles":
-            self.bubbles.set_cols(cols)
-        elif self.style == "Pie":
-            self.pie.set_cols(cols)
-        else:
-            self.bars.set_cols(cols)
+        # All three overlays read the tape directly now, so they only need the
+        # columns for their bounding rect - and they need it whether visible or
+        # not, so switching type does not show a stale extent for one frame.
+        for it in (self.bubbles, self.pie, self.bars):
+            it.xscale = 1.0 / self.agg
+            it.bin_cols = self.bubble_bin
+            it.row_ticks = self.row_ticks
+            it.set_cols(cols)
         self.vol_item.set_cols(cols)
         latest = cols[-1]
         # The newest column may have been created by a trade and carry no book;
@@ -402,7 +638,7 @@ class BookmapWindow(QMainWindow):
         vmax = 1
         for c in cols[-60:]:
             if c.book:
-                m = max(c.book.values())
+                m = c.book.max_size()
                 if m > vmax:
                     vmax = m
         self.projection.set_projection(book_col, latest.bucket + 1, mid_ti, vmax)
@@ -416,9 +652,11 @@ class BookmapWindow(QMainWindow):
 
         if book_col.book:
             # Exact, no margin: the ladder's bars are right-anchored at mx, so
-            # the deepest level must land flush against the price axis.
-            mx = max(book_col.book.values()) or 1
-            self.dom.setXRange(0, mx, padding=0)
+            # the deepest level must land flush against the price axis. Taken
+            # from the ladder item, which has already summed levels into the
+            # selected price buckets - the raw per-tick max would under-scale
+            # the axis and push aggregated bars off the edge.
+            self.dom.setXRange(0, self.dom_item.vmax or 1, padding=0)
 
         if initial or self._follow:
             width = self._view_width(cols, default=60)

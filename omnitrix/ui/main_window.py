@@ -782,9 +782,22 @@ class OmnitrixWindow(QMainWindow):
         self._register_child("monitor", MarketMonitorWindow(self, self))
 
     def _open_bookmap(self) -> None:
-        sym = self.active_symbol or "QQQ"
+        self.open_bookmap_for(self.active_symbol or "QQQ")
+
+    def open_bookmap_for(self, sym: str) -> None:
+        """Open (or raise) the bookmap for `sym`.
+
+        Public because the Bookmap window's own ticker search calls back into
+        it: the per-symbol buffers and the child-window registry live here, and
+        a window constructed anywhere else would bypass both.
+        """
+        sym = (sym or "").strip().upper()
+        if not sym:
+            return
         if (w := self._child(f"bookmap:{sym}")) is not None:
             w.raise_(); w.activateWindow(); return
+        if sym not in self._known_symbols:
+            self._register_symbol(sym)
         win = BookmapWindow(self._bookmap(sym), self.instruments.tick(sym), self)
         self._register_child(f"bookmap:{sym}", win)
 
