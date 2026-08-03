@@ -24,7 +24,7 @@ from ..engine.model import Trade, BookSnapshot
 from ..render import (
     FootprintItem, HeatmapItem, DARK, LIGHT, TimeAxis,
     FibRetracement, PositionDrawer, FixedVolumeProfile, PenDrawing,
-    CprDrawing, EMAItem, CPRItem
+    CprDrawing, PriceLevel, MeasureTool, EMAItem, CPRItem
 )
 from .settings_dialog import SettingsDialog
 from .bookmap_window import BookmapWindow
@@ -344,6 +344,9 @@ class OmnitrixWindow(QMainWindow):
             ("▤", "VP", "Fixed-range volume profile"),
             ("✎", "Pen", "Freehand pen — hold the left button and draw"),
             ("╪", "CPR", "Central Pivot Range over the boxed bars"),
+            ("⟷", "Measure",
+             "Measure — price move, %, bars, duration and volume"),
+            ("—", "HLine", "Horizontal price level  (Alt+H at the crosshair)"),
         ):
             b = QPushButton(glyph)
             b.setToolTip(tip)
@@ -451,6 +454,28 @@ class OmnitrixWindow(QMainWindow):
                                      pen=pg.mkPen("#666", style=Qt.PenStyle.DashLine))
         self.price_plot.addItem(self.vline, ignoreBounds=True)
         self.price_plot.addItem(self.hline, ignoreBounds=True)
+
+        # Crosshair readouts, placed at the ENDS of the two lines - price on the
+        # right edge beside the price axis, time on the bottom edge beside the
+        # time axis - the way a terminal marks the crosshair. Putting them next
+        # to the pointer means the value sits on top of the candles you are
+        # reading, which is precisely where it is most in the way.
+        def _badge(colour):
+            it = pg.TextItem(color="#0B0E14", anchor=(0, 0.5),
+                             fill=pg.mkBrush(colour))
+            it.setZValue(90)
+            it.setVisible(False)
+            self.price_plot.addItem(it, ignoreBounds=True)
+            return it
+
+        self.xhair_price = _badge("#9FB0C8")
+        self.xhair_time = _badge("#9FB0C8")
+        self.xhair_time.setAnchor((0.5, 0))
+        self._last_cursor = None
+        # Zooming or panning moves the edges the badges are pinned to, and the
+        # pointer need not move for that to happen.
+        self.price_plot.vb.sigRangeChanged.connect(
+            lambda *_: self._place_xhair_badges())
 
         self.glw.scene().sigMouseMoved.connect(self._on_mouse_move)
         # Rubber band shown between the two creation clicks.
@@ -751,6 +776,10 @@ class OmnitrixWindow(QMainWindow):
         if key == Qt.Key.Key_R and mods & Qt.KeyboardModifier.AltModifier:
             self._center()
             return
+        # Alt+H drops a price level where the crosshair is.
+        if key == Qt.Key.Key_H and mods & Qt.KeyboardModifier.AltModifier:
+            self._add_price_level()
+            return
         # Delete/Backspace removes the selected drawing. Checked before the
         # ticker search so the shortcuts cannot be swallowed by it.
         if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
@@ -971,11 +1000,49 @@ class OmnitrixWindow(QMainWindow):
         self._apply_theme()
         self._dirty = True
 
+    def _time_at(self, x: float) -> str:
+        """Wall-clock label for a bar position, matching the time axis."""
+        bars = self.time_axis._bars
+        i = int(round(x))
+        if not (0 <= i < len(bars)):
+            return ""
+        lt = time.localtime(bars[i].start_ts)
+        fmt = "%H:%M:%S" if self.tf_s < 60 else "%d %b  %H:%M"
+        return time.strftime(fmt, lt)
+
+    def _place_xhair_badges(self) -> None:
+        """Pin the readouts to the ends of the crosshair lines."""
+        if self._last_cursor is None:
+            return
+        x, y = self._last_cursor
+        (x0, x1), (y0, y1) = self.price_plot.vb.viewRange()
+        # Price rides the horizontal line to the right edge; time rides the
+        # vertical line to the bottom edge. Anchors were chosen so the badge
+        # sits just inside the plot rather than under the axis.
+        self.xhair_price.setText(f"{y:,.2f}")
+        self.xhair_price.setPos(x1, y)
+        label = self._time_at(x)
+        self.xhair_time.setText(label)
+        self.xhair_time.setPos(x, y0)
+        self.xhair_price.setVisible(True)
+        self.xhair_time.setVisible(bool(label))
+
+    def _hide_xhair_badges(self) -> None:
+        self._last_cursor = None
+        self.xhair_price.setVisible(False)
+        self.xhair_time.setVisible(False)
+
     def _on_mouse_move(self, pos) -> None:
+        if not self.price_plot.sceneBoundingRect().contains(pos):
+            # Leaving the chart must clear the readouts, or they sit there
+            # asserting a price the pointer is no longer on.
+            self._hide_xhair_badges()
         if self.price_plot.sceneBoundingRect().contains(pos):
             mp = self.price_plot.vb.mapSceneToView(pos)
             self.vline.setPos(mp.x())
             self.hline.setPos(mp.y())
+            self._last_cursor = (mp.x(), mp.y())
+            self._place_xhair_badges()
             if self.active_drawing_tool == "Pen":
                 self._pen_move(mp)
                 return
@@ -1038,6 +1105,12 @@ class OmnitrixWindow(QMainWindow):
             return
 
         mp = self.price_plot.vb.mapSceneToView(pos)
+        # A level needs one click, not two - waiting for a second would leave a
+        # rubber band on screen with nothing to rubber-band.
+        if self.active_drawing_tool == "HLine":
+            self._add_price_level(mp.y())
+            return
+
         if self._drawing_start_point is None:
             self._drawing_start_point = mp
             self._preview.setVisible(True)
@@ -1066,10 +1139,28 @@ class OmnitrixWindow(QMainWindow):
                                       self.instruments.tick(self.active_symbol))
         elif tool == "CPR":
             item = CprDrawing(p1, p2, self._get_bars_for_vp)
+        elif tool == "Measure":
+            item = MeasureTool(p1, p2, self._get_bars_for_vp)
         else:
             return
 
         self._add_drawing(item)
+
+    def _add_price_level(self, price: float | None = None) -> bool:
+        """Horizontal level at the crosshair (Alt+H).
+
+        Falls back to the centre of the view when the pointer has never entered
+        the chart - pressing the shortcut should always produce a line you can
+        then drag, rather than silently doing nothing.
+        """
+        if price is None:
+            if self._last_cursor is not None:
+                price = self._last_cursor[1]
+            else:
+                y0, y1 = self.price_plot.vb.viewRange()[1]
+                price = (y0 + y1) / 2.0
+        self._add_drawing(PriceLevel(float(price)))
+        return True
 
     def _add_drawing(self, item) -> None:
         """Register a finished drawing: add, wire, select, disarm."""

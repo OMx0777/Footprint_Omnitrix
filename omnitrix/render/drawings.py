@@ -20,6 +20,7 @@ local y = h is its top.
 from __future__ import annotations
 
 import pyqtgraph as pg
+from PyQt6 import QtCore
 from PyQt6.QtCore import Qt, QRectF, QPointF
 from PyQt6.QtGui import (QColor, QPen, QBrush, QPainter, QFont, QPainterPath)
 
@@ -268,6 +269,153 @@ class PositionDrawer(_DrawTool):
                    "#00E676")
         self._text(p, tr, self.data_x(0), sl, f"SL {sl:,.2f}  (-{risk:,.2f})",
                    "#FF5252")
+
+
+class PriceLevel(pg.InfiniteLine):
+    """A horizontal price level, dragged by its line and labelled with its price.
+
+    Not a `_DrawTool`: a level has no box, and forcing it into an ROI would
+    give it a width it does not have and handles that mean nothing. It instead
+    implements the small protocol the window needs from a drawing -
+    `set_selected`, `sigClicked`, `sigRemoveRequested` - so selection, Delete
+    and right-click Remove all work on it exactly as on the box tools.
+
+    InfiniteLine already renders a value label and spans the view at any pan or
+    zoom, which is the whole behaviour wanted here.
+    """
+
+    sigRemoveRequested = QtCore.pyqtSignal(object)
+
+    BASE = "#5C9DFF"
+    SEL = "#FFC43C"
+
+    def __init__(self, price: float, colour: str = BASE, **kw):
+        kw.setdefault("movable", True)
+        super().__init__(
+            pos=price, angle=0,
+            pen=pg.mkPen(colour, width=1, style=Qt.PenStyle.DashLine),
+            hoverPen=pg.mkPen(colour, width=2),
+            label="{value:,.2f}",
+            labelOpts={"position": 0.02, "color": colour,
+                       "fill": (18, 22, 31, 210), "movable": False},
+            **kw)
+        self.colour = colour
+        self.selected = False
+
+    def set_selected(self, on: bool) -> None:
+        self.selected = on
+        c = self.SEL if on else self.colour
+        self.setPen(pg.mkPen(c, width=2 if on else 1,
+                             style=Qt.PenStyle.DashLine))
+        if self.label is not None:
+            self.label.setColor(pg.mkColor(c))
+        self.update()
+
+    def mouseClickEvent(self, ev) -> None:
+        # Right-click removes, matching pg.ROI's built-in Remove entry so the
+        # gesture is the same on every drawing.
+        if ev.button() == Qt.MouseButton.RightButton:
+            ev.accept()
+            self.sigRemoveRequested.emit(self)
+            return
+        super().mouseClickEvent(ev)
+
+
+class MeasureTool(_DrawTool):
+    """TradingView-style measure: price move, %, bars, duration and volume.
+
+    Reports the SIGNED move from the first corner to the second, so dragging
+    down reads negative and colours red - the direction is the point of the
+    tool. `_norm` throws that away (it sorts the corners), so the direction is
+    captured at construction, exactly as FibRetracement does for its ladder.
+    """
+
+    UP = QColor(0, 230, 118)
+    DOWN = QColor(255, 82, 82)
+
+    PAD_R_PX = 250.0
+
+    def __init__(self, p1, p2, get_bars_cb, **kw):
+        pos, size = _norm(p1, p2)
+        super().__init__(pos, size, **kw)
+        self.get_bars_cb = get_bars_cb
+        self._down = float(p2[1]) < float(p1[1])
+        self.addScaleHandle([0, 0], [1, 1])
+        self.addScaleHandle([1, 1], [0, 0])
+
+    def stats(self) -> dict:
+        r = self.shape_rect()
+        w, h = r.width(), r.height()
+        y0 = self.data_y(h if self._down else 0.0)     # start price
+        y1 = self.data_y(0.0 if self._down else h)     # end price
+        move = y1 - y0
+        pct = (move / y0 * 100.0) if y0 else 0.0
+        bars = self.get_bars_cb(self.data_x(0), self.data_x(w)) or []
+        vol = sum(b.volume for b in bars)
+        secs = 0
+        if len(bars) >= 2:
+            secs = int(bars[-1].start_ts - bars[0].start_ts
+                       + getattr(bars[-1], "tf_s", 0))
+        elif len(bars) == 1:
+            secs = int(getattr(bars[0], "tf_s", 0))
+        return {"move": move, "pct": pct, "bars": len(bars),
+                "secs": secs, "volume": vol}
+
+    @staticmethod
+    def _dur(secs: int) -> str:
+        if secs <= 0:
+            return "0s"
+        d, rem = divmod(secs, 86400)
+        h, rem = divmod(rem, 3600)
+        m, s = divmod(rem, 60)
+        parts = [f"{d}d" if d else "", f"{h}h" if h else "",
+                 f"{m}m" if m else "", f"{s}s" if s else ""]
+        return " ".join(p for p in parts if p) or "0s"
+
+    def paint(self, p: QPainter, *args) -> None:
+        r = self.shape_rect()
+        w, h = r.width(), r.height()
+        if w <= 0 or h <= 0:
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        st = self.stats()
+        col = self.DOWN if st["move"] < 0 else self.UP
+
+        band = QColor(col)
+        band.setAlpha(38)
+        p.fillRect(r, band)
+        p.setPen(pg.mkPen(col, width=1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(r)
+
+        # Direction arrow down the middle, from the start price to the end.
+        cx = w / 2
+        y_from = h if self._down else 0.0
+        y_to = 0.0 if self._down else h
+        p.setPen(pg.mkPen(col, width=2))
+        p.drawLine(QPointF(cx, y_from), QPointF(cx, y_to))
+        head = (y_from - y_to) * 0.12
+        p.drawLine(QPointF(cx, y_to), QPointF(cx - w * 0.06, y_to + head))
+        p.drawLine(QPointF(cx, y_to), QPointF(cx + w * 0.06, y_to + head))
+
+        tr = p.transform()
+        sign = "+" if st["move"] >= 0 else ""
+        lines = (f"{sign}{st['move']:,.2f}  ({sign}{st['pct']:.2f}%)",
+                 f"{st['bars']:,} bars  {self._dur(st['secs'])}",
+                 f"vol {st['volume']:,}")
+        # Stacked in SCREEN space off the arrow head, so the block reads the
+        # same at any zoom instead of collapsing as the box shrinks.
+        pt = tr.map(QPointF(cx, y_to))
+        p.save()
+        p.resetTransform()
+        p.setFont(_LABEL_FONT)
+        p.setPen(pg.mkPen(col))
+        fm = p.fontMetrics()
+        step = fm.height()
+        top = pt.y() - (step * len(lines) + 8) if not self._down else pt.y() + 8
+        for i, s in enumerate(lines):
+            p.drawText(QPointF(pt.x() + 8, top + i * step), s)
+        p.restore()
 
 
 class PenDrawing(_DrawTool):
