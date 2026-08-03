@@ -30,6 +30,7 @@ def save(win, path: str = PATH) -> bool:
             "symbol": win.active_symbol,
             "timeframe": win.tf_combo.currentText(),
             "mode": win.mode_combo.currentText(),
+            "price_step": win.step_combo.currentText(),
             "theme": win.theme_combo.currentText(),
             "imbalance": win.chk_imb.isChecked(),
             "imbalance_factor": fp.imbalance_factor,
@@ -66,6 +67,7 @@ def restore(win, path: str = PATH) -> bool:
 
         for combo, key in ((win.tf_combo, "timeframe"),
                            (win.mode_combo, "mode"),
+                           (win.step_combo, "price_step"),
                            (win.theme_combo, "theme")):
             v = d.get(key)
             if v and combo.findText(v) >= 0:

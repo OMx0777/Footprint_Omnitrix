@@ -83,6 +83,14 @@ MODES = {
     "Cluster + Heatmap": ("Cluster", True, True),
 }
 
+# Footprint price aggregation, as a PRICE not a tick count, so "10c" means 10c
+# whatever the instrument's tick is. 0.0 = Auto (chosen from the zoom).
+PRICE_STEPS = {
+    "Auto": 0.0,
+    "1¢": 0.01, "5¢": 0.05, "10¢": 0.10, "25¢": 0.25, "50¢": 0.50,
+    "$1": 1.00, "$2": 2.00, "$5": 5.00,
+}
+
 
 class OmnitrixWindow(QMainWindow):
     def __init__(self, feed: Feed, instruments: Instruments | None = None):
@@ -186,6 +194,23 @@ class OmnitrixWindow(QMainWindow):
         self.mode_combo.addItems(list(MODES))
         self.mode_combo.currentTextChanged.connect(self._on_mode)
         tb.addWidget(self.mode_combo)
+
+        tb.addWidget(QLabel("  Price "))
+        self.step_combo = QComboBox()
+        self.step_combo.addItems(list(PRICE_STEPS))
+        self.step_combo.setCurrentText("Auto")
+        self.step_combo.setToolTip(
+            "Price rows per footprint cell. A 1-tick grid is right on a 10s "
+            "candle and unreadable on a 1h one, where hundreds of levels "
+            "collapse into a stripe. Volume is SUMMED into each row, and the "
+            "POC, value area and imbalances are recomputed on that grid.\n"
+            "Auto follows the zoom so rows stay readable while you pan.")
+        self.step_combo.currentTextChanged.connect(self._on_price_step)
+        tb.addWidget(self.step_combo)
+        # Auto is otherwise opaque - show which step it actually settled on.
+        self.lbl_step = QLabel("")
+        self.lbl_step.setStyleSheet("color:#8A93A6;font-weight:600;")
+        tb.addWidget(self.lbl_step)
 
         tb.addSeparator()
         self.chk_imb = QCheckBox("Imbalance")
@@ -617,6 +642,7 @@ class OmnitrixWindow(QMainWindow):
                 curve.setData([], [])
             self.lbl_stats.setText(f"  {self.active_symbol}   (no prints yet)  ")
             return
+        self._sync_step_label()
         bars = s.view(self.tf_s)
         self.fp.set_bars(bars)
         if self.heatmap.isVisible():
@@ -1026,6 +1052,25 @@ class OmnitrixWindow(QMainWindow):
     def _on_numbers(self, on: bool) -> None:
         self.fp.show_numbers = on
         self.fp.update()
+
+    def _on_price_step(self, txt: str) -> None:
+        self.fp.price_step = PRICE_STEPS.get(txt, 0.0)
+        self.lbl_step.setText("")          # refreshed after the next paint
+        self.fp.update()
+
+    def _sync_step_label(self) -> None:
+        """Report the step Auto chose.
+
+        Read after the draw rather than set from inside `paint()` - touching a
+        widget from a paint handler is how you get a repaint loop. One frame of
+        lag on a readout is not worth that risk.
+        """
+        if self.fp.price_step > 0:
+            self.lbl_step.setText("")      # the combo already names it
+            return
+        px = self.fp.step_ticks * self.fp.tick
+        self.lbl_step.setText(f"({px * 100:.0f}¢)" if px < 1.0
+                              else f"(${px:,.2f})".replace(".00", ""))
 
     def _on_cvd_pane(self, on: bool) -> None:
         self.cvd_plot.setVisible(on)

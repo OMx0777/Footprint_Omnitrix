@@ -25,6 +25,14 @@ class FootprintItem(pg.GraphicsObject):
     # Narrower than this (screen px across the whole block) and no cell label
     # can fit, so skip the text pass entirely rather than emit clipped digits.
     MIN_LABEL_PX = 26.0
+    # Auto price-step targets this many screen pixels per footprint row - about
+    # one line of the cell font plus breathing room, i.e. the point at which a
+    # row can actually carry its numbers.
+    AUTO_TARGET_PX = 14.0
+    # Ticks per row the auto mode is allowed to choose. A "nice" ladder, so the
+    # grid lands on round money (1c, 2c, 5c, 10c, 25c, 50c, $1 ... on a penny
+    # tick) instead of an arbitrary 7 or 13 that no one reads prices in.
+    AUTO_STEPS = (1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000)
 
     def __init__(self, tick: float, theme: Theme = DARK):
         super().__init__()
@@ -45,8 +53,14 @@ class FootprintItem(pg.GraphicsObject):
         # values, and the per-bar delta/volume footer). Some readers want the
         # shapes only.
         self.show_numbers = True
+        # Price aggregation for the footprint grid, as a PRICE (dollars), not a
+        # tick count - "10c" has to mean 10c on any instrument, and converting
+        # through the symbol's tick keeps that true when the tick is not a cent.
+        # 0.0 = Auto: pick from the zoom so rows stay readable while panning.
+        self.price_step = 0.0
         self._fm = QFontMetrics(self.font)
         self._bounds = QRectF()
+        self.step_ticks = 1               # last step used; for the UI readout
 
     # ---- external setters ------------------------------------------------
     def set_bars(self, bars: list) -> None:
@@ -125,8 +139,15 @@ class FootprintItem(pg.GraphicsObject):
         # rect, so a wide value is omitted instead of being cut in half.
         self._fm = QFontMetrics(self.font)
         box_px = self.BOX_W / max(px_w, 1e-12)
+
+        step = self._step_ticks(px_h)
+        self.step_ticks = step
+        row_h = step * tick
+        # Gate on the DRAWN row, not the raw tick: aggregating is precisely what
+        # buys the room for the numbers, so a folded grid must be allowed to
+        # label itself where a 1-tick grid could not.
         show_text = (self.show_numbers
-                     and px_h < tick * 0.72
+                     and px_h < row_h * 0.72
                      and box_px >= self.MIN_LABEL_PX)
 
         xr = vb.viewRange()[0]
@@ -142,7 +163,28 @@ class FootprintItem(pg.GraphicsObject):
             if self.show_candles:
                 self._paint_candle(p, x, bar, cc, half, tick)
             if self.draw_cells and bar.cells:
-                self._paint_block(p, x, bar, half, tick, show_text)
+                # Fold onto the drawn grid first, so POC, value area and the
+                # diagonal imbalances all describe the rows on screen.
+                self._paint_block(p, x, bar.aggregated(step), half, row_h,
+                                  show_text)
+
+    def _step_ticks(self, px_h: float) -> int:
+        """Ticks per drawn footprint row.
+
+        `px_h` is price units per screen pixel, so `AUTO_TARGET_PX * px_h` is
+        the price height a comfortable row wants; dividing by the tick turns
+        that into ticks.
+        """
+        tick = self.tick
+        if self.price_step > 0:
+            return max(1, int(round(self.price_step / tick)))
+        if px_h <= 0:
+            return 1
+        want = (self.AUTO_TARGET_PX * px_h) / tick
+        for s in self.AUTO_STEPS:
+            if s >= want:
+                return s
+        return self.AUTO_STEPS[-1]
 
     def _paint_candle(self, p, x, bar, color, half, tick) -> None:
         cx = x - half - self.CANDLE_GAP
@@ -156,7 +198,9 @@ class FootprintItem(pg.GraphicsObject):
         p.setBrush(pg.mkBrush(color))
         p.drawRect(QRectF(cx - 0.09, bot, 0.18, top - bot))
 
-    def _paint_block(self, p, x, bar, half, tick, show_text) -> None:
+    def _paint_block(self, p, x, bar, half, row_h, show_text) -> None:
+        """`bar` is already folded onto the drawn grid; its cell keys are BUCKET
+        indices and one row spans `row_h` in price."""
         t = self.theme
         cells = bar.cells
         poc = bar.poc
@@ -170,8 +214,8 @@ class FootprintItem(pg.GraphicsObject):
 
         # value-area wash + VAH/VAL guides
         if self.show_va and vah is not None:
-            y_lo = val * tick - tick / 2
-            y_hi = vah * tick + tick / 2
+            y_lo = val * row_h - row_h / 2
+            y_hi = vah * row_h + row_h / 2
             p.fillRect(QRectF(x - half, y_lo, self.BOX_W, y_hi - y_lo), t.va_wash)
             p.setPen(pg.mkPen(t.va_line, width=1, style=Qt.PenStyle.DashLine))
             for edge in (y_hi, y_lo):
@@ -186,7 +230,7 @@ class FootprintItem(pg.GraphicsObject):
             tot = sell_v + buy_v
             if tot == 0:
                 continue
-            y = ti * tick - tick / 2
+            y = ti * row_h - row_h / 2
             is_poc = ti == poc
 
             if mode == "Footprint":
@@ -196,18 +240,18 @@ class FootprintItem(pg.GraphicsObject):
                     c_sell = t.sell_imb
                 if ti in buy_imb:
                     c_buy = t.buy_imb
-                p.fillRect(QRectF(x - half, y, half, tick), c_sell)
-                p.fillRect(QRectF(x, y, half, tick), c_buy)
+                p.fillRect(QRectF(x - half, y, half, row_h), c_sell)
+                p.fillRect(QRectF(x, y, half, row_h), c_buy)
                 if show_text:
-                    self._cell_two(p, tr, x, y, tick, half, sell_v, buy_v,
+                    self._cell_two(p, tr, x, y, row_h, half, sell_v, buy_v,
                                    t.poc_text if is_poc else t.cell_text)
 
             elif mode == "Cluster":
                 bg = QColor(t.poc_bg) if is_poc else (
                     t.ask_bg if bar.is_bull else t.bid_bg)
-                p.fillRect(QRectF(x - half, y, self.BOX_W, tick), bg)
+                p.fillRect(QRectF(x - half, y, self.BOX_W, row_h), bg)
                 if show_text:
-                    self._cell_one(p, tr, x, y, tick, half, _fmt(tot),
+                    self._cell_one(p, tr, x, y, row_h, half, _fmt(tot),
                                    t.poc_text if is_poc else t.cell_text)
 
             elif mode == "Profile":
@@ -215,10 +259,10 @@ class FootprintItem(pg.GraphicsObject):
                 col = QColor(t.bull) if buy_v >= sell_v else QColor(t.bear)
                 if is_poc:
                     col = QColor(t.va_line)
-                p.fillRect(QRectF(x - half, y, w, tick), col)
+                p.fillRect(QRectF(x - half, y, w, row_h), col)
                 if show_text:
-                    self._cell_one(p, tr, x, y, tick, half, _fmt(tot), t.cell_text,
-                                   align_left=True)
+                    self._cell_one(p, tr, x, y, row_h, half, _fmt(tot),
+                                   t.cell_text, align_left=True)
 
             elif mode == "Delta":
                 d = buy_v - sell_v
@@ -226,16 +270,19 @@ class FootprintItem(pg.GraphicsObject):
                 base = QColor(t.bull) if d >= 0 else QColor(t.bear)
                 col = QColor(base.red(), base.green(), base.blue(),
                              int(60 + 195 * inten))
-                p.fillRect(QRectF(x - half, y, self.BOX_W, tick), col)
+                p.fillRect(QRectF(x - half, y, self.BOX_W, row_h), col)
                 if show_text:
-                    self._cell_one(p, tr, x, y, tick, half,
+                    self._cell_one(p, tr, x, y, row_h, half,
                                    f"{'+' if d > 0 else ''}{_fmt(d)}", t.cell_text)
 
         if self.show_imbalance and mode == "Footprint":
-            self._paint_stacks(p, x, tick, half, sorted(buy_imb), sorted(sell_imb))
+            self._paint_stacks(p, x, row_h, half, sorted(buy_imb),
+                               sorted(sell_imb))
 
         if show_text:
-            self._paint_footer(p, tr, x, bar, half, tick)
+            # Footer sits just under the bar's low, so it is offset by a real
+            # tick - scaling that by the price step would push it far off at $1.
+            self._paint_footer(p, tr, x, bar, half, self.tick)
 
     def _fits(self, rect: QRectF, text: str) -> bool:
         """Does `text` fit inside `rect` (screen px) without being clipped?
@@ -248,9 +295,9 @@ class FootprintItem(pg.GraphicsObject):
         return (rect.width() >= fm.horizontalAdvance(text) + 2
                 and rect.height() >= fm.height() - 2)
 
-    def _cell_two(self, p, tr, x, y, tick, half, sell_v, buy_v, color) -> None:
-        rb = tr.mapRect(QRectF(x - half, y, half - 0.05, tick))
-        ra = tr.mapRect(QRectF(x + 0.05, y, half - 0.05, tick))
+    def _cell_two(self, p, tr, x, y, row_h, half, sell_v, buy_v, color) -> None:
+        rb = tr.mapRect(QRectF(x - half, y, half - 0.05, row_h))
+        ra = tr.mapRect(QRectF(x + 0.05, y, half - 0.05, row_h))
         s_txt, b_txt = _fmt(sell_v), _fmt(buy_v)
         s_ok, b_ok = self._fits(rb, s_txt), self._fits(ra, b_txt)
         if not (s_ok or b_ok):
@@ -267,8 +314,9 @@ class FootprintItem(pg.GraphicsObject):
                        | Qt.AlignmentFlag.AlignLeft, b_txt)
         p.restore()
 
-    def _cell_one(self, p, tr, x, y, tick, half, text, color, align_left=False) -> None:
-        r = tr.mapRect(QRectF(x - half + 0.03, y, self.BOX_W - 0.06, tick))
+    def _cell_one(self, p, tr, x, y, row_h, half, text, color,
+                  align_left=False) -> None:
+        r = tr.mapRect(QRectF(x - half + 0.03, y, self.BOX_W - 0.06, row_h))
         if not self._fits(r, text):
             return
         p.save()
@@ -280,14 +328,18 @@ class FootprintItem(pg.GraphicsObject):
         p.drawText(r, align, text)
         p.restore()
 
-    def _paint_stacks(self, p, x, tick, half, buy_sorted, sell_sorted) -> None:
+    def _paint_stacks(self, p, x, row_h, half, buy_sorted, sell_sorted) -> None:
+        # Runs are consecutive BUCKET indices on the folded grid, so "stacked"
+        # counts adjacent drawn rows - which is what the viewer is reading.
         p.setBrush(Qt.BrushStyle.NoBrush)
         for a, b in _runs(buy_sorted, self.stacked_min):
             p.setPen(pg.mkPen(self.theme.buy_imb, width=2))
-            p.drawRect(QRectF(x, a * tick - tick / 2, half, (b - a) * tick + tick))
+            p.drawRect(QRectF(x, a * row_h - row_h / 2, half,
+                              (b - a) * row_h + row_h))
         for a, b in _runs(sell_sorted, self.stacked_min):
             p.setPen(pg.mkPen(self.theme.sell_imb, width=2))
-            p.drawRect(QRectF(x - half, a * tick - tick / 2, half, (b - a) * tick + tick))
+            p.drawRect(QRectF(x - half, a * row_h - row_h / 2, half,
+                              (b - a) * row_h + row_h))
 
     def _paint_footer(self, p, tr, x, bar, half, tick) -> None:
         t = self.theme

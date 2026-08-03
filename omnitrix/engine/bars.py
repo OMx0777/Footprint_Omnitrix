@@ -33,7 +33,7 @@ class Bar:
 
     __slots__ = (
         "start_ts", "tf_s", "open", "high", "low", "close",
-        "cells", "volume", "delta", "book", "_dirty", "_cache",
+        "cells", "volume", "delta", "book", "_dirty", "_cache", "_agg",
     )
 
     def __init__(self, start_ts: int, tf_s: int, price: float):
@@ -46,6 +46,7 @@ class Bar:
         self.book: PriceLadder = EMPTY_LADDER  # tick_index -> resting L2 size
         self._dirty = True
         self._cache: dict = {}
+        self._agg = None                  # (step, volume, folded Bar)
 
     # ---- ingestion -------------------------------------------------------
     def add(self, price: float, tick_index: int, size: int, aggressor: Aggressor) -> None:
@@ -161,6 +162,52 @@ class Bar:
                 if up_buy == 0 or sell_v >= factor * up_buy:
                     sell_imb.add(ti)
         return buy_imb, sell_imb
+
+    def aggregated(self, step: int) -> "Bar":
+        """This bar's footprint folded onto a coarser price grid.
+
+        At a 1-hour candle a penny-ticked name puts hundreds of rows in one
+        bar, so the cells collapse into an unreadable stripe. Folding `step`
+        ticks into one row and SUMMING their volume makes each row thick enough
+        to carry its numbers, and a level spread across several cents shows its
+        true weight instead of being split into slivers.
+
+        Returns a real Bar keyed by BUCKET index (ti // step), so every existing
+        analytic - POC, value area, and in particular the diagonal imbalance
+        test - runs unchanged on the grid actually being drawn. That is the
+        whole reason this happens here rather than in the renderer: comparing
+        buy at bucket i against sell at bucket i-1 is only meaningful once the
+        folding is done, and aggregating after the imbalance test would mark
+        cells the viewer cannot see.
+
+        Floor division keeps bucket edges absolute, so a row does not slide as
+        price moves - the same reason the Bookmap heatmap floors its rows.
+
+        `step <= 1` returns self, so the default path allocates nothing.
+        """
+        if step <= 1:
+            return self
+        c = self._agg
+        # `volume` doubles as the version: it changes on every trade, so a live
+        # bar refolds and a sealed one never does.
+        if c is not None and c[0] == step and c[1] == self.volume:
+            return c[2]
+
+        agg = Bar(self.start_ts, self.tf_s, self.open)
+        agg.high, agg.low, agg.close = self.high, self.low, self.close
+        agg.volume, agg.delta, agg.book = self.volume, self.delta, self.book
+        cells = agg.cells
+        for ti, cell in self.cells.items():
+            b = ti // step
+            cur = cells.get(b)
+            if cur is None:
+                cells[b] = [cell[0], cell[1]]
+            else:
+                cur[0] += cell[0]
+                cur[1] += cell[1]
+        agg.seal()                 # analytics computed once; we refold on change
+        self._agg = (step, self.volume, agg)
+        return agg
 
     @property
     def is_bull(self) -> bool:
