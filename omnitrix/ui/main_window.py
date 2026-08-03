@@ -370,10 +370,17 @@ class OmnitrixWindow(QMainWindow):
         self.sym_search.returnPressed.connect(self._apply_sym_search)
         self.sym_search.installEventFilter(self)
 
-        self.price_plot = self.glw.addPlot(row=0, col=0)
+        # Two time axes, one per pane. Only the bottom-most VISIBLE pane shows
+        # its own, so hiding the CVD pane hands the axis up to the price chart
+        # instead of leaving the chart with no time scale at all. An axis item
+        # belongs to the plot it was built into and cannot be moved between
+        # them, so the second one is created up front and kept in sync.
+        self.price_time_axis = TimeAxis(orientation="bottom")
+        self.price_plot = self.glw.addPlot(
+            row=0, col=0, axisItems={"bottom": self.price_time_axis})
         self.price_plot.showAxis("right")
         self.price_plot.hideAxis("left")
-        self.price_plot.hideAxis("bottom")     # time labels live on the CVD pane
+        self.price_plot.hideAxis("bottom")     # CVD pane carries it by default
         self.price_plot.showGrid(x=True, y=True, alpha=0.25)
 
         self.time_axis = TimeAxis(orientation="bottom")
@@ -633,6 +640,7 @@ class OmnitrixWindow(QMainWindow):
             self.fp.set_bars([])
             self.heatmap.set_bars([])
             self.time_axis.set_bars([])
+            self.price_time_axis.set_bars([])
             for item in (self.cpr_item, self.ema9_item, self.ema21_item):
                 if item.isVisible():
                     item.set_bars([])
@@ -647,8 +655,12 @@ class OmnitrixWindow(QMainWindow):
         self.fp.set_bars(bars)
         if self.heatmap.isVisible():
             self.heatmap.set_bars(bars)
+        # Both axes stay fed: whichever one is showing must have the bars, and
+        # the cost is a list reference, not a copy.
         self.time_axis.set_bars(bars)
-        
+        self.price_time_axis.set_bars(bars)
+
+
         if self.cpr_item.isVisible(): self.cpr_item.set_bars(bars)
         if self.ema9_item.isVisible(): self.ema9_item.set_bars(bars)
         if self.ema21_item.isVisible(): self.ema21_item.set_bars(bars)
@@ -1074,6 +1086,12 @@ class OmnitrixWindow(QMainWindow):
 
     def _on_cvd_pane(self, on: bool) -> None:
         self.cvd_plot.setVisible(on)
+        # The time axis lives on the bottom-most pane, so hiding CVD took the
+        # whole time scale with it. Hand it up to the price chart instead.
+        if on:
+            self.price_plot.hideAxis("bottom")
+        else:
+            self.price_plot.showAxis("bottom")
         # Collapse the row too: hiding the plot alone leaves its band reserved,
         # so the price chart does not reclaim the space.
         self.glw.ci.layout.setRowStretchFactor(1, 1 if on else 0)
