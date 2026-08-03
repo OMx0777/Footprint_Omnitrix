@@ -65,6 +65,28 @@ class BookmapBuffer:
         # BBO line and the x-axis follow that order directly.
         self.order: list[int] = []
         self.trades: deque[tuple[float, int, int, Aggressor]] = deque(maxlen=max_trades)
+        # Aggregation cache, mirroring BarSeries. `view()` runs on the Bookmap's
+        # 80 ms timer, and rebuilding the whole fold each time cost 6.6 ms at
+        # one hour and 30.8 ms at eight - 38% of a core, growing with uptime.
+        # Keyed by agg -> (version, folded cols, evicted count).
+        self._agg_cache: dict[int, tuple[int, list, int]] = {}
+        # Earliest BASE bucket modified since each agg was last folded. This is
+        # what makes the rebuild incremental: a version counter alone bumps on
+        # every trade, so it invalidates the cache without saying how much of it
+        # is actually stale.
+        self._dirty: dict[int, int | None] = {}
+        self._version = 0
+        self._evicted = 0
+        self._all_cache: tuple[int, int, list] | None = None
+        # O(1) running tape stats. The stats dock asked for these 2.5x a second
+        # by materialising every print in the deque into a Python list - 6.5 ms
+        # a call once it filled. Like BarSeries' session figures these cover
+        # every trade ingested and deliberately do NOT shrink when the deque
+        # rolls: a session's largest print is not less true for having scrolled
+        # out of the ring.
+        self.trade_count = 0
+        self.trade_vol = 0
+        self.trade_max = 0
 
     def _col(self, ts_ms: int) -> Column:
         b = int((ts_ms / 1000.0) // self.col_dt)
@@ -97,7 +119,17 @@ class BookmapBuffer:
                 c.ask_ti = prev.ask_ti
             while len(self.order) > self.max_cols:
                 self.cols.pop(self.order.pop(0), None)
+                self._evicted += 1
+        self._touch(b)
         return c
+
+    def _touch(self, bucket: int) -> None:
+        """Record that `bucket` changed, for every cached aggregation."""
+        self._version += 1
+        d = self._dirty
+        for agg, cur in d.items():
+            if cur is None or bucket < cur:
+                d[agg] = bucket
 
     def add_trade(self, tr) -> None:
         c = self._col(tr.ts_ms)
@@ -113,6 +145,10 @@ class BookmapBuffer:
         c.vol += tr.size
         x = (tr.ts_ms / 1000.0) / self.col_dt
         self.trades.append((x, ti, tr.size, tr.aggressor))
+        self.trade_count += 1
+        self.trade_vol += tr.size
+        if tr.size > self.trade_max:
+            self.trade_max = tr.size
 
     def add_book(self, bk) -> None:
         c = self._col(bk.ts_ms)
@@ -129,7 +165,15 @@ class BookmapBuffer:
 
     # ---- read access -----------------------------------------------------
     def columns(self) -> list[Column]:
-        return [self.cols[b] for b in self.order]
+        """All columns in time order. Cached: at the 14,400-column cap this
+        list costs ~0.9 ms to rebuild and several consumers ask for it on
+        their own timers."""
+        c = self._all_cache
+        if c is not None and c[0] == self._version and c[1] == self._evicted:
+            return c[2]
+        out = [self.cols[b] for b in self.order]
+        self._all_cache = (self._version, self._evicted, out)
+        return out
 
     def latest(self) -> Column | None:
         return self.cols[self.order[-1]] if self.order else None
@@ -150,12 +194,46 @@ class BookmapBuffer:
     def view(self, agg: int = 1) -> list[Column]:
         """Aggregate every `agg` base columns into one coarser column (the
         bookmap 'timeframe'). Resting book = most recent snapshot in the group;
-        buy/sell/vol are summed; BBO = latest."""
+        buy/sell/vol are summed; BBO = latest.
+
+        Incremental. This is on the 80 ms refresh path, and re-folding the whole
+        buffer every call grew from 6.6 ms at one hour to 30.8 ms at eight -
+        38% of a core, purely because history got longer. Live data only ever
+        appends, so all but the last group are already correct; only the tail
+        from the dirty watermark is rebuilt.
+        """
         if agg <= 1:
             return self.columns()
+
+        cached = self._agg_cache.get(agg)
+        out = None
+        if cached is not None and cached[2] == self._evicted:
+            if cached[0] == self._version:
+                return cached[1]                  # nothing changed at all
+            dirty = self._dirty.get(agg)
+            if dirty is not None:
+                # Groups strictly before the dirty one are untouched; keep them
+                # and re-fold from there.
+                gb = dirty // agg
+                prev = cached[1]
+                k = len(prev)
+                while k > 0 and prev[k - 1].bucket >= gb:
+                    k -= 1
+                i = len(self.order)
+                while i > 0 and self.order[i - 1] // agg >= gb:
+                    i -= 1
+                out = prev[:k] + self._fold(agg, i)
+        if out is None:
+            out = self._fold(agg, 0)
+
+        self._agg_cache[agg] = (self._version, out, self._evicted)
+        self._dirty[agg] = None
+        return out
+
+    def _fold(self, agg: int, start: int) -> list[Column]:
         groups: dict[int, Column] = {}
         order: list[int] = []
-        for b in self.order:
+        for b in self.order[start:]:
             c = self.cols[b]
             gb = b // agg
             g = groups.get(gb)

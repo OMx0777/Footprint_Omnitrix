@@ -14,6 +14,7 @@ them uniformly:  {kind, bucket, ti, size, side, note}
 
 from __future__ import annotations
 
+from itertools import islice
 from statistics import median
 
 import numpy as np
@@ -113,10 +114,38 @@ def detect_wall_breaks(cols, wall_mult: float = 4.0, top_n: int = 40) -> list[di
     return out[:top_n]
 
 
-def detect_all(buffer, agg: int = 1) -> list[dict]:
-    """Run every detector over a BookmapBuffer and return events newest-first."""
+# How much history the live detectors look at. Bounded ON PURPOSE.
+#
+# These ran over the WHOLE session on a 900 ms timer: 59 ms at one hour, 240 ms
+# at eight - a quarter-second freeze of the GUI thread, three times a second's
+# worth of budget, every 0.9 s. That is the single worst source of "it gets
+# laggy after a while".
+#
+# Bounding is not just a speed fix, it is the right semantics. This feeds a
+# live signals panel that displays 60 events newest-first; a block print from
+# four hours ago is neither actionable nor new, yet it was being re-detected,
+# re-sorted and re-discarded on every tick. At the default 1 s columns these
+# windows are ~20 minutes of tape, which is what "recent flow" means to a
+# scalper. Raise them if you want a longer memory - the cost is linear.
+COLS_WINDOW = 1200
+TRADES_WINDOW = 8000
+
+
+def detect_all(buffer, agg: int = 1, cols_window: int = COLS_WINDOW,
+               trades_window: int = TRADES_WINDOW) -> list[dict]:
+    """Run every detector over a BookmapBuffer and return events newest-first.
+
+    Only the most recent `cols_window` columns and `trades_window` prints are
+    scanned, so the cost is flat in session length rather than growing with it.
+    """
     cols = buffer.view(agg)
-    ev = (detect_blocks(buffer.trades)
+    if cols_window and len(cols) > cols_window:
+        cols = cols[-cols_window:]
+    trades = buffer.trades
+    if trades_window and len(trades) > trades_window:
+        # A deque slices badly; take the tail without copying the whole thing.
+        trades = list(islice(trades, len(trades) - trades_window, None))
+    ev = (detect_blocks(trades)
           + detect_absorption(cols)
           + detect_wall_breaks(cols))
     ev.sort(key=lambda d: -d["bucket"])

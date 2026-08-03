@@ -131,10 +131,11 @@ class AnalyticsWindow(QMainWindow):
             return
         cols = cols[-400:]                       # keep the panes responsive
 
-        xs, ys = metrics.book_imbalance(cols)
+        # One split serves both panes; computing it twice was half this
+        # window's cost.
+        xs2, bids, asks = metrics.depth_sides(cols)
+        xs, ys = metrics.imbalance_from(xs2, bids, asks)
         self.imb_curve.setData(xs, ys)
-
-        xs2, bids, asks = metrics.depth_totals(cols)
         self.bid_curve.setData(xs2, bids)
         self.ask_curve.setData(xs2, asks)
 

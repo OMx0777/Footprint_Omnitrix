@@ -94,13 +94,15 @@ class StatsPanel(QWidget):
                 ]
 
         buf = app.bookmaps.get(sym)
-        if buf and buf.trades:
-            sizes = [t[2] for t in buf.trades]
+        if buf and buf.trade_count:
+            # O(1) running counters. Materialising the 60,000-print deque into
+            # a list here cost 6.5 ms at 2.5 Hz and grew until the ring filled.
+            n = buf.trade_count
             rows += [
                 ("TAPE", None),
-                ("Prints", _fmt(len(sizes))),
-                ("Avg size", _fmt(sum(sizes) / len(sizes))),
-                ("Max print", _fmt(max(sizes))),
+                ("Prints", _fmt(n)),
+                ("Avg size", _fmt(buf.trade_vol / n)),
+                ("Max print", _fmt(buf.trade_max)),
             ]
         return rows
 

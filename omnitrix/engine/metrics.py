@@ -41,18 +41,40 @@ def sides(col):
     return bid, ask
 
 
-def book_imbalance(cols) -> tuple[list, list]:
-    """(bid-ask)/(bid+ask) per column: +1 = all bid depth, -1 = all ask."""
-    xs, ys = [], []
+def depth_sides(cols) -> tuple[list, list, list]:
+    """(x, bid_depth, ask_depth) per column with a book — ONE pass.
+
+    `book_imbalance` and `depth_totals` both want exactly this, and the
+    Analytics window asks for both on the same columns every 250 ms. Splitting
+    a column costs a handful of numpy calls, so computing it twice was half the
+    pane's entire cost for nothing.
+    """
+    xs, bids, asks = [], [], []
     for c in cols:
         if not c.book:
             continue
         b, a = sides(c)
+        xs.append(c.bucket + 0.5)
+        bids.append(b)
+        asks.append(a)
+    return xs, bids, asks
+
+
+def book_imbalance(cols) -> tuple[list, list]:
+    """(bid-ask)/(bid+ask) per column: +1 = all bid depth, -1 = all ask."""
+    return imbalance_from(*depth_sides(cols))
+
+
+def imbalance_from(xs, bids, asks) -> tuple[list, list]:
+    """Imbalance from an already-computed split — lets a caller that needs both
+    series pay for `depth_sides` once."""
+    ox, oy = [], []
+    for x, b, a in zip(xs, bids, asks):
         tot = b + a
         if tot:
-            xs.append(c.bucket + 0.5)
-            ys.append((b - a) / tot)
-    return xs, ys
+            ox.append(x)
+            oy.append((b - a) / tot)
+    return ox, oy
 
 
 def spread_ticks(cols) -> tuple[list, list]:
@@ -88,12 +110,4 @@ def cvd_series(cols) -> tuple[list, list]:
 
 def depth_totals(cols) -> tuple[list, list, list]:
     """Per-column (x, bid_depth, ask_depth) — resting liquidity on each side."""
-    xs, bids, asks = [], [], []
-    for c in cols:
-        if not c.book:
-            continue
-        b, a = sides(c)
-        xs.append(c.bucket + 0.5)
-        bids.append(b)
-        asks.append(a)
-    return xs, bids, asks
+    return depth_sides(cols)

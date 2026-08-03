@@ -11,13 +11,15 @@ works identically on either feed.
 """
 
 import argparse
+import os
 import logging
 import sys
 import traceback
 
 from PyQt6.QtWidgets import QApplication
 
-from .engine import Instruments, SyntheticFeed, PipeFeed, Recorder, ReplayFeed
+from .engine import (Instruments, SyntheticFeed, PipeFeed, NetworkFeed,
+                     Recorder, ReplayFeed)
 from .ui import OmnitrixWindow
 
 log = logging.getLogger("omnitrix")
@@ -63,6 +65,12 @@ def main() -> int:
                     help="replay a previously captured session")
     ap.add_argument("--speed", type=float, default=0.0,
                     help="replay speed (0 = instant, 1 = real time, 5 = 5x)")
+    # Remote mode. The default comes from the environment so a packaged client
+    # can ship a host without forking this file - see Host_Omnitrix/client_app.
+    ap.add_argument("--network", metavar="HOST[:PORT]",
+                    default=os.environ.get("OMNITRIX_HOST", ""),
+                    help="connect to a remote Takion broadcaster "
+                         "(e.g. 192.168.2.53:9999)")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -81,6 +89,11 @@ def main() -> int:
         feed = PipeFeed(symbols=syms or None)
         print("[omnitrix] LIVE mode — waiting for Takion to connect to "
               r"\\.\pipe\TakionOHLCV and \\.\pipe\TakionData …")
+    elif args.network:
+        host, _, port_s = args.network.partition(":")
+        port = int(port_s) if port_s else 9999
+        feed = NetworkFeed(host=host, port=port, symbols=syms or None)
+        print(f"[omnitrix] NETWORK mode — connecting to {host}:{port} …")
     else:
         feed = SyntheticFeed(
             symbols=syms or ["QQQ", "AAPL", "SPY"],

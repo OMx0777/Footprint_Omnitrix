@@ -10,6 +10,7 @@ from . import metrics
 from . import signals
 from .feed import Feed, SyntheticFeed
 from .pipe_feed import PipeFeed
+from .network_feed import NetworkFeed
 from .recorder import Recorder, ReplayFeed, read_events
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "Feed",
     "SyntheticFeed",
     "PipeFeed",
+    "NetworkFeed",
     "Recorder",
     "ReplayFeed",
     "read_events",
