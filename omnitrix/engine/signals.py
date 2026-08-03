@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from statistics import median
 
+import numpy as np
+
 
 def detect_blocks(trades, min_size: int = 0, top_n: int = 40) -> list[dict]:
     """Largest aggressive prints. If min_size is 0 an adaptive threshold of
@@ -87,22 +89,25 @@ def detect_wall_breaks(cols, wall_mult: float = 4.0, top_n: int = 40) -> list[di
     prev = None
     for c in cols:
         if prev is not None and prev.book and c.book:
-            avg = sum(prev.book.values()) / len(prev.book)
-            thr = max(1.0, avg * wall_mult)
             mid = None
             if c.bid_ti is not None and c.ask_ti is not None:
                 mid = (c.bid_ti + c.ask_ti) / 2
-            for ti, size in prev.book.items():
-                if size < thr:
-                    continue
-                now = c.book.get(ti, 0)
-                if now <= size * 0.25 and mid is not None:
-                    # price must have reached / crossed the level
-                    if abs(mid - ti) <= 2:
-                        side = "bid" if ti < mid else "ask"
-                        out.append({"kind": "wall_break", "bucket": c.bucket,
-                                    "ti": ti, "size": int(size), "side": side,
-                                    "note": f"wall {int(size):,} broke"})
+            if mid is None:
+                prev = c
+                continue
+            # Only walls within 2 ticks of the mid can qualify, so narrow to
+            # that handful with numpy before touching Python. Scanning every
+            # level of every column boxed the whole ladder on each step.
+            pt, ps = prev.book.arrays()
+            thr = max(1.0, float(ps.mean()) * wall_mult)
+            cand = np.nonzero((ps >= thr) & (np.abs(pt - mid) <= 2))[0]
+            for i in cand:
+                ti, size = int(pt[i]), int(ps[i])
+                if c.book.get(ti, 0) <= size * 0.25:
+                    side = "bid" if ti < mid else "ask"
+                    out.append({"kind": "wall_break", "bucket": c.bucket,
+                                "ti": ti, "size": size, "side": side,
+                                "note": f"wall {size:,} broke"})
         prev = c
     out.sort(key=lambda d: -d["size"])
     return out[:top_n]

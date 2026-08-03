@@ -743,7 +743,7 @@ class ProjectionItem(pg.GraphicsObject):
 
         # Wall threshold still gates whether the band is worth highlighting, but
         # *which* level counts comes from the persistence tracker.
-        avg = sum(book.values()) / len(book)
+        avg = float(book.values().mean())      # numpy, not a boxed Python sum
         thr = max(self.wall_floor, avg * self.wall_mult)
         sup_ti = self.support.ti if self.support is not None else None
         res_ti = self.resistance.ti if self.resistance is not None else None

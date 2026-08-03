@@ -86,7 +86,7 @@ class DomLadderWidget(QWidget):
         prof = app.profiles.get(sym)
         vols = prof.analytics()["totals"] if prof and prof.total else {}
         poc = prof.analytics()["poc"] if prof and prof.total else None
-        max_sz = max(col.book.values()) or 1
+        max_sz = col.book.max_size() or 1      # cached on the ladder
         max_vol = max(vols.values()) if vols else 1
 
         px_bid_bar = int(w * 0.14)

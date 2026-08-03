@@ -12,19 +12,32 @@ book and tick-by-tick prints into the reads an institutional desk watches:
 
 from __future__ import annotations
 
+import numpy as np
+
 
 def sides(col):
-    """Split a column's combined book into (bid_depth, ask_depth)."""
-    bid = ask = 0
+    """Split a column's combined book into (bid_depth, ask_depth).
+
+    Vectorised: this is called per column across the Analytics panes (400
+    columns) and once per symbol on the Market Monitor's timer, and iterating
+    `book.items()` boxed the ladder's int32 arrays into Python lists every time.
+    """
+    ti, sz = col.book.arrays()
+    if ti.size == 0:
+        return 0, 0
+    sz = sz.astype(np.int64)
     b_ti, a_ti = col.bid_ti, col.ask_ti
-    for ti, size in col.book.items():
-        if a_ti is not None and ti >= a_ti:
-            ask += size
-        elif b_ti is not None and ti <= b_ti:
-            bid += size
-        else:                       # inside the spread — split evenly
-            bid += size // 2
-            ask += size - size // 2
+
+    # Ask is tested first, exactly as the original if/elif did, so on a crossed
+    # book a level that satisfies both bounds counts as ask.
+    is_ask = (ti >= a_ti) if a_ti is not None else np.zeros(ti.size, dtype=bool)
+    is_bid = ((ti <= b_ti) if b_ti is not None
+              else np.zeros(ti.size, dtype=bool)) & ~is_ask
+    inside = ~(is_ask | is_bid)          # inside the spread — split evenly
+
+    half = sz[inside] // 2               # integer split, as before
+    bid = int(sz[is_bid].sum() + half.sum())
+    ask = int(sz[is_ask].sum() + (sz[inside] - half).sum())
     return bid, ask
 
 
