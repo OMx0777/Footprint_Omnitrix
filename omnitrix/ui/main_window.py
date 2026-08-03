@@ -23,7 +23,8 @@ from ..engine import (
 from ..engine.model import Trade, BookSnapshot
 from ..render import (
     FootprintItem, HeatmapItem, DARK, LIGHT, TimeAxis,
-    FibRetracement, PositionDrawer, FixedVolumeProfile, EMAItem, CPRItem
+    FibRetracement, PositionDrawer, FixedVolumeProfile, PenDrawing,
+    CprDrawing, EMAItem, CPRItem
 )
 from .settings_dialog import SettingsDialog
 from .bookmap_window import BookmapWindow
@@ -299,6 +300,8 @@ class OmnitrixWindow(QMainWindow):
         tb.addWidget(self.btn_settings)
 
         self.btn_center = QPushButton("Center")
+        self.btn_center.setToolTip("Re-centre on the latest bars  (Alt+R)")
+        self.btn_center.setShortcut("Alt+R")
         self.btn_center.clicked.connect(self._center)
         tb.addWidget(self.btn_center)
 
@@ -322,6 +325,9 @@ class OmnitrixWindow(QMainWindow):
         self.active_drawing_tool = None
         self.drawing_items = []
         self._drawing_start_point = None
+        # Freehand stroke in progress, or None. Initialised here as well as in
+        # _set_drawing_tool: mouse moves can arrive before any tool is armed.
+        self._pen_points = None
         self._selected_drawing = None
 
         # A narrow glyph strip, as every charting terminal has. Full-word buttons
@@ -336,6 +342,8 @@ class OmnitrixWindow(QMainWindow):
             ("▲", "Long", "Long position — entry / TP / SL with R:R"),
             ("▼", "Short", "Short position — entry / TP / SL with R:R"),
             ("▤", "VP", "Fixed-range volume profile"),
+            ("✎", "Pen", "Freehand pen — hold the left button and draw"),
+            ("╪", "CPR", "Central Pivot Range over the boxed bars"),
         ):
             b = QPushButton(glyph)
             b.setToolTip(tip)
@@ -737,6 +745,12 @@ class OmnitrixWindow(QMainWindow):
     # ---- TradingView-style ticker search --------------------------------
     def keyPressEvent(self, ev) -> None:
         key = ev.key()
+        mods = ev.modifiers()
+        # Alt+R re-centres. Tested before the ticker search, which otherwise
+        # eats any bare letter - `ev.text()` for Alt+R is still "r".
+        if key == Qt.Key.Key_R and mods & Qt.KeyboardModifier.AltModifier:
+            self._center()
+            return
         # Delete/Backspace removes the selected drawing. Checked before the
         # ticker search so the shortcuts cannot be swallowed by it.
         if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
@@ -745,7 +759,7 @@ class OmnitrixWindow(QMainWindow):
         if key == Qt.Key.Key_Escape:
             # Escape unwinds one step at a time: abandon a half-drawn shape,
             # else disarm the tool, else drop the selection.
-            if self._drawing_start_point is not None:
+            if self._drawing_start_point is not None or self._pen_points:
                 self._cancel_draw()
             elif self.active_drawing_tool is not None:
                 self._set_drawing_tool(None)
@@ -962,8 +976,45 @@ class OmnitrixWindow(QMainWindow):
             mp = self.price_plot.vb.mapSceneToView(pos)
             self.vline.setPos(mp.x())
             self.hline.setPos(mp.y())
+            if self.active_drawing_tool == "Pen":
+                self._pen_move(mp)
+                return
             if self._drawing_start_point is not None:
                 self._update_preview(mp)
+
+    # ---- freehand pen ----------------------------------------------------
+    def _pen_move(self, mp) -> None:
+        """Collect stroke points while the left button is held.
+
+        pyqtgraph only publishes `sigMouseClicked`, which fires on RELEASE, so
+        there is no press event to start a stroke from. The button state comes
+        from the application instead: a move with the left button down is a
+        stroke in progress, and the click that arrives on release ends it.
+        """
+        from PyQt6.QtWidgets import QApplication
+        down = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+        if not down:
+            return
+        pt = (mp.x(), mp.y())
+        if self._pen_points is None:
+            self._pen_points = [pt]
+            return
+        # Thin the stroke: a raw move stream puts hundreds of points on one
+        # pixel, which costs paint time and gains no detail.
+        px_w, px_h = self.price_plot.vb.viewPixelSize()
+        lx, ly = self._pen_points[-1]
+        if (abs(pt[0] - lx) >= px_w * 2.0) or (abs(pt[1] - ly) >= px_h * 2.0):
+            self._pen_points.append(pt)
+
+    def _pen_finish(self) -> bool:
+        """Commit the stroke on mouse release. True if one was created."""
+        pts = self._pen_points
+        self._pen_points = None
+        if not pts or len(pts) < 2:
+            return False
+        item = PenDrawing(pts)
+        self._add_drawing(item)
+        return True
 
     def _on_mouse_click(self, ev) -> None:
         pos = ev.scenePos()
@@ -978,6 +1029,12 @@ class OmnitrixWindow(QMainWindow):
         if not self.active_drawing_tool:
             if self._selected_drawing is not None:
                 self._select_drawing(None)
+            return
+
+        # The pen draws on drag, so this click is its mouse-release: commit the
+        # stroke here rather than treating it as a corner of a box.
+        if self.active_drawing_tool == "Pen":
+            self._pen_finish()
             return
 
         mp = self.price_plot.vb.mapSceneToView(pos)
@@ -1007,9 +1064,15 @@ class OmnitrixWindow(QMainWindow):
         elif tool == "VP":
             item = FixedVolumeProfile(p1, p2, self._get_bars_for_vp,
                                       self.instruments.tick(self.active_symbol))
+        elif tool == "CPR":
+            item = CprDrawing(p1, p2, self._get_bars_for_vp)
         else:
             return
 
+        self._add_drawing(item)
+
+    def _add_drawing(self, item) -> None:
+        """Register a finished drawing: add, wire, select, disarm."""
         self.price_plot.addItem(item)
         self.drawing_items.append(item)
         item.sigRemoveRequested.connect(self._remove_drawing)
@@ -1042,8 +1105,9 @@ class OmnitrixWindow(QMainWindow):
         return True
 
     def _cancel_draw(self) -> None:
-        """Drop a half-drawn shape and hide the preview."""
+        """Drop a half-drawn shape or an in-progress stroke, hide the preview."""
         self._drawing_start_point = None
+        self._pen_points = None
         self._preview.setVisible(False)
 
     def _update_preview(self, mp) -> None:
@@ -1120,7 +1184,14 @@ class OmnitrixWindow(QMainWindow):
         # jumped to a random zoom in the middle of drawing. Creation here is
         # click, move, click; the ViewBox never needs to change behaviour, and
         # the chart stays pannable while a tool is armed.
-        self.price_plot.getViewBox().setMouseMode(pg.ViewBox.PanMode)
+        vb = self.price_plot.getViewBox()
+        vb.setMouseMode(pg.ViewBox.PanMode)
+        # The pen is the one tool that DOES drag, so panning has to be off while
+        # it is armed - otherwise the chart slides out from under the stroke and
+        # the points land on prices the user never touched. Restored on disarm.
+        pen = tool_name == "Pen"
+        vb.setMouseEnabled(x=not pen, y=not pen)
+        self._pen_points = None
         self.glw.setCursor(Qt.CursorShape.ArrowCursor if tool_name is None
                            else Qt.CursorShape.CrossCursor)
 

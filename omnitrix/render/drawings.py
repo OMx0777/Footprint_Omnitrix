@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QRectF, QPointF
-from PyQt6.QtGui import QColor, QPen, QBrush, QPainter, QFont
+from PyQt6.QtGui import (QColor, QPen, QBrush, QPainter, QFont, QPainterPath)
 
 _LABEL_FONT = QFont("Consolas", 8, QFont.Weight.Bold)
 
@@ -49,6 +49,19 @@ class _DrawTool(pg.ROI):
 
     SEL_PEN = pg.mkPen("#FFC43C", width=2)
 
+    # Screen-pixel margin the labels are allowed to spill outside the ROI box.
+    # `_text` resets the transform and draws in device space, so a label sits
+    # OUTSIDE `pg.ROI.boundingRect()`, which is exactly (0, 0, w, h).
+    #
+    # Qt only repaints the area an item's boundingRect covered, so anything
+    # painted beyond it is never invalidated: drag a drawing and the old labels
+    # stay burnt into the canvas. That is the "garbage colours left behind when
+    # I move them" glitch. Widening the reported rect to cover everything we
+    # actually paint is the fix - the rect must be a superset of the painted
+    # area or artifacts are guaranteed.
+    PAD_L_PX, PAD_R_PX = 12.0, 210.0      # labels extend to the RIGHT of x
+    PAD_T_PX, PAD_B_PX = 16.0, 16.0
+
     def __init__(self, pos, size, **kw):
         kw.setdefault("pen", pg.mkPen("#5C9DFF", width=1))
         # ROI ships a right-click "Remove" entry and the matching signal; the
@@ -74,6 +87,38 @@ class _DrawTool(pg.ROI):
     def _changed(self, *_) -> None:
         self.prepareGeometryChange()
         self.update()
+
+    # ---- geometry --------------------------------------------------------
+    def shape_rect(self) -> QRectF:
+        """The ROI box itself, in local coords - what the tools draw against."""
+        return super().boundingRect()
+
+    def boundingRect(self) -> QRectF:
+        """The box PLUS room for the labels (see PAD_*_PX).
+
+        The pad is specified in pixels and converted through the view scale, so
+        it covers the text at any zoom rather than being a data-space guess that
+        is too small when zoomed out.
+        """
+        r = super().boundingRect()
+        vb = self.getViewBox()
+        if vb is None:
+            return r
+        try:
+            px_w, px_h = vb.viewPixelSize()
+        except Exception:
+            return r
+        if not (px_w > 0 and px_h > 0):
+            return r
+        return r.adjusted(-self.PAD_L_PX * px_w, -self.PAD_T_PX * px_h,
+                          self.PAD_R_PX * px_w, self.PAD_B_PX * px_h)
+
+    def viewTransformChanged(self) -> None:
+        # boundingRect() is measured in pixels, so a zoom changes it even though
+        # the ROI has not moved. Without this Qt keeps the stale rect from the
+        # previous scale and clips - or fails to clear - the labels.
+        self.prepareGeometryChange()
+        super().viewTransformChanged()
 
     def data_y(self, local_y: float) -> float:
         """Local y -> price."""
@@ -118,7 +163,7 @@ class FibRetracement(_DrawTool):
         return h * (1.0 - level) if self._flip else h * level
 
     def paint(self, p: QPainter, *args) -> None:
-        r = self.boundingRect()
+        r = self.shape_rect()
         w, h = r.width(), r.height()
         if w <= 0 or h <= 0:
             return
@@ -167,7 +212,7 @@ class PositionDrawer(_DrawTool):
         # while addScaleHandle() runs — before entry_handle exists.
         handle = getattr(self, "entry_handle", None)
         if handle is not None and not self._syncing:
-            r = self.boundingRect()
+            r = self.shape_rect()
             h = max(r.height(), 1e-9)
             hp = handle.pos()
             self.entry_frac = min(1.0, max(0.0, hp.y() / h))
@@ -182,7 +227,7 @@ class PositionDrawer(_DrawTool):
         super()._changed()
 
     def paint(self, p: QPainter, *args) -> None:
-        r = self.boundingRect()
+        r = self.shape_rect()
         w, h = r.width(), r.height()
         if w <= 0 or h <= 0:
             return
@@ -225,6 +270,126 @@ class PositionDrawer(_DrawTool):
                    "#FF5252")
 
 
+class PenDrawing(_DrawTool):
+    """Freehand stroke.
+
+    Stored as points in LOCAL coordinates against a normalised bounding box, so
+    dragging the ROI moves the whole stroke and the coordinate contract at the
+    top of this file still holds. No scale handles: a freehand mark is an
+    annotation on a price and a time, and rescaling it would move every point
+    off the thing it was drawn on.
+    """
+
+    # No labels, so the box needs only enough slack for the pen width.
+    PAD_L_PX = PAD_R_PX = PAD_T_PX = PAD_B_PX = 4.0
+
+    def __init__(self, points, colour: str = "#FFC43C", width: int = 2, **kw):
+        pts = [(float(x), float(y)) for x, y in points]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        pos = [min(xs), min(ys)]
+        size = [max(max(xs) - pos[0], 1e-9), max(max(ys) - pos[1], 1e-9)]
+        kw.setdefault("pen", pg.mkPen(colour, width=width))
+        super().__init__(pos, size, **kw)
+        self.colour = colour
+        self.width = width
+        self.points = [(x - pos[0], y - pos[1]) for x, y in pts]
+
+    def paint(self, p: QPainter, *args) -> None:
+        if len(self.points) < 2:
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = pg.mkPen(self.SEL_PEN.color() if self.selected else self.colour,
+                       width=self.width)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        path = QPainterPath()
+        path.moveTo(self.points[0][0], self.points[0][1])
+        for x, y in self.points[1:]:
+            path.lineTo(x, y)
+        p.drawPath(path)
+
+
+class CprDrawing(_DrawTool):
+    """Central Pivot Range over a user-selected bar range.
+
+    The CPR overlay in `indicators.py` derives its levels from the PREVIOUS
+    calendar session, which is the textbook read. This tool answers the other
+    question a scalper asks - "what is the pivot of *this* leg?" - by computing
+    the same formula over whatever range is boxed, and projecting the levels
+    across the box so they can be dragged onto the next move.
+
+        P  = (H + L + C) / 3     of the selected bars
+        BC = (H + L) / 2
+        TC = 2P - BC             (swapped if inverted)
+    """
+
+    P_COL = "#FF4081"
+    C_COL = "#00BCD4"
+
+    def __init__(self, p1, p2, get_bars_cb, **kw):
+        pos, size = _norm(p1, p2)
+        super().__init__(pos, size, **kw)
+        self.get_bars_cb = get_bars_cb
+        self.addScaleHandle([0, 0.5], [1, 0.5])
+        self.addScaleHandle([1, 0.5], [0, 0.5])
+        self.addScaleHandle([0.5, 1], [0.5, 0])
+        self.addScaleHandle([0.5, 0], [0.5, 1])
+
+    def levels(self) -> tuple[float, float, float] | None:
+        """(pivot, tc, bc) in PRICE, or None when the box holds no bars."""
+        bars = self.get_bars_cb(self.data_x(0),
+                                self.data_x(self.shape_rect().width())) or []
+        if not bars:
+            return None
+        hi = max(b.high for b in bars)
+        lo = min(b.low for b in bars)
+        close = bars[-1].close
+        pv = (hi + lo + close) / 3.0
+        bc = (hi + lo) / 2.0
+        tc = 2.0 * pv - bc
+        if tc < bc:
+            tc, bc = bc, tc
+        return pv, tc, bc
+
+    def paint(self, p: QPainter, *args) -> None:
+        r = self.shape_rect()
+        w, h = r.width(), r.height()
+        if w <= 0 or h <= 0:
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+        p.setPen(pg.mkPen("#5C9DFF", width=1, style=Qt.PenStyle.DashLine))
+        p.setBrush(QBrush(QColor(41, 98, 255, 14)))
+        p.drawRect(r)
+
+        lv = self.levels()
+        if lv is None:
+            return
+        pv, tc, bc = lv
+        tr = p.transform()
+        y_base = self.pos().y()
+        # price -> local y; the levels are real prices and need not sit inside
+        # the box the user happened to draw.
+        ly_p, ly_tc, ly_bc = (pv - y_base), (tc - y_base), (bc - y_base)
+
+        band = QColor(self.C_COL)
+        band.setAlpha(38)
+        p.fillRect(QRectF(0, min(ly_bc, ly_tc), w, abs(ly_tc - ly_bc)), band)
+
+        p.setPen(pg.mkPen(self.P_COL, width=2))
+        p.drawLine(QPointF(0, ly_p), QPointF(w, ly_p))
+        p.setPen(pg.mkPen(self.C_COL, width=1, style=Qt.PenStyle.DashLine))
+        for ly in (ly_tc, ly_bc):
+            p.drawLine(QPointF(0, ly), QPointF(w, ly))
+
+        for tag, ly, price, col in (("P", ly_p, pv, self.P_COL),
+                                    ("TC", ly_tc, tc, self.C_COL),
+                                    ("BC", ly_bc, bc, self.C_COL)):
+            self._text(p, tr, self.data_x(w), self.data_y(ly),
+                       f"{tag} {price:,.2f}", col)
+
+
 class FixedVolumeProfile(_DrawTool):
     """Volume-at-price over a user-selected bar range.
 
@@ -244,7 +409,7 @@ class FixedVolumeProfile(_DrawTool):
         self.addScaleHandle([0.5, 0], [0.5, 1])
 
     def paint(self, p: QPainter, *args) -> None:
-        r = self.boundingRect()
+        r = self.shape_rect()
         w, h = r.width(), r.height()
         if w <= 0 or h <= 0:
             return
