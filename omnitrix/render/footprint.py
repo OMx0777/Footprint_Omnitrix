@@ -17,6 +17,7 @@ from PyQt6.QtCore import QRectF, QPointF, Qt
 from PyQt6.QtGui import QFont, QColor, QPainter, QFontMetrics
 
 from .theme import Theme, DARK
+from .pricegrid import AUTO_STEPS, TARGET_PX_LABELLED, step_ticks
 
 
 class FootprintItem(pg.GraphicsObject):
@@ -25,14 +26,10 @@ class FootprintItem(pg.GraphicsObject):
     # Narrower than this (screen px across the whole block) and no cell label
     # can fit, so skip the text pass entirely rather than emit clipped digits.
     MIN_LABEL_PX = 26.0
-    # Auto price-step targets this many screen pixels per footprint row - about
-    # one line of the cell font plus breathing room, i.e. the point at which a
-    # row can actually carry its numbers.
-    AUTO_TARGET_PX = 14.0
-    # Ticks per row the auto mode is allowed to choose. A "nice" ladder, so the
-    # grid lands on round money (1c, 2c, 5c, 10c, 25c, 50c, $1 ... on a penny
-    # tick) instead of an arbitrary 7 or 13 that no one reads prices in.
-    AUTO_STEPS = (1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000)
+    # Shared with the Bookmap price grid so the two views cannot drift into
+    # different ideas of what a step means - see render/pricegrid.py.
+    AUTO_TARGET_PX = TARGET_PX_LABELLED
+    AUTO_STEPS = AUTO_STEPS
 
     def __init__(self, tick: float, theme: Theme = DARK):
         super().__init__()
@@ -169,22 +166,9 @@ class FootprintItem(pg.GraphicsObject):
                                   show_text)
 
     def _step_ticks(self, px_h: float) -> int:
-        """Ticks per drawn footprint row.
-
-        `px_h` is price units per screen pixel, so `AUTO_TARGET_PX * px_h` is
-        the price height a comfortable row wants; dividing by the tick turns
-        that into ticks.
-        """
-        tick = self.tick
-        if self.price_step > 0:
-            return max(1, int(round(self.price_step / tick)))
-        if px_h <= 0:
-            return 1
-        want = (self.AUTO_TARGET_PX * px_h) / tick
-        for s in self.AUTO_STEPS:
-            if s >= want:
-                return s
-        return self.AUTO_STEPS[-1]
+        """Ticks per drawn footprint row (`price_step` <= 0 selects auto)."""
+        return step_ticks(self.price_step, self.tick, px_h,
+                          self.AUTO_TARGET_PX)
 
     def _paint_candle(self, p, x, bar, color, half, tick) -> None:
         cx = x - half - self.CANDLE_GAP

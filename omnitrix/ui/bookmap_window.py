@@ -30,6 +30,7 @@ from ..render.bookmap import LOOK_LUTS as LOOKS
 RECENCY = {"Off": 0.0, "Light": 0.35, "Medium": 0.65, "Strong": 1.0}
 
 from ..render.bookmap import BOOKMAP_BG as BG
+from ..render.pricegrid import auto_step_ticks, TARGET_PX_BAND
 
 # label -> aggregation factor over the 1s base columns
 TF = {"1s": 1, "5s": 5, "10s": 10, "30s": 30, "1m": 60, "5m": 300,
@@ -41,7 +42,8 @@ BUBBLE_TF = {"Live": 1, "1s": 1, "2s": 2, "3s": 3, "5s": 5, "10s": 10,
              "30s": 30, "1m": 60, "5m": 300}
 
 # label -> price bucket in DOLLARS; converted to ticks against the instrument.
-PRICE_STEP = {"1 tick": 0.0, "1¢": 0.01, "5¢": 0.05, "10¢": 0.10,
+# -1 selects Auto (follow the zoom); 0 pins to exactly one tick.
+PRICE_STEP = {"Auto": -1.0, "1 tick": 0.0, "1¢": 0.01, "5¢": 0.05, "10¢": 0.10,
               "25¢": 0.25, "50¢": 0.50, "$1": 1.00}
 
 SIZE_STEPS = {"50%": 0.5, "75%": 0.75, "100%": 1.0, "150%": 1.5,
@@ -74,6 +76,11 @@ class BookmapWindow(QMainWindow):
         self.agg = 1
         self.bubble_bin = 1.0
         self.row_ticks = 1
+        # Must agree with the step combo's default item, which is the first key
+        # of PRICE_STEP: the handler is connected after addItems, so selecting
+        # the default never fires it and nothing else would sync this.
+        # The first refresh() resolves the actual grid.
+        self.auto_step = next(iter(PRICE_STEP.values())) < 0
         self.setWindowTitle(f"Omnitrix Bookmap — {buffer.symbol}")
         self.resize(1500, 860)
         self._follow = True
@@ -120,9 +127,15 @@ class BookmapWindow(QMainWindow):
         self.step_combo.setToolTip(
             "Collapse this many ticks into one heatmap row. Coarser rows draw "
             "thicker, readable bands instead of overlapping hairlines, and "
-            "sizes are summed within each band")
+            "sizes are summed within each band.\n"
+            "Auto follows the zoom: fine detail zoomed in, thick bands zoomed "
+            "out, without touching the control.")
         self.step_combo.currentTextChanged.connect(self._on_step)
         tb.addWidget(self.step_combo)
+        # Auto is otherwise opaque - show which grid it settled on.
+        self.lbl_step = QLabel("")
+        self.lbl_step.setStyleSheet("color:#8A93A6;font-weight:600;")
+        tb.addWidget(self.lbl_step)
 
         tb.addWidget(QLabel("   Type "))
         self.type_combo = QComboBox()
@@ -546,13 +559,58 @@ class BookmapWindow(QMainWindow):
 
     def _on_step(self, txt: str):
         dollars = PRICE_STEP.get(txt, 0.0)
-        # 0 means "one tick", whatever the instrument's tick happens to be.
-        rt = 1 if dollars <= 0 else max(1, int(round(dollars / self.tick)))
+        # -1 = Auto (resolved per refresh from the zoom); 0 = exactly one tick,
+        # whatever the instrument's tick happens to be.
+        self.auto_step = dollars < 0
+        if not self.auto_step:
+            self.lbl_step.setText("")          # the combo already names it
+            self._set_row_ticks(1 if dollars <= 0 else
+                                max(1, int(round(dollars / self.tick))))
+        else:
+            self._resolve_auto_step()
+        self.refresh()
+
+    def _set_row_ticks(self, rt: int) -> bool:
+        """Push one price grid to every consumer. Returns True if it changed.
+
+        Five items draw on this grid - the heat field, the DOM ladder and the
+        three tape overlays - and they must agree: a ladder bucketed differently
+        from the field behind it lines up with nothing, which is worse than
+        either grid alone.
+        """
+        if rt == self.row_ticks:
+            return False
         self.row_ticks = rt
         self.heat.row_ticks = rt
         self.dom_item.row_ticks = rt
         self._apply_tape()
-        self.refresh()
+        return True
+
+    def _resolve_auto_step(self) -> bool:
+        """Pick the grid from the current zoom. No-op unless Auto is selected.
+
+        Resolved here rather than inside each item's paint (as the footprint
+        does) precisely because five items share this grid - letting each derive
+        its own from its own viewport would let the DOM ladder and the field
+        disagree. The DOM y-axis is linked to the main plot, so one reading
+        serves both.
+
+        Targets a band rather than a text row: the heat field only has to stay
+        a visible band, and forcing footprint-sized rows here would throw away
+        most of the depth resolution the feed provides.
+        """
+        if not self.auto_step:
+            return False
+        vb = self.main.getViewBox()
+        if vb is None:
+            return False
+        px_h = vb.viewPixelSize()[1]
+        changed = self._set_row_ticks(
+            auto_step_ticks(px_h, self.tick, TARGET_PX_BAND))
+        px = self.row_ticks * self.tick
+        self.lbl_step.setText(f"({px * 100:.0f}¢)" if px < 1.0
+                              else f"(${px:,.2f})".replace(".00", ""))
+        return changed
 
     def _on_size(self, txt: str):
         sc = SIZE_STEPS.get(txt, 1.0)
@@ -605,6 +663,9 @@ class BookmapWindow(QMainWindow):
 
     # ---- data + view -----------------------------------------------------
     def refresh(self, initial: bool = False) -> None:
+        # Before anything reads row_ticks: a zoom changes the right grid, and
+        # this timer is what notices.
+        self._resolve_auto_step()
         cols = self.buffer.view(self.agg)
         if not cols:
             return
