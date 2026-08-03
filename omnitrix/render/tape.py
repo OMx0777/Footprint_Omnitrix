@@ -25,6 +25,12 @@ from PyQt6.QtCore import QRectF, QPointF, Qt
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont
 
 from .bookmap import BUY_BUBBLE, SELL_BUBBLE
+from PyQt6.QtGui import QColor as _QColor
+
+# A print that could not be classified is neither a lift nor a hit. Drawing
+# it in either colour asserts a direction the data does not contain, so it
+# gets its own neutral grey - the same choice the time-and-sales dock makes.
+UNKNOWN_BUBBLE = _QColor(150, 156, 168)
 
 BLOCK_RING = QColor(255, 214, 92)          # ring around institutional-size prints
 TAPE_BG = "#0E1319"
@@ -118,10 +124,15 @@ class TapePrintsItem(_TapeBase):
         rmin = self.min_r * self.size_scale
         rmax = self.max_r * self.size_scale
         block = self.block_size
-        for t, price, size, is_buy in vis:
+        for t, price, size, buy in vis:
             pt = tr.map(QPointF(t, price))
             r = rmin + (rmax - rmin) * math.sqrt(size / smax)
-            base = BUY_BUBBLE if is_buy else SELL_BUBBLE
+            # Three states, not two. `buy` is the print's buy SHARE, so an
+            # unclassifiable print splits evenly and gets a neutral dot instead
+            # of being drawn as a green lift it never was.
+            sell = size - buy
+            base = (BUY_BUBBLE if buy > sell
+                    else SELL_BUBBLE if sell > buy else UNKNOWN_BUBBLE)
             p.setBrush(QBrush(QColor(base.red(), base.green(), base.blue(), 225)))
             if size >= block:
                 # A block trade is the one print a scalper must not miss in a
@@ -154,7 +165,7 @@ class TapeSpeedItem(_TapeBase):
         b = max(self.bucket_s, 1e-6)
         out: dict[int, int] = {}
         get = out.get
-        for t, _price, _size, _is_buy in self.prints:
+        for t, _price, _size, _buy in self.prints:
             k = int(t // b)
             out[k] = get(k, 0) + 1
             get = out.get
@@ -201,8 +212,11 @@ class TapeCvdItem(_TapeBase):
     def _build_curve(self):
         xs, ys, acc = [], [], 0
         xa, ya = xs.append, ys.append
-        for t, _price, size, is_buy in self.prints:
-            acc += size if is_buy else -size
+        # buy - sell, where sell = size - buy. Was `+size if is_buy else -size`,
+        # which added the FULL size of every unclassified print to the buy side
+        # and made the curve drift upward all session.
+        for t, _price, size, buy in self.prints:
+            acc += 2 * buy - size
             xa(t)
             ya(acc)
         return xs, ys

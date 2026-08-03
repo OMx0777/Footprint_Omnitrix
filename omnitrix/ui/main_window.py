@@ -740,17 +740,37 @@ class OmnitrixWindow(QMainWindow):
         self._update_link()
 
     def _update_link(self) -> None:
-        """Show live-pipe status; blank for feeds that aren't pipe-based."""
+        """Show live-feed status; blank for feeds that aren't Takion-based."""
         conn = getattr(self.feed, "connected", None)
         if not isinstance(conn, dict):
             return
-        l1, l2 = bool(conn.get("l1")), bool(conn.get("l2"))
+        if "network" in conn:
+            l1 = l2 = bool(conn.get("network"))
+        else:
+            l1, l2 = bool(conn.get("l1")), bool(conn.get("l2"))
         if l1 and l2:
             txt, col = f"● LIVE  {len(self.series)} sym", "#26A69A"
         elif l1 or l2:
             txt, col = f"● PARTIAL  L1:{'✓' if l1 else '×'} L2:{'✓' if l2 else '×'}", "#FFB300"
         else:
             txt, col = "○ waiting for Takion…", "#EF5350"
+        # How much of the delta is evidence and how much is an even split.
+        # Every buy/sell figure on screen rests on this, so it belongs on the
+        # status line rather than in a log nobody reads: if `?` is large, the
+        # feed is not telling us who was aggressing and the deltas are weaker
+        # than they look.
+        q = getattr(self.feed, "quality", None)
+        if callable(q):
+            try:
+                m = q()
+                known = m["quote"] + m["mid"]
+                if m["unknown"] > 0.02 or known < 0.75:
+                    txt += (f"   flow {known:.0%} known"
+                            f"  ? {m['unknown']:.0%}")
+                    if m["unknown"] > 0.15:
+                        col = "#FFB300"
+            except Exception:
+                pass
         if self._dropped:
             # Visible, not silent: if the GUI cannot keep up you need to know the
             # chart is now an incomplete picture.

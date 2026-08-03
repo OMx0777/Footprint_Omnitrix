@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from .model import Trade, Aggressor, PriceLadder, EMPTY_LADDER
+from .model import (Trade, Aggressor, PriceLadder, EMPTY_LADDER,
+                    split_size)
 from .instruments import Instruments
 
 
@@ -59,17 +60,10 @@ class Bar:
             cell = [0, 0]
             self.cells[tick_index] = cell
 
-        if aggressor is Aggressor.BUY:
-            cell[1] += size
-            self.delta += size
-        elif aggressor is Aggressor.SELL:
-            cell[0] += size
-            self.delta -= size
-        else:  # UNKNOWN — split evenly, odd share to buy
-            half = size // 2
-            cell[0] += half
-            cell[1] += size - half
-            self.delta += (size - half) - half
+        buy, sell = split_size(size, aggressor, tick_index)
+        cell[0] += sell
+        cell[1] += buy
+        self.delta += buy - sell
 
         self.volume += size
         self._dirty = True
@@ -264,16 +258,12 @@ class BarSeries:
         self.sess_last = tr.price
         self.sess_volume += tr.size
         self.sess_trades += 1
-        if tr.aggressor is Aggressor.BUY:
-            self.sess_delta += tr.size
-        elif tr.aggressor is Aggressor.SELL:
-            self.sess_delta -= tr.size
-        else:
-            # Must mirror Bar.add() exactly: an UNKNOWN print is split evenly
-            # with the odd share going to the buy side, contributing +1 to delta
-            # on odd sizes. Ignoring it here made the monitor's session delta
-            # drift from the charted delta by one per odd mid-print.
-            self.sess_delta += tr.size - 2 * (tr.size // 2)
+        # Same split as Bar.add, via the one shared definition - deriving it
+        # separately here is exactly how the monitor's session delta drifted
+        # from the charted delta.
+        b, s = split_size(tr.size, tr.aggressor,
+                          self.instruments.to_index(self.symbol, tr.price))
+        self.sess_delta += b - s
 
     def add_trade(self, tr: Trade) -> None:
         bucket = (tr.ts_ms // 1000 // self.base_tf_s) * self.base_tf_s

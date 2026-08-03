@@ -14,6 +14,8 @@ from __future__ import annotations
 import math
 import numpy as np
 import pyqtgraph as pg
+
+from ..engine.model import split_size
 from PyQt6.QtCore import QRectF, QPointF, Qt
 from PyQt6.QtGui import (QColor, QPainter, QFont, QPen, QBrush, QRadialGradient,
                          QImage)
@@ -505,10 +507,15 @@ class _TapeItem(_BufItem):
             e = cells.get(key)
             if e is None:
                 e = cells[key] = [0, 0]
-            if aggr.value == "sell":
-                e[1] += size
-            else:
-                e[0] += size
+            # THE one split (model.split_size). This used to be
+            # `if sell: ... else: buy`, which counted every UNKNOWN print as
+            # 100% buying - so a bubble was green whenever the print could not
+            # be classified, and the overlay systematically overstated buying
+            # by the whole unclassified volume. That is the "everything is
+            # green" report, and it was false data, not a colour choice.
+            b, s = split_size(size, aggr, ti)
+            e[0] += b
+            e[1] += s
         return cells
 
     def _binned(self) -> list[tuple]:

@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QToolBar, QLabel, QComboBox, QCheckBox, QPushButton,
 )
 
+from ..engine.model import split_size
 from ..render.tape import TapePrintsItem, TapeSpeedItem, TapeCvdItem, TAPE_BG
 
 # label -> seconds held in view
@@ -165,7 +166,14 @@ class TapeWindow(QMainWindow):
 
     # ---- data ------------------------------------------------------------
     def _window(self):
-        """The visible tape only: ([(t_s, price, size, is_buy)], lo, hi, stats).
+        """The visible tape only: ([(t_s, price, size, buy)], lo, hi, stats).
+
+        The fourth element is the print's BUY SHARE, not a boolean. It used to
+        be `is_buy = aggr.value != "sell"`, which made every UNKNOWN print a
+        full buy - colouring it green and, worse, adding its whole size to the
+        CVD line. A cumulative-delta curve biased upward by all unclassified
+        volume is not a slow chart, it is a wrong one. Carrying the split lets
+        the dots take a third, neutral colour and the CVD stay exact.
 
         Walks the deque BACKWARDS and stops at the window edge. Converting the
         whole 60,000-print tape every frame cost 790 ms against a 60 ms timer -
@@ -189,13 +197,12 @@ class TapeWindow(QMainWindow):
             t = x * dt
             if t < lo:
                 break
-            is_buy = aggr.value != "sell"
-            out.append((t, ti * tick, size, is_buy))
+            b, _s = split_size(size, aggr, ti)
+            out.append((t, ti * tick, size, b))
             vol += size
-            if is_buy:
-                buy += size
+            buy += b
         out.reverse()
-        return out, lo, hi, (len(out), vol, buy - (vol - buy))
+        return out, lo, hi, (len(out), vol, 2 * buy - vol)
 
     def refresh(self) -> None:
         vis, lo, hi, (n, vol, delta) = self._window()

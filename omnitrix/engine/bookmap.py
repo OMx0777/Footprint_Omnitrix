@@ -25,7 +25,7 @@ from collections import deque
 
 import numpy as np
 
-from .model import Aggressor, PriceLadder, EMPTY_LADDER
+from .model import Aggressor, PriceLadder, EMPTY_LADDER, split_size
 from .instruments import Instruments
 
 
@@ -134,14 +134,14 @@ class BookmapBuffer:
     def add_trade(self, tr) -> None:
         c = self._col(tr.ts_ms)
         ti = self.instruments.to_index(self.symbol, tr.price)
-        if tr.aggressor is Aggressor.BUY:
-            c.buy[ti] = c.buy.get(ti, 0) + tr.size
-        elif tr.aggressor is Aggressor.SELL:
-            c.sell[ti] = c.sell.get(ti, 0) + tr.size
-        else:
-            h = tr.size // 2
-            c.buy[ti] = c.buy.get(ti, 0) + h
-            c.sell[ti] = c.sell.get(ti, 0) + tr.size - h
+        # One shared split (see model.split_size): this used to give the odd
+        # share of an UNKNOWN print to SELL while the footprint gave it to BUY,
+        # so the two panes disagreed about the same trade.
+        buy, sell = split_size(tr.size, tr.aggressor, ti)
+        if buy:
+            c.buy[ti] = c.buy.get(ti, 0) + buy
+        if sell:
+            c.sell[ti] = c.sell.get(ti, 0) + sell
         c.vol += tr.size
         x = (tr.ts_ms / 1000.0) / self.col_dt
         self.trades.append((x, ti, tr.size, tr.aggressor))

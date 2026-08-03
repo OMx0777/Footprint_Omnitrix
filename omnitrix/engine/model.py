@@ -26,6 +26,41 @@ class Aggressor(str, Enum):
     UNKNOWN = "unknown"
 
 
+def split_size(size: int, aggressor: Aggressor, tick_index: int) -> tuple[int, int]:
+    """One print -> (buy_volume, sell_volume). THE definition of the split.
+
+    Every consumer must route an UNKNOWN print through here. Four places used
+    to decide this independently and three of them were wrong in ways that all
+    leaned the same direction - green:
+
+      * the bubble / pie / split-bar overlay counted UNKNOWN as 100% BUY;
+      * the tape reader's prints and CVD did the same;
+      * the footprint gave the odd share of an odd split to BUY while the
+        bookmap gave it to SELL, so the two panes disagreed about the same
+        trade.
+
+    An UNKNOWN print carries no directional information, so attributing all of
+    it to either side is fabricating data. It is split evenly.
+
+    The odd share of an odd size cannot be split in integers, so it alternates
+    on the PRICE's parity. That matters: a fixed side accumulates a real bias
+    (a 1-lot unclassified print would count as a whole buy, every time), while
+    keying on the trade itself - not on a per-consumer counter - keeps every
+    consumer in agreement about the same print. Over any price walk the
+    residual averages to zero instead of accumulating.
+
+    buy + sell == size always, which the session-figure derivations rely on.
+    """
+    if aggressor is Aggressor.BUY:
+        return size, 0
+    if aggressor is Aggressor.SELL:
+        return 0, size
+    buy = size // 2
+    if (size & 1) and (tick_index & 1):
+        buy += 1
+    return buy, size - buy
+
+
 @dataclass(slots=True, frozen=True)
 class Trade:
     """A single time-and-sales print."""
