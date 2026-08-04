@@ -31,6 +31,7 @@ RECENCY = {"Off": 0.0, "Light": 0.35, "Medium": 0.65, "Strong": 1.0}
 
 from ..render.bookmap import BOOKMAP_BG as BG
 from ..render.pricegrid import auto_step_ticks, TARGET_PX_BAND
+from ..render.crosshair import Crosshair
 
 # label -> aggregation factor over the 1s base columns
 TF = {"1s": 1, "5s": 5, "10s": 10, "30s": 30, "1m": 60, "5m": 300,
@@ -360,6 +361,14 @@ class BookmapWindow(QMainWindow):
 
         vb.sigRangeChangedManually.connect(self._on_manual)
         self.glw.scene().sigMouseClicked.connect(self._on_click)
+        # Badges only: this window already owns its crosshair lines and a rich
+        # hover readout, so a second set of lines would fight the first.
+        self.xhair = Crosshair(
+            self.main,
+            x_label=lambda x: time.strftime(
+                "%H:%M:%S",
+                time.localtime(x * self.buffer.col_dt * self.agg)),
+            add_lines=False, connect=False)
         self.glw.scene().sigMouseMoved.connect(self._on_mouse_move)
 
     # ---- ticker search ---------------------------------------------------
@@ -434,11 +443,13 @@ class BookmapWindow(QMainWindow):
         if not self.main.sceneBoundingRect().contains(pos):
             for it in (self.cx_v, self.cx_h, self.readout):
                 it.setVisible(False)
+            self.xhair.hide()
             return
         mp = vb.mapSceneToView(pos)
         price, x = mp.y(), mp.x()
         self.cx_v.setPos(x)
         self.cx_h.setPos(price)
+        self.xhair.set(x, price)
 
         ti = int(round(price / self.tick))
         cols = self.buffer.view(self.agg)

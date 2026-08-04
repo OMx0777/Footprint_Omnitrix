@@ -13,7 +13,10 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QMainWindow, QToolBar, QLabel, QComboBox
 
+import time
+
 from ..engine import metrics
+from ..render.crosshair import Crosshair
 from .bookmap_window import TF
 
 BG = "#0B0E14"
@@ -74,6 +77,17 @@ class AnalyticsWindow(QMainWindow):
                 a = pl.getAxis(ax)
                 a.setPen(pg.mkPen("#2A3140")); a.setTextPen(pg.mkPen("#8A93A6"))
             self.plots.append(pl)
+
+        # Every pane shares the x axis, so each gets its own readout: the y
+        # value differs per pane (imbalance, depth, ticks, volume) and reading
+        # it off the axis by eye is exactly what a crosshair is for.
+        self.xhairs = [
+            Crosshair(pl,
+                      x_label=lambda x: time.strftime(
+                          "%H:%M:%S",
+                          time.localtime(x * self.buffer.col_dt * self.agg)),
+                      price_fmt="{:,.2f}")
+            for pl in self.plots]
 
         p_imb, p_depth, p_spread, p_speed = self.plots
 

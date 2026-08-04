@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 
 from ..engine.model import split_size
 from ..render.tape import TapePrintsItem, TapeSpeedItem, TapeCvdItem, TAPE_BG
+from ..render.crosshair import Crosshair
 
 # label -> seconds held in view
 SPANS = {"15s": 15, "30s": 30, "1m": 60, "2m": 120, "5m": 300, "10m": 600}
@@ -161,6 +162,11 @@ class TapeWindow(QMainWindow):
             labelOpts={"position": 0.98, "color": "#0A0E16",
                        "fill": "#D8DCE4", "movable": False})
         self.main.addItem(self.last_line, ignoreBounds=True)
+
+        # x is epoch seconds here, so the time badge is a direct clock format.
+        self.xhair = Crosshair(
+            self.main,
+            x_label=lambda x: time.strftime("%H:%M:%S", time.localtime(x)))
 
         self.main.getViewBox().sigRangeChangedManually.connect(self._on_manual)
 

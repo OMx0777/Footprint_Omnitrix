@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..render import TPOItem, VolumeProfileItem
+from ..render.crosshair import Crosshair
 
 BG = "#0B0E14"
 
@@ -86,6 +87,11 @@ class ProfileWindow(QMainWindow):
             for ax in ("right", "bottom"):
                 a = plot.getAxis(ax)
                 a.setPen(pg.mkPen("#2A3140")); a.setTextPen(pg.mkPen("#8A93A6"))
+
+        # x is a TPO bracket / a volume ratio, not a time, so no time badge -
+        # inventing one would label the axis with something it does not mean.
+        self.xhair_tpo = Crosshair(self.tpo_plot)
+        self.xhair_vp = Crosshair(self.vp_plot)
 
         self.tpo_item = TPOItem(self.tick)
         self.tpo_plot.addItem(self.tpo_item)

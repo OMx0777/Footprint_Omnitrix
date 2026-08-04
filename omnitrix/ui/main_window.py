@@ -22,7 +22,7 @@ from ..engine import (
 )
 from ..engine.model import Trade, BookSnapshot
 from ..render import (
-    FootprintItem, HeatmapItem, DARK, LIGHT, TimeAxis,
+    FootprintItem, HeatmapItem, DARK, LIGHT, TimeAxis, Crosshair,
     FibRetracement, PositionDrawer, FixedVolumeProfile, PenDrawing,
     CprDrawing, PriceLevel, MeasureTool, EMAItem, CPRItem
 )
@@ -460,28 +460,13 @@ class OmnitrixWindow(QMainWindow):
         self.price_plot.addItem(self.vline, ignoreBounds=True)
         self.price_plot.addItem(self.hline, ignoreBounds=True)
 
-        # Crosshair readouts, placed at the ENDS of the two lines - price on the
-        # right edge beside the price axis, time on the bottom edge beside the
-        # time axis - the way a terminal marks the crosshair. Putting them next
-        # to the pointer means the value sits on top of the candles you are
-        # reading, which is precisely where it is most in the way.
-        def _badge(colour):
-            it = pg.TextItem(color="#0B0E14", anchor=(0, 0.5),
-                             fill=pg.mkBrush(colour))
-            it.setZValue(90)
-            it.setVisible(False)
-            self.price_plot.addItem(it, ignoreBounds=True)
-            return it
-
-        self.xhair_price = _badge("#9FB0C8")
-        self.xhair_time = _badge("#9FB0C8")
-        self.xhair_time.setAnchor((0.5, 0))
+        # Same component every other chart uses - see render/crosshair.py.
+        # Lines are owned here (the drawing tools read them), badges by it.
+        self.xhair = Crosshair(self.price_plot, x_label=self._time_at,
+                               add_lines=False, connect=False)
+        self.xhair_price = self.xhair.price      # kept: workspace + tests
+        self.xhair_time = self.xhair.time
         self._last_cursor = None
-        # Zooming or panning moves the edges the badges are pinned to, and the
-        # pointer need not move for that to happen.
-        self.price_plot.vb.sigRangeChanged.connect(
-            lambda *_: self._place_xhair_badges())
-
         self.glw.scene().sigMouseMoved.connect(self._on_mouse_move)
         # Rubber band shown between the two creation clicks.
         self._preview = QGraphicsRectItem()
@@ -1036,26 +1021,11 @@ class OmnitrixWindow(QMainWindow):
         return time.strftime(fmt, lt)
 
     def _place_xhair_badges(self) -> None:
-        """Pin the readouts to the ends of the crosshair lines."""
-        if self._last_cursor is None:
-            return
-        x, y = self._last_cursor
-        (x0, x1), (y0, y1) = self.price_plot.vb.viewRange()
-        # Price rides the horizontal line to the right edge; time rides the
-        # vertical line to the bottom edge. Anchors were chosen so the badge
-        # sits just inside the plot rather than under the axis.
-        self.xhair_price.setText(f"{y:,.2f}")
-        self.xhair_price.setPos(x1, y)
-        label = self._time_at(x)
-        self.xhair_time.setText(label)
-        self.xhair_time.setPos(x, y0)
-        self.xhair_price.setVisible(True)
-        self.xhair_time.setVisible(bool(label))
+        self.xhair.place()
 
     def _hide_xhair_badges(self) -> None:
         self._last_cursor = None
-        self.xhair_price.setVisible(False)
-        self.xhair_time.setVisible(False)
+        self.xhair.hide()
 
     def _on_mouse_move(self, pos) -> None:
         if not self.price_plot.sceneBoundingRect().contains(pos):
@@ -1067,7 +1037,7 @@ class OmnitrixWindow(QMainWindow):
             self.vline.setPos(mp.x())
             self.hline.setPos(mp.y())
             self._last_cursor = (mp.x(), mp.y())
-            self._place_xhair_badges()
+            self.xhair.set(mp.x(), mp.y())
             if self.active_drawing_tool == "Pen":
                 self._pen_move(mp)
                 return
