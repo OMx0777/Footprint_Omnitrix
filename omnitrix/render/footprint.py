@@ -231,11 +231,19 @@ class FootprintItem(pg.GraphicsObject):
         max_abs_d = max((abs(b - s) for _t, s, b in cells), default=1) or 1
 
         tr = p.transform()
+        # Skip rows that are off screen. Qt clipped them anyway, so the picture
+        # is unchanged - but the Python loop, the QRectF and the fillRect call
+        # all happened first. A bar holds every price it traded at; a zoomed-in
+        # view shows a fraction of them.
+        vb = self.getViewBox()
+        y_min, y_max = vb.viewRange()[1] if vb is not None else (-1e18, 1e18)
         for ti, sell_v, buy_v in cells:
             tot = sell_v + buy_v
             if tot == 0:
                 continue
             y = ti * row_h - row_h / 2
+            if y > y_max or y + row_h < y_min:
+                continue
             is_poc = ti == poc
 
             if mode == "Footprint":

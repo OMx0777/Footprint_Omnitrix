@@ -46,12 +46,17 @@ log = logging.getLogger(__name__)
 # dicts), so this is really a memory budget: 120,000 events is ~2.7 GB worst
 # case if every one is a book, versus 13.6 GB at the 600,000 it used to be.
 #
-# Raised from 40,000 after live 100-symbol sessions reported "dropped 14,817".
-# 40,000 was sized against the census AVERAGE of ~500 events/sec, but the DLL
-# sweeps far faster than its average at the open, and a queue is exactly the
-# thing that should absorb that. Dropping market data to save memory is the
-# wrong trade at this scale; the drain below is what keeps the backlog short.
-EVENT_QUEUE_MAX = 120_000
+# Raised from 40,000 after live 100-symbol sessions reported "dropped 14,817",
+# then trimmed to 60,000 once the drain was fixed (4,467 -> 19,138 events/sec).
+#
+# Sized for the deployment target: a 16 GB machine that is ALSO running Takion.
+# After Windows, Takion and a no-swap margin, Omnitrix has roughly 8 GB, and a
+# safety valve that can itself consume 2.7 GB of that (120,000 books) is not a
+# safety valve - it is the thing that pushes the box into swap, which is the
+# failure it exists to prevent. 60,000 caps the worst case at ~1.4 GB and is
+# still ~30 seconds of burst at the measured arrival rate against a drain that
+# clears 19,000 events/sec.
+EVENT_QUEUE_MAX = 60_000
 
 # Wall-clock budget for one drain pass, in seconds. A COUNT cap cannot bound
 # time: at 75 us/event the old 40,000-event cap allowed a single frame to block
