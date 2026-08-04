@@ -90,9 +90,16 @@ class SettingsDialog(QDialog):
         # colour pickers
         self.c_bull = _ColorButton(QColor(t.bull))
         self.c_bear = _ColorButton(QColor(t.bear))
+        # Candle styling is independent of the semantic up/down above.
+        self.c_cup = _ColorButton(QColor(getattr(t, "candle_up", t.bull)))
+        self.c_cdn = _ColorButton(QColor(getattr(t, "candle_down", t.bear)))
+        self.c_wick = _ColorButton(QColor(getattr(t, "candle_wick", "#8A8F9A")))
         self.c_buy = _ColorButton(t.buy_imb)
         self.c_sell = _ColorButton(t.sell_imb)
         for label, btn in (("Up / buy", self.c_bull), ("Down / sell", self.c_bear),
+                           ("Candle up", self.c_cup),
+                           ("Candle down", self.c_cdn),
+                           ("Candle wick", self.c_wick),
                            ("Buy imbalance", self.c_buy), ("Sell imbalance", self.c_sell)):
             form.addRow(label, btn)
 
@@ -114,6 +121,9 @@ class SettingsDialog(QDialog):
             "show_candles": self.chk_candles.isChecked(),
             "bull": self.c_bull.color().name(),
             "bear": self.c_bear.color().name(),
+            "candle_up": self.c_cup.color().name(),
+            "candle_down": self.c_cdn.color().name(),
+            "candle_wick": self.c_wick.color().name(),
             "buy_imb": self.c_buy.color(),
             "sell_imb": self.c_sell.color(),
         }

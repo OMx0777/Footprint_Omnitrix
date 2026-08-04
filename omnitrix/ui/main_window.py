@@ -1039,6 +1039,9 @@ class OmnitrixWindow(QMainWindow):
         self.heatmap.gamma = v["hm_gamma"]
         # colour overrides -> new immutable theme
         self.theme = replace(self.theme, bull=v["bull"], bear=v["bear"],
+                             candle_up=v["candle_up"],
+                             candle_down=v["candle_down"],
+                             candle_wick=v["candle_wick"],
                              buy_imb=v["buy_imb"], sell_imb=v["sell_imb"])
         self._apply_theme()
         self._dirty = True

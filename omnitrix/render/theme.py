@@ -15,8 +15,16 @@ class Theme:
     text: str
     axis: str
 
-    bull: str          # up candle
-    bear: str          # down candle
+    bull: str          # semantic "up": delta, CVD, imbalance, depth
+    bear: str          # semantic "down"
+
+    # Candle styling is SEPARATE from the semantic bull/bear above. Tying them
+    # together means restyling the candles also repaints delta bars, the CVD
+    # line and the imbalance highlights - which is not what "make the down
+    # candles purple" should do.
+    candle_up: str
+    candle_down: str
+    candle_wick: str   # thin, neutral: the wick is a range, not a direction
 
     bid_bg: QColor     # sell column background
     ask_bg: QColor     # buy column background
@@ -44,6 +52,9 @@ DARK = Theme(
     axis="#2A3140",
     bull="#26A69A",
     bear="#EF5350",
+    candle_up="#26A69A",        # green  — closed above the open
+    candle_down="#9C5CFF",      # purple — closed below the open
+    candle_wick="#8A8F9A",      # grey   — the high/low range
     bid_bg=QColor(60, 22, 26),      # muted red field
     ask_bg=QColor(18, 52, 44),      # muted green field
     poc_bg=QColor(230, 232, 238),
@@ -69,6 +80,9 @@ LIGHT = Theme(
     axis="#B7BDC7",
     bull="#00897B",
     bear="#E53935",
+    candle_up="#00897B",
+    candle_down="#7B3FE4",
+    candle_wick="#6E7480",
     bid_bg=QColor(252, 228, 232),
     ask_bg=QColor(224, 242, 237),
     poc_bg=QColor(26, 26, 26),
