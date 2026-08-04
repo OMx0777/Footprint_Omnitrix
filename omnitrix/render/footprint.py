@@ -151,13 +151,8 @@ class FootprintItem(pg.GraphicsObject):
         x_lo = max(0, int(xr[0]) - 1)
         x_hi = min(len(self.bars), int(xr[1]) + 2)
 
-        # Candle colours, not the semantic bull/bear - see Theme.
-        c_bull = QColor(getattr(t, "candle_up", t.bull))
-        c_bear = QColor(getattr(t, "candle_down", t.bear))
-        # One thin neutral pen for every wick: the high/low range has no
-        # direction, so colouring it by the body just doubles the signal.
-        wick_pen = pg.mkPen(QColor(getattr(t, "candle_wick", "#8A8F9A")),
-                            width=1)
+        c_bull = QColor(t.bull)
+        c_bear = QColor(t.bear)
         # Pens, brushes and theme colours built ONCE per frame, not per bar and
         # not per cell. Profiling a 150-bar view found 2,250 mkPen and 3,000
         # mkColor calls a frame - rebuilding identical objects cost as much as
@@ -178,7 +173,7 @@ class FootprintItem(pg.GraphicsObject):
             cc = c_bull if bar.is_bull else c_bear
             if self.show_candles:
                 self._paint_candle(p, x, bar, cc, half, tick,
-                                   wick_pen, pens[(cc.name(), 1)],
+                                   pens[(cc.name(), 2)], pens[(cc.name(), 1)],
                                    brushes[cc.name()])
             if self.draw_cells and bar.has_cells():
                 # Fold onto the drawn grid first, so POC, value area and the
@@ -192,9 +187,9 @@ class FootprintItem(pg.GraphicsObject):
                           self.AUTO_TARGET_PX)
 
     def _paint_candle(self, p, x, bar, color, half, tick,
-                      wick_pen, pen1, brush) -> None:
+                      pen2, pen1, brush) -> None:
         cx = x - half - self.CANDLE_GAP
-        p.setPen(wick_pen)
+        p.setPen(pen2)
         p.drawLine(QPointF(cx, bar.low), QPointF(cx, bar.high))
         top = max(bar.open, bar.close)
         bot = min(bar.open, bar.close)
