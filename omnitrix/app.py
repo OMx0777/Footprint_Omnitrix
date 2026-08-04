@@ -70,7 +70,7 @@ def main() -> int:
     ap.add_argument("--network", metavar="HOST[:PORT]",
                     default=os.environ.get("OMNITRIX_HOST", ""),
                     help="connect to a remote Takion broadcaster "
-                         "(e.g. 192.168.2.53:9999)")
+                         "(e.g. 192.168.1.50:9999)")
     args = ap.parse_args()
 
     logging.basicConfig(
