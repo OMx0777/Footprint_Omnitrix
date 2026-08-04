@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 
 from ..render import TPOItem, VolumeProfileItem
 from ..render.crosshair import Crosshair
+from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
 
 BG = "#0B0E14"
 
@@ -30,9 +31,9 @@ class ProfileWindow(QMainWindow):
         self._build_toolbar()
         self._build_plots()
 
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self.refresh)
-        self._timer.start(400)
+        self._timer = GovernedTimer(self, self.refresh, 400,
+                                    priority=1)
+        self._timer.start()
         self.refresh()
 
     def _build_toolbar(self) -> None:
@@ -64,7 +65,7 @@ class ProfileWindow(QMainWindow):
             " border-radius:4px;padding:4px 10px;font-weight:600;}")
 
     def _build_plots(self) -> None:
-        self.glw = pg.GraphicsLayoutWidget()
+        self.glw = GovernedPlotWidget(gov_key=id(self))
         self.glw.setBackground(BG)
         self.setCentralWidget(self.glw)
 
@@ -127,7 +128,9 @@ class ProfileWindow(QMainWindow):
         # (98.5 ms of 104 ms at four windows), so skipping an unseen one is the
         # cheapest frame in the app.
         if not self.isVisible() or self.isMinimized():
+            GOVERNOR.set_alive(id(self), False)
             return
+        GOVERNOR.set_alive(id(self), True)
         prof = self.profile
         a = prof.analytics(self.va_pct)
         rows = prof.tpo_rows()

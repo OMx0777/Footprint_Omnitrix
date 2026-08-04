@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 
+from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
 from ..engine import metrics
 
 COLS = ["Symbol", "Last", "Chg", "Chg %", "Volume", "Delta", "CVD",
@@ -60,9 +61,9 @@ class MarketMonitorWindow(QMainWindow):
             " padding:6px;border:none;font-weight:700;}")
 
         self._rows: dict[str, int] = {}
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self.refresh)
-        self._timer.start(500)
+        self._timer = GovernedTimer(self, self.refresh, 500,
+                                    priority=1)
+        self._timer.start()
         self.refresh()
 
     def _cell(self, r: int, c: int, text: str, color=NEUTRAL, bold=False):
@@ -85,7 +86,9 @@ class MarketMonitorWindow(QMainWindow):
         # (98.5 ms of 104 ms at four windows), so skipping an unseen one is the
         # cheapest frame in the app.
         if not self.isVisible() or self.isMinimized():
+            GOVERNOR.set_alive(id(self), False)
             return
+        GOVERNOR.set_alive(id(self), True)
         app = self.app
         for sym in sorted(app.series):
             if sym not in self._rows:

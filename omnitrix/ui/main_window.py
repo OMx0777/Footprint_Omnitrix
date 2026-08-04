@@ -17,12 +17,13 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QDockWidget, QLineEdit, QGraphicsRectItem,
 )
 
+from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
 from ..engine import (
     Instruments, BarSeries, BookmapBuffer, SessionProfile, Feed,
 )
 from ..engine.model import Trade, BookSnapshot
 from ..render import (
-    FootprintItem, HeatmapItem, DARK, LIGHT, TimeAxis, Crosshair,
+    FootprintItem, HeatmapItem, DARK, LIGHT, TimeAxis, PriceAxis, Crosshair,
     FibRetracement, PositionDrawer, FixedVolumeProfile, PenDrawing,
     CprDrawing, PriceLevel, MeasureTool, EMAItem, CPRItem,
     ExecutionMarkersItem
@@ -155,9 +156,12 @@ class OmnitrixWindow(QMainWindow):
         self._pending_symbol = ""
         workspace.restore(self)               # reapply the last saved desk
 
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(33)                 # ~30 fps drain + redraw
+        # Priority 0: this is the chart being traded from. When the shared
+        # budget is tight, every other window gives way to this one.
+        self._timer = GovernedTimer(self, self._tick, 33, priority=0)
+        self.glw.set_gov_key(id(self))
+        GOVERNOR.set_focus(id(self))
+        self._timer.start()
 
     def start_feed(self) -> None:
         """Begin streaming.
@@ -400,7 +404,7 @@ class OmnitrixWindow(QMainWindow):
         dtb.addWidget(btn_clear_drawings)
 
         # ---- two linked panes: price (top), CVD (bottom) ----
-        self.glw = pg.GraphicsLayoutWidget()
+        self.glw = GovernedPlotWidget()
         self.setCentralWidget(self.glw)
 
         # TradingView-style ticker search: start typing a symbol anywhere on the
@@ -423,8 +427,15 @@ class OmnitrixWindow(QMainWindow):
         # belongs to the plot it was built into and cannot be moved between
         # them, so the second one is created up front and kept in sync.
         self.price_time_axis = TimeAxis(orientation="bottom")
+        # The price scale reads the instrument's tick through a callable rather
+        # than a captured value: the tick is a Settings field, and the axis has
+        # to follow a change without the plot being rebuilt.
+        self.price_axis = PriceAxis(
+            orientation="right",
+            tick_fn=lambda: self.instruments.tick(self.active_symbol or "QQQ"))
         self.price_plot = self.glw.addPlot(
-            row=0, col=0, axisItems={"bottom": self.price_time_axis})
+            row=0, col=0, axisItems={"bottom": self.price_time_axis,
+                                     "right": self.price_axis})
         self.price_plot.showAxis("right")
         self.price_plot.hideAxis("left")
         self.price_plot.hideAxis("bottom")     # CVD pane carries it by default
@@ -1352,6 +1363,12 @@ class OmnitrixWindow(QMainWindow):
         self.price_plot.setYRange(lo - margin, hi + margin, padding=0)
         self.price_plot.setXRange(max(-1, len(bars) - 22), len(bars) + 3, padding=0)
         self.auto_scroll = True
+
+    def changeEvent(self, ev):
+        if (ev.type() == QEvent.Type.ActivationChange
+                and self.isActiveWindow()):
+            GOVERNOR.set_focus(id(self))
+        super().changeEvent(ev)
 
     def closeEvent(self, event) -> None:
         workspace.save(self)                  # remember the desk for next time

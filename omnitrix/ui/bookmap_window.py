@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QToolBar, QLabel, QComboBox, QPushButton, QCheckBox, QLineEdit,
 )
 
+from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
 from ..engine import BookmapBuffer, SRTracker
 from ..render import (
     BookHeatmapItem, BBOItem, BubbleItem, PieItem, BarsItem, ProjectionItem,
@@ -95,9 +96,11 @@ class BookmapWindow(QMainWindow):
         self._build_toolbar()
         self._build_plots()
 
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self.refresh)
-        self._timer.start(80)                 # ~12.5 fps data refresh
+        # Priority 1: useful, but not the window being traded from. These are
+        # what get stretched when four of them are open at once.
+        self._timer = GovernedTimer(self, self.refresh, 80, priority=1)
+        self.glw.set_gov_key(id(self))
+        self._timer.start()
         self.refresh(initial=True)
 
     # ---- toolbar ---------------------------------------------------------
@@ -240,7 +243,7 @@ class BookmapWindow(QMainWindow):
 
     # ---- plots -----------------------------------------------------------
     def _build_plots(self) -> None:
-        self.glw = pg.GraphicsLayoutWidget()
+        self.glw = GovernedPlotWidget(gov_key=id(self))
         self.glw.setBackground(BG)
         self.setCentralWidget(self.glw)
 
@@ -671,6 +674,22 @@ class BookmapWindow(QMainWindow):
         self.bars.setVisible(txt == "Bars")
         self.refresh()
 
+    # ---- lifecycle -------------------------------------------------------
+    def changeEvent(self, ev):
+        """Follow the user's attention.
+
+        Whichever window is active is the one whose frame rate can actually be
+        perceived, so it is the one the budget protects.
+        """
+        from PyQt6.QtCore import QEvent as _QEvent
+        if ev.type() == _QEvent.Type.ActivationChange and self.isActiveWindow():
+            GOVERNOR.set_focus(id(self))
+        super().changeEvent(ev)
+
+    def closeEvent(self, ev):
+        self._timer.release()
+        super().closeEvent(ev)
+
     # ---- data + view -----------------------------------------------------
     def refresh(self, initial: bool = False) -> None:
         # A window you cannot see does not need live data. Every one of these
@@ -680,7 +699,13 @@ class BookmapWindow(QMainWindow):
         # (98.5 ms of 104 ms at four windows), so skipping an unseen one is the
         # cheapest frame in the app.
         if not self.isVisible() or self.isMinimized():
+            # Returning early is not enough: the governor still counts this
+            # window's measured cost against the shared budget, so three
+            # minimised bookmaps would go on throttling the one you are
+            # looking at. Hand the budget back.
+            GOVERNOR.set_alive(id(self), False)
             return
+        GOVERNOR.set_alive(id(self), True)
         # Before anything reads row_ticks: a zoom changes the right grid, and
         # this timer is what notices.
         self._resolve_auto_step()

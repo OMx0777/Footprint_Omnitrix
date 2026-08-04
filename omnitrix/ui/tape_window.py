@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
 from ..engine.model import split_size
 from ..render.tape import TapePrintsItem, TapeSpeedItem, TapeCvdItem, TAPE_BG
 from ..render.crosshair import Crosshair, clock_label
+from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
 
 # label -> seconds held in view
 SPANS = {"15s": 15, "30s": 30, "1m": 60, "2m": 120, "5m": 300, "10m": 600}
@@ -50,9 +51,9 @@ class TapeWindow(QMainWindow):
         self._build_toolbar()
         self._build_plots()
 
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self.refresh)
-        self._timer.start(60)              # a tape has to feel immediate
+        self._timer = GovernedTimer(self, self.refresh, 60,
+                                    priority=1)              # a tape has to feel immediate
+        self._timer.start()
         self.refresh()
 
     # ---- toolbar ---------------------------------------------------------
@@ -114,7 +115,7 @@ class TapeWindow(QMainWindow):
 
     # ---- plots -----------------------------------------------------------
     def _build_plots(self) -> None:
-        self.glw = pg.GraphicsLayoutWidget()
+        self.glw = GovernedPlotWidget(gov_key=id(self))
         self.glw.setBackground(TAPE_BG)
         self.setCentralWidget(self.glw)
 
@@ -218,7 +219,9 @@ class TapeWindow(QMainWindow):
         # (98.5 ms of 104 ms at four windows), so skipping an unseen one is the
         # cheapest frame in the app.
         if not self.isVisible() or self.isMinimized():
+            GOVERNOR.set_alive(id(self), False)
             return
+        GOVERNOR.set_alive(id(self), True)
         vis, lo, hi, (n, vol, delta) = self._window()
         if not vis:
             return

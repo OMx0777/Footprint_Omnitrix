@@ -3,7 +3,7 @@
 from .theme import Theme, DARK, LIGHT
 from .footprint import FootprintItem
 from .heatmap import HeatmapItem
-from .axis import TimeAxis
+from .axis import TimeAxis, PriceAxis
 from .crosshair import Crosshair
 from .executions import ExecutionMarkersItem
 from .bookmap import (
@@ -18,7 +18,7 @@ from .indicators import EMAItem, CPRItem
 from .tape import TapePrintsItem, TapeSpeedItem, TapeCvdItem
 
 __all__ = [
-    "Theme", "DARK", "LIGHT", "FootprintItem", "HeatmapItem", "TimeAxis", "Crosshair", "ExecutionMarkersItem",
+    "Theme", "DARK", "LIGHT", "FootprintItem", "HeatmapItem", "TimeAxis", "PriceAxis", "Crosshair", "ExecutionMarkersItem",
     "BookHeatmapItem", "BBOItem", "BubbleItem", "PieItem", "BarsItem",
     "ProjectionItem", "DomLadderItem", "VolumeBarsItem", "SRLinesItem",
     "TPOItem", "VolumeProfileItem",
