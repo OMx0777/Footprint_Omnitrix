@@ -144,17 +144,30 @@ LOOK_LUTS: dict[str, tuple] = {
 }
 
 
-_pb_memo: tuple = (None, None)
+# Bounded, NOT a single slot.
+#
+# One entry per (column list, tick), so every render item in a window shares a
+# hit. It used to hold exactly one result, which was fine for one Bookmap and
+# catastrophic for two: each window's items evicted the other's key on every
+# refresh, so the memo never hit again and all eight items fell back to a full
+# scan of up to 14,400 columns. Measured 3.2 ms for one window and 61.8 ms for
+# two - a 19x jump for a second window, which is what "it lags when I open 3-4
+# bookmaps" actually was.
+#
+# 32 is far more than any plausible number of open windows x items; the cap
+# only exists so a long-lived process cannot accumulate stale keys.
+_PB_MAX = 32
+_pb_memo: dict = {}
 
 
 def _price_bounds(cols, tick):
     # A refresh hands the *same* column list to every item, so without a memo
     # this full-buffer scan runs once per item per frame.
-    global _pb_memo
     last = cols[-1]
     key = (id(cols), len(cols), cols[0].bucket, last.bucket, id(last.book), tick)
-    if _pb_memo[0] == key:
-        return _pb_memo[1]
+    hit = _pb_memo.get(key)
+    if hit is not None:
+        return hit
 
     # Hot path: runs for every item on every refresh over the whole buffer.
     # min()/max() on the dict is a C-level scan instead of a Python loop, and
@@ -182,7 +195,11 @@ def _price_bounds(cols, tick):
         x0 = cols[0].bucket
         x1 = cols[-1].bucket
         rect = QRectF(x0 - 1, lo * tick, (x1 - x0) + 3, (hi - lo) * tick + tick)
-    _pb_memo = (key, rect)
+    if len(_pb_memo) >= _PB_MAX:
+        # Cheap eviction: these keys die as soon as their column list is
+        # rebuilt, so anything still here is either live or already garbage.
+        _pb_memo.clear()
+    _pb_memo[key] = rect
     return rect
 
 

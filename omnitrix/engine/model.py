@@ -73,6 +73,33 @@ class Trade:
 
 
 @dataclass(slots=True, frozen=True)
+class Execution:
+    """One of YOUR fills, derived from a change in position size.
+
+    The feed does not carry an execution report. What it does carry is the
+    account's position in each security (`posSize`), and a change in that is a
+    fill. Read the limits before trusting a marker to the cent:
+
+      * `size` is the NET change between two L1 snapshots. Several fills inside
+        one snapshot interval arrive as a single marker, and two fills that
+        cancel out are invisible.
+      * `price` is the snapshot's last trade price, not the actual fill price.
+        It is the right price to within one snapshot's worth of movement.
+
+    That is honest enough to mark where you traded on the chart, and not
+    precise enough to reconcile a blotter against. `is_buy` is exact: the sign
+    of a position change cannot be ambiguous.
+    """
+
+    symbol: str
+    price: float
+    size: int               # absolute share count of the change
+    is_buy: bool            # position increased
+    position: int           # resulting position, signed
+    ts_ms: int
+
+
+@dataclass(slots=True, frozen=True)
 class BookSnapshot:
     """A full L2 depth sweep at one instant (used by heatmap / DOM only)."""
 

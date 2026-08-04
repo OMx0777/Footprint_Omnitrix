@@ -24,7 +24,8 @@ from ..engine.model import Trade, BookSnapshot
 from ..render import (
     FootprintItem, HeatmapItem, DARK, LIGHT, TimeAxis, Crosshair,
     FibRetracement, PositionDrawer, FixedVolumeProfile, PenDrawing,
-    CprDrawing, PriceLevel, MeasureTool, EMAItem, CPRItem
+    CprDrawing, PriceLevel, MeasureTool, EMAItem, CPRItem,
+    ExecutionMarkersItem
 )
 from .settings_dialog import SettingsDialog
 from .bookmap_window import BookmapWindow
@@ -111,6 +112,9 @@ class OmnitrixWindow(QMainWindow):
         self.profiles: dict[str, SessionProfile] = {}
         self._child_windows: dict = {}        # key -> live child window
         self.latest_book: dict[str, BookSnapshot] = {}
+        # Your fills per symbol, oldest first. Bounded: a marker you can no
+        # longer scroll to is a marker nobody will ever look at.
+        self.executions: dict[str, list] = {}
         self.active_symbol = ""
         self.tf_s = 60
         self.theme = DARK
@@ -146,6 +150,7 @@ class OmnitrixWindow(QMainWindow):
 
         feed.on_trade(self._enqueue)
         feed.on_book(self._enqueue)
+        feed.on_execution(self._on_execution)
 
         self._pending_symbol = ""
         workspace.restore(self)               # reapply the last saved desk
@@ -163,6 +168,22 @@ class OmnitrixWindow(QMainWindow):
         the feed once all taps are in place.
         """
         self.feed.start()
+
+    def _on_execution(self, ex) -> None:
+        """Feed-thread entry point for your own fills.
+
+        Appended directly rather than queued: fills arrive at human frequency,
+        not market frequency, and a list append is atomic under the GIL. Routing
+        them through the event queue would make them compete with book sweeps
+        for the drain budget for no benefit.
+        """
+        lst = self.executions.get(ex.symbol)
+        if lst is None:
+            lst = self.executions[ex.symbol] = []
+        lst.append(ex)
+        if len(lst) > 5000:
+            del lst[:len(lst) - 5000]
+        self._dirty = True
 
     def _enqueue(self, ev) -> None:
         """Feed-thread entry point. Counts what the bounded queue sheds."""
@@ -244,6 +265,16 @@ class OmnitrixWindow(QMainWindow):
             "footer — applies to Footprint, Cluster, Profile and Delta modes")
         self.chk_numbers.toggled.connect(self._on_numbers)
         tb.addWidget(self.chk_numbers)
+
+        self.chk_fills = QCheckBox("My fills")
+        self.chk_fills.setChecked(True)
+        self.chk_fills.setToolTip(
+            "Mark your own executions on the chart: hollow green = bought, "
+            "red = sold, radius by size. "
+            "Derived from position changes in the feed, so several fills inside "
+            "one snapshot appear as one marker at the snapshot's last price.")
+        self.chk_fills.toggled.connect(self._on_fills)
+        tb.addWidget(self.chk_fills)
 
         self.chk_cvd = QCheckBox("CVD pane")
         self.chk_cvd.setChecked(True)
@@ -415,6 +446,9 @@ class OmnitrixWindow(QMainWindow):
 
         self.fp = FootprintItem(self.instruments.tick("QQQ"), self.theme)
         self.price_plot.addItem(self.fp)
+
+        self.exec_item = ExecutionMarkersItem()
+        self.price_plot.addItem(self.exec_item)
 
         # Indicators
         self.cpr_item = CPRItem()
@@ -664,6 +698,7 @@ class OmnitrixWindow(QMainWindow):
             self.heatmap.set_bars([])
             self.time_axis.set_bars([])
             self.price_time_axis.set_bars([])
+            self.exec_item.set_data([], [])
             for item in (self.cpr_item, self.ema9_item, self.ema21_item):
                 if item.isVisible():
                     item.set_bars([])
@@ -682,6 +717,9 @@ class OmnitrixWindow(QMainWindow):
         # the cost is a list reference, not a copy.
         self.time_axis.set_bars(bars)
         self.price_time_axis.set_bars(bars)
+        if self.exec_item.isVisible():
+            self.exec_item.set_data(bars,
+                                    self.executions.get(self.active_symbol, []))
 
 
         if self.cpr_item.isVisible(): self.cpr_item.set_bars(bars)
@@ -1233,6 +1271,10 @@ class OmnitrixWindow(QMainWindow):
         px = self.fp.step_ticks * self.fp.tick
         self.lbl_step.setText(f"({px * 100:.0f}¢)" if px < 1.0
                               else f"(${px:,.2f})".replace(".00", ""))
+
+    def _on_fills(self, on: bool) -> None:
+        self.exec_item.setVisible(on)
+        self._dirty = True
 
     def _on_cvd_pane(self, on: bool) -> None:
         self.cvd_plot.setVisible(on)

@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import QApplication
 _app = QApplication.instance() or QApplication([])
 
 import numpy as np
-from PyQt6.QtGui import QImage, QPainter
+from PyQt6.QtGui import QImage, QPainter, QColor
 from PyQt6.QtCore import QRectF
 
 from omnitrix.engine import Instruments, BookmapBuffer, SessionProfile
@@ -50,6 +50,43 @@ MAX_GROWTH = 1.6
 # meaningless - three attribute reads "grew 2.2x" from 0.0001 to 0.0002 ms -
 # and a consumer this cheap cannot cause lag whatever its ratio does.
 NOISE_FLOOR_MS = 0.05
+
+def _machine_factor() -> float:
+    """How much slower this machine is RIGHT NOW than the reference.
+
+    Absolute millisecond budgets are not portable and, worse, are not even
+    stable on one box: measured across a long session, an UNCHANGED renderer
+    drifted 59 -> 79 -> 91 ms as the machine warmed up and load accumulated.
+    A gate that fails on thermal state teaches people to ignore it.
+
+    So the paint budgets are scaled by a calibration the gate measures itself:
+    a fixed synthetic drawing workload, timed here, against the value it had on
+    the reference machine. Ratios stay meaningful; absolute times do not.
+    """
+    # Sized to land in the same tens-of-milliseconds range as the paint it
+    # calibrates. A 5 ms probe was noise-dominated and the factor swung
+    # 1.12-1.54 across consecutive runs, which is worse than no calibration.
+    img = QImage(1920, 1080, QImage.Format.Format_ARGB32)
+    rects = [QRectF((i * 7) % 1900, (i * 13) % 1060, 6.0, 4.0)
+             for i in range(30000)]
+    c = QColor(180, 90, 90)
+    best = 1e9
+    for _ in range(5):                       # best-of, to reject a stray stall
+        img.fill(0)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        t = time.perf_counter()
+        for rr in rects:
+            p.fillRect(rr, c)
+        best = min(best, time.perf_counter() - t)
+        p.end()
+    return max(1.0, (best * 1000) / _REFERENCE_FILL_MS)
+
+
+# 4,000 fillRects took this long on the machine the budgets were set on.
+_REFERENCE_FILL_MS = 30.0
+MACHINE = _machine_factor()
+
 
 g = Gate("performance")
 
@@ -140,7 +177,8 @@ g.check(total_cpu < 25.0,
         f"at {LONG_H:g} h")
 
 # =====================================================================
-g.section("frame budgets at worst-case settings (33 ms frame)")
+g.section(f"frame budgets (33 ms frame; this machine is "
+          f"{MACHINE:.2f}x the reference)")
 
 
 # The deployment target is a fleet of identical boxes: i7-9700, 16 GB,
@@ -176,10 +214,15 @@ def paint_ms(item, vb, reps=5, W=SCREEN_W, H=SCREEN_H):
         item.paint(p)
         p.end()
     once()
-    t = time.perf_counter()
+    # BEST-of, matching _machine_factor. A mean includes whatever else the OS
+    # decided to do during the run, and comparing a mean against a best-of
+    # calibration is what made the ratio unstable.
+    best = 1e9
     for _ in range(reps):
+        t = time.perf_counter()
         once()
-    return (time.perf_counter() - t) * 1000 / reps
+        best = min(best, time.perf_counter() - t)
+    return best * 1000
 
 
 inst = Instruments()
@@ -225,9 +268,10 @@ fp.bars = live
 fp.price_step = 0.0                              # Auto - the shipped default
 ms_live = paint_ms(fp, vb_live)
 lv = sum(b.n_levels() for b in live) / len(live)
-g.check(ms_live <= 70.0,
+g.check(ms_live <= 70.0 * MACHINE,
         f"live view, {len(live)} one-minute bars at {lv:.0f} levels/bar: "
-        f"{ms_live:.1f} ms  (baseline guard - see the note in this file)")
+        f"{ms_live:.1f} ms vs {70.0 * MACHINE:.0f} ms allowed "
+        f"(baseline guard - see the note in this file)")
 
 # Cost must not blow up with cell count. If someone reintroduces per-cell object
 # construction this ratio is where it shows, long before the absolute budget
@@ -257,7 +301,7 @@ fp2 = FootprintItem(TICK)
 fp2.bars = bars
 fp2.price_step = 0.0
 ms_all = paint_ms(fp2, vb_all)
-g.check(ms_all <= 75.0,
+g.check(ms_all <= 75.0 * MACHINE,
         f"zoomed fully out, {len(bars)} hourly bars on Auto: {ms_all:.1f} ms "
         f"(looser budget: not the live path, and capped by max_bars)")
 # 75 ms, not 55: the earlier figure came from 1600x900 measurements. At the

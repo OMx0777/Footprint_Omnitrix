@@ -1,6 +1,6 @@
 """Qt-free market-data engine: model, instruments, feeds, bar builder."""
 
-from .model import Trade, BookSnapshot, Aggressor
+from .model import Execution, Trade, BookSnapshot, Aggressor
 from .instruments import Instruments
 from .bars import Bar, BarSeries
 from .bookmap import BookmapBuffer, Column

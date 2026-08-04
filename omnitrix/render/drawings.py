@@ -271,6 +271,39 @@ class PositionDrawer(_DrawTool):
                    "#FF5252")
 
 
+POC_COL = "#FFC43C"
+VA_COL = "#5C9DFF"
+
+
+def _value_area(totals: dict, poc: int, pct: float):
+    """(VAH, VAL) tick indices holding `pct` of the volume around the POC.
+
+    Grown one level at a time toward the heavier adjacent side - the standard
+    construction, and the same one Bar.value_area uses, so a drawn profile and
+    a bar's own value area cannot disagree about the same prices.
+    """
+    if not totals or poc is None:
+        return None, None
+    idxs = sorted(totals)
+    target = sum(totals.values()) * pct
+    pos = idxs.index(poc)
+    lo = hi = pos
+    acc = totals[poc]
+    n = len(idxs)
+    while acc < target and (lo > 0 or hi < n - 1):
+        up = totals[idxs[hi + 1]] if hi < n - 1 else -1
+        dn = totals[idxs[lo - 1]] if lo > 0 else -1
+        if up < 0 and dn < 0:
+            break
+        if up >= dn:
+            hi += 1
+            acc += totals[idxs[hi]]
+        else:
+            lo -= 1
+            acc += totals[idxs[lo]]
+    return idxs[hi], idxs[lo]
+
+
 class PriceLevel(pg.InfiniteLine):
     """A horizontal price level, dragged by its line and labelled with its price.
 
@@ -551,6 +584,7 @@ class FixedVolumeProfile(_DrawTool):
         super().__init__(pos, size, **kw)
         self.get_bars_cb = get_bars_cb
         self.tick_size = max(float(tick_size), 1e-9)
+        self.va_pct = 0.70          # share of the range's volume in the band
         self.addScaleHandle([0, 0.5], [1, 0.5])
         self.addScaleHandle([1, 0.5], [0, 0.5])
         self.addScaleHandle([0.5, 1], [0.5, 0])
@@ -588,7 +622,10 @@ class FixedVolumeProfile(_DrawTool):
 
         totals = {ti: buy.get(ti, 0) + sell.get(ti, 0) for ti in tis}
         mx = max(totals.values()) or 1
-        poc = max(totals, key=totals.get)
+        # Ties go to the lowest price, matching Bar._compute - a POC that moves
+        # with dict insertion order is a POC that changes on replay.
+        poc = min(k for k, v in totals.items() if v == mx)
+        vah, val = _value_area(totals, poc, self.va_pct)
         y_base = self.pos().y()
         # One row per price level, always tick-tall. Scaling rows to fill the box
         # made them fat and overlapping whenever the ROI spanned more price than
@@ -608,6 +645,30 @@ class FixedVolumeProfile(_DrawTool):
             p.fillRect(QRectF(w - full, y, s_w, row_h), QColor(239, 83, 80, 190))
             p.fillRect(QRectF(w - full + s_w, y, b_w, row_h),
                        QColor(38, 166, 154, 190))
-            if ti == poc:
-                p.setPen(pg.mkPen("#FFC43C", width=2))
-                p.drawLine(QPointF(0, ly), QPointF(w, ly))
+        # Value area: the band holding `va_pct` of the range's volume, grown
+        # from the POC toward whichever neighbour is heavier. Drawn AFTER the
+        # bars so the levels are readable over them.
+        tr = p.transform()
+        vy = {}
+        for tag, lvl, col in (("VAH", vah, VA_COL), ("VAL", val, VA_COL),
+                              ("POC", poc, POC_COL)):
+            if lvl is None:
+                continue
+            vy[tag] = (lvl * tick) - y_base
+
+        if "VAH" in vy and "VAL" in vy:
+            band = QColor(VA_COL)
+            band.setAlpha(28)
+            lo, hi = sorted((vy["VAL"], vy["VAH"]))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.fillRect(QRectF(0, lo, w, hi - lo), band)
+
+        for tag, ly2 in vy.items():
+            is_poc = tag == "POC"
+            colour = POC_COL if is_poc else VA_COL
+            p.setPen(pg.mkPen(colour, width=2 if is_poc else 1,
+                              style=Qt.PenStyle.SolidLine if is_poc
+                              else Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(0, ly2), QPointF(w, ly2))
+            self._text(p, tr, self.data_x(w), self.data_y(ly2),
+                       f"{tag} {(ly2 + y_base):,.2f}", colour)

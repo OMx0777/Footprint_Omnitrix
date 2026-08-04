@@ -13,7 +13,7 @@ import threading
 import time
 from collections.abc import Callable
 
-from .model import Trade, BookSnapshot, Aggressor
+from .model import Trade, BookSnapshot, Execution, Aggressor
 
 TradeCB = Callable[[Trade], None]
 BookCB = Callable[[BookSnapshot], None]
@@ -25,6 +25,7 @@ class Feed:
     def __init__(self) -> None:
         self._on_trade: TradeCB | None = None
         self._on_book: BookCB | None = None
+        self._on_exec = None
         self._running = False
 
     def on_trade(self, cb: TradeCB) -> None:
@@ -32,6 +33,13 @@ class Feed:
 
     def on_book(self, cb: BookCB) -> None:
         self._on_book = cb
+
+    def on_execution(self, cb) -> None:
+        self._on_exec = cb
+
+    def _emit_exec(self, ex) -> None:
+        if self._on_exec:
+            self._on_exec(ex)
 
     def _emit_trade(self, tr: Trade) -> None:
         if self._on_trade:

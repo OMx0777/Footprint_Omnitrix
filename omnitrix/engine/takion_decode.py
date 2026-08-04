@@ -33,7 +33,7 @@ import struct
 import time
 from dataclasses import replace
 
-from .model import Trade, BookSnapshot, Aggressor
+from .model import Trade, BookSnapshot, Execution, Aggressor
 from .feed import Feed
 
 log = logging.getLogger("omnitrix.takion")
@@ -107,6 +107,12 @@ class TakionDecoder(Feed):
         self._pending: list[tuple[Trade, int]] = []
         self._last_vol: dict[str, int] = {}
         self._last_px: dict[str, float] = {}    # for the tick test
+        # Your position per symbol. A change in it is a fill - the only
+        # execution information this feed carries. None = not yet seen, which
+        # is NOT the same as flat: seeding from the first snapshot would
+        # otherwise report your whole existing position as a fresh trade the
+        # moment the app connects.
+        self._pos: dict[str, int] = {}
         self._bids: dict[str, dict[float, int]] = {}
         self._asks: dict[str, dict[float, int]] = {}
         self._overflow_warned: set = set()   # (symbol, side) already logged
@@ -120,7 +126,7 @@ class TakionDecoder(Feed):
         self.cls = {"quote": 0, "mid": 0, "tick": 0, "unknown": 0}
 
     # ---- connection lifecycle --------------------------------------------
-    def on_l1_disconnect(self) -> None:
+    def on_l1_disconnect(self) -> None:  # noqa: D401
         """Forget cumulative volume. MUST be called when the L1 link drops.
 
         A trade's size is the change in cumulative volume between consecutive
@@ -140,6 +146,9 @@ class TakionDecoder(Feed):
                      "symbols so the gap is not emitted as one huge print",
                      len(self._last_vol))
         self._last_vol.clear()
+        # Same reasoning: after a gap the position we come back to may differ
+        # from the one we left, and the difference is not a trade we saw.
+        self._pos.clear()
 
     def on_disconnect(self) -> None:
         """Drop every half-assembled book. MUST be called when a link drops.
@@ -296,10 +305,23 @@ class TakionDecoder(Feed):
     # ---- record handlers -------------------------------------------------
     def _on_l1(self, chunk: bytes, off: int) -> None:
         (sym_b, _o, _h, _l, last, bid, ask, cum_vol, time_ms,
-         _pos, _bsz, _asz) = L1.unpack_from(chunk, off)
+         pos_size, _bsz, _asz) = L1.unpack_from(chunk, off)
         sym = _cstr(sym_b)
         if not sym or not self._wanted(sym):
             return
+
+        # A change in position size is a fill. Emitted before the price guard
+        # below only if we have a price to attach it to.
+        prev_pos = self._pos.get(sym)
+        if prev_pos is None:
+            self._pos[sym] = int(pos_size)      # seed; not a trade
+        elif int(pos_size) != prev_pos:
+            delta = int(pos_size) - prev_pos
+            self._pos[sym] = int(pos_size)
+            if last > 0.0 and last == last:
+                self._emit_exec(Execution(
+                    sym, float(last), abs(delta), delta > 0, int(pos_size),
+                    self._align_ts(int(time_ms))))
 
         # An unpriceable record cannot become a trade. `last` is 0.0 whenever
         # the Security has no last price yet (the struct is memset to zero and
