@@ -56,7 +56,16 @@ import pyqtgraph as pg
 # is where this application actually runs out of GUI thread, and the remaining
 # 32% is Qt's own event handling, layout, styling, the feed thread's GIL slices
 # and GC. Budgeting at 1.0 would be budgeting for a thread we do not have.
-TARGET = 0.65
+# Frames may run this much over their granted interval before we treat the
+# thread as oversubscribed. Some slack is ALWAYS present and is not a problem:
+# our callback returns before Qt paints, so the paint lands between frames and
+# pushes the next one out. Measured, an unloaded single chart sits at ~1.18 and
+# a genuinely oversubscribed desk (4 charts + 4 bookmaps) at ~2.1, so the
+# threshold goes between them rather than near either.
+LATE_HIGH = 1.40
+# Ceiling on how far the requested rate can be stretched, so a pathological
+# machine cannot drive every window to a standstill.
+MAX_SCALE = 6.0
 
 # An unfocused window is never stretched past this, so a background bookmap
 # still updates four times a second - enough to glance at and see live data.
@@ -67,6 +76,7 @@ MAX_INTERVAL_MS = 250
 # Cost estimates settle with an exponential moving average: a single slow frame
 # (a GC pause, a window resize) must not blow the budget for everyone.
 _ALPHA = 0.25
+_LATE_ALPHA = 0.15
 
 
 class _Entry:
@@ -79,7 +89,8 @@ class _Entry:
     refresh is 0.3 ms and paint is 26 ms.
     """
 
-    __slots__ = ("base_ms", "refresh_s", "paint_s", "priority", "alive", "last_ms")
+    __slots__ = ("base_ms", "refresh_s", "paint_s", "paint_accum",
+                 "priority", "alive", "last_ms")
 
     def __init__(self, base_ms: int, priority: int):
         self.base_ms = base_ms
@@ -88,6 +99,9 @@ class _Entry:
         # over-scheduling on the first few frames.
         self.refresh_s = base_ms / 1000.0 * 0.25
         self.paint_s = base_ms / 1000.0 * 0.25
+        # Paint cost ACCUMULATES within a frame and is folded into the EMA at
+        # the frame boundary - see report_paint.
+        self.paint_accum = 0.0
         self.priority = priority
         self.alive = True
         self.last_ms = base_ms
@@ -103,6 +117,13 @@ class FrameGovernor:
     def __init__(self) -> None:
         self._reg: dict[int, _Entry] = {}
         self._focus: int | None = None
+        # Smoothed "how late are our frames", as a ratio of the interval we
+        # granted. 1.0 = exactly on time.
+        self._late = 1.0
+        # Multiplier applied to every window's requested interval. 1.0 = the
+        # governor is doing nothing, which is where it sits until frames
+        # actually start arriving late.
+        self._scale = 1.0
 
     # ---- registration ----------------------------------------------------
     def register(self, key: int, base_ms: int, priority: int = 1) -> None:
@@ -127,11 +148,36 @@ class FrameGovernor:
         e.refresh_s += (seconds - e.refresh_s) * _ALPHA
 
     def report_paint(self, key: int, seconds: float) -> None:
-        """Cost of one paint of this window's plot widget."""
+        """Cost of one paint against this window's budget. ACCUMULATES.
+
+        A window can own several plot widgets - the chart grid runs up to four,
+        all reporting under the main window's key - and they all paint within
+        the same frame. Folding each report straight into the EMA averaged them
+        instead of adding them, so the estimate converged on the cost of ONE
+        pane however many were on screen.
+
+        Measured: a 4-chart grid reported 29% demand while a single chart
+        reported 80%, for the same real work. The governor was handing out
+        budget it did not have, which is precisely the failure it exists to
+        prevent. Sum within the frame; smooth across frames.
+        """
         e = self._reg.get(key)
         if e is None:
             return
-        e.paint_s += (seconds - e.paint_s) * _ALPHA
+        e.paint_accum += seconds
+
+    def fold_paint(self, key: int) -> None:
+        """Commit a frame's accumulated paint. Called once per frame.
+
+        A frame with no paint at all folds in a genuine zero - a window Qt did
+        not need to repaint really did cost nothing, and should give its budget
+        back rather than hold it on the strength of an old measurement.
+        """
+        e = self._reg.get(key)
+        if e is None:
+            return
+        e.paint_s += (e.paint_accum - e.paint_s) * _ALPHA
+        e.paint_accum = 0.0
 
     def set_alive(self, key: int, alive: bool) -> None:
         """A hidden window costs nothing and must not hold budget.
@@ -144,75 +190,87 @@ class FrameGovernor:
             e.alive = alive
 
     # ---- the decision ----------------------------------------------------
+    #
+    # CONTROL SIGNAL: LATENESS, NOT COST.
+    #
+    # The first version of this modelled demand as cost-per-frame over the
+    # requested interval. That needs paints and refreshes to be 1:1, and they
+    # are not - Qt repaints on its own schedule (compositor damage, hover,
+    # expose, a sibling widget), so the accumulated paint time per refresh
+    # over-stated demand at 125-190% and the governor throttled work that was
+    # not there. Measured, it made things WORSE than not governing at all:
+    #
+    #       config                  ungoverned   modelled-cost governor
+    #       1 chart                   20.7 fps         13.5 fps
+    #       4 charts                  15.1 fps          9.4 fps
+    #       4 charts + 4 bookmaps      6.8 fps          4.5 fps
+    #
+    # So the cost model is gone. What the user actually experiences is whether
+    # a frame arrives when it was promised, and that is directly observable:
+    # compare the gap between consecutive frames against the interval we
+    # granted. Chronically late means the thread is oversubscribed, whatever
+    # the reason; on time means it is not, whatever the cost happens to be.
+    #
+    # The loop then finds the rate the machine can actually sustain, with no
+    # assumption about paints, widgets, window size or CPU speed - and it
+    # cannot repeat the mistake above, because throttling something that was
+    # not the problem shows up immediately as "still late" and is undone.
+
+    def note_gap(self, key: int, gap_s: float) -> None:
+        """Report the measured interval between two frames of this window."""
+        e = self._reg.get(key)
+        if e is None or not e.alive:
+            return
+        granted = max(e.last_ms, 1) / 1000.0
+        # Ratio > 1 means we asked for a frame rate we are not getting.
+        ratio = gap_s / granted
+        # Clamp a single pathological sample (a GC pause, a resize, the machine
+        # sleeping) so one outlier cannot slam every window to the floor.
+        ratio = min(ratio, 4.0)
+        self._late += (ratio - self._late) * _LATE_ALPHA
+        self._adjust()
+
+    def _adjust(self) -> None:
+        if self._late > LATE_HIGH:
+            # Late: ask for less. Ramp gently - overshooting costs frames that
+            # were achievable.
+            self._scale = min(MAX_SCALE, self._scale * 1.06)
+        else:
+            # Not late: hand the frame rate back. Deliberately NO dead band on
+            # this side. An earlier version only decayed below a second, lower
+            # threshold, and startup - where the prefill genuinely does run
+            # late - drove the scale up and then left it stuck there forever,
+            # because steady-state lateness sat between the two thresholds. A
+            # single chart was being throttled from 20.7 fps to 12.3 fps for a
+            # backlog that had cleared minutes earlier.
+            self._scale = max(1.0, self._scale * 0.97)
+
     def interval(self, key: int) -> int:
         """Milliseconds this window should wait before its next frame."""
         e = self._reg.get(key)
         if e is None:
             return 33
-
-        demand = sum(x.cost_s / (x.base_ms / 1000.0)
-                     for x in self._reg.values() if x.alive)
-        if demand <= TARGET:
+        scale = self._scale
+        if scale <= 1.0001:
             e.last_ms = e.base_ms
             return e.base_ms
-
-        # Over budget. The policy, in order:
-        #
-        #   1. background windows are stretched first, but never past
-        #      MAX_INTERVAL_MS - a window updating twice a second is still
-        #      worth glancing at, one updating every two seconds is not;
-        #   2. if that frees enough, the protected windows keep their rate;
-        #   3. if it does not, the protected windows are stretched as well,
-        #      to fit whatever is left AFTER the background floor.
-        #
-        # Step 3 is what an earlier version got wrong. It handed the protected
-        # set the whole TARGET and then let the floored windows add their cost
-        # on top, so actual demand landed at 64% against a 55% target - over
-        # budget in exactly the case the budget existed for. The floor is
-        # irreducible, so it has to be subtracted BEFORE the protected set is
-        # served, not after.
-        prot_keys = [k for k, x in self._reg.items()
-                     if x.alive and (k == self._focus or x.priority == 0)]
-        prot_raw = sum(self._reg[k].cost_s / (self._reg[k].base_ms / 1000.0)
-                       for k in prot_keys)
-        unprot = [x for k, x in self._reg.items()
-                  if x.alive and k not in prot_keys]
-        unprot_raw = sum(x.cost_s / (x.base_ms / 1000.0) for x in unprot)
-        # What the background costs even when stretched as far as we allow.
-        unprot_floor = sum(x.cost_s / (MAX_INTERVAL_MS / 1000.0) for x in unprot)
-
-        protected = key in prot_keys
-        if prot_raw + unprot_floor <= TARGET:
-            # Room exists: protected keep their rate, background absorbs it all.
-            if protected:
-                e.last_ms = e.base_ms
-                return e.base_ms
-            slack = TARGET - prot_raw
-            scale = unprot_raw / slack if slack > 0 else float("inf")
-        else:
-            # No room: background goes to the floor and the protected set
-            # divides what remains.
-            if not protected:
-                e.last_ms = MAX_INTERVAL_MS
-                return MAX_INTERVAL_MS
-            avail = TARGET - unprot_floor
-            if avail <= 0.0:
-                e.last_ms = MAX_INTERVAL_MS
-                return MAX_INTERVAL_MS
-            scale = prot_raw / avail
-
-        # Round the interval UP. int() truncates, and a shorter interval means
-        # MORE demand, so truncating biases every window over budget - which is
-        # the one direction this class must never drift in. It cost 1% of the
-        # thread across five windows, enough to fail the budget gate.
+        # Protect the window being looked at: it absorbs a fraction of the
+        # throttling the background windows take in full. The loop still
+        # converges, because it measures the RESULT of this split rather than
+        # predicting it.
+        if key == self._focus or e.priority == 0:
+            scale = 1.0 + (scale - 1.0) * 0.30
         ms = int(min(float(MAX_INTERVAL_MS), math.ceil(e.base_ms * scale)))
         e.last_ms = max(e.base_ms, ms)
         return e.last_ms
 
     # ---- introspection, for the perf gate and the status bar -------------
     def demand(self) -> float:
-        return sum(x.cost_s / (x.base_ms / 1000.0)
-                   for x in self._reg.values() if x.alive)
+        """Observed lateness: 1.0 means every frame is arriving on schedule."""
+        return self._late
+
+    def scale(self) -> float:
+        return self._scale
 
     def snapshot(self) -> list[tuple[int, float, int, int, bool]]:
         return [(k, e.cost_s * 1000.0, e.base_ms, e.last_ms, e.alive)
@@ -239,6 +297,7 @@ class GovernedTimer:
         self._cb = callback
         self._key = id(owner)
         GOVERNOR.register(self._key, base_ms, priority)
+        self._last_end = None
         self._timer = QTimer(owner)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._fire)
@@ -251,13 +310,22 @@ class GovernedTimer:
 
     def _fire(self) -> None:
         t = time.perf_counter()
+        if self._last_end is not None:
+            # Measured from the END of the previous frame, which is when the
+            # timer was re-armed. Timing fire-to-fire instead would include our
+            # own callback in the gap, so the ratio could never reach 1.0 and
+            # the governor would read a permanent 17% lateness on a machine
+            # that was perfectly on time - and never hand the frame rate back.
+            GOVERNOR.note_gap(self._key, t - self._last_end)
         try:
             self._cb()
         finally:
             # Measure even when the callback raised: a frame that throws still
             # consumed the thread, and pretending it was free would let a
             # failing window keep its rate while everyone else is throttled.
-            GOVERNOR.report(self._key, time.perf_counter() - t)
+            end = time.perf_counter()
+            GOVERNOR.report(self._key, end - t)
+            self._last_end = end
             self._timer.start(GOVERNOR.interval(self._key))
 
     def release(self) -> None:

@@ -1,13 +1,22 @@
-"""Gate: the frame budget must actually bound total UI demand.
+"""Gate: the frame governor must help when the desk is overloaded and do
+NOTHING when it is not.
 
-This is pure arithmetic on FrameGovernor - no Qt, no windows, no timing - so it
-runs anywhere and cannot go flaky. What it protects is the one property the
-whole design rests on:
+Pure arithmetic on FrameGovernor - no Qt, no windows, no wall-clock timing - so
+it runs anywhere and cannot go flaky.
 
-    whatever the mix of windows, the demand the UI PLACES on the GUI thread
-    after throttling must not exceed TARGET.
+The second half of that sentence is the part with scars on it. Two earlier
+versions of this governor made the application SLOWER than not governing at
+all, and both times the unit test passed because it only checked that
+throttling happened, never that it was warranted:
 
-If that ever stops holding, frames get dropped by accident again.
+  * v1 modelled cost as paint-time per frame over the requested interval. Qt
+    paints on its own schedule, not once per refresh, so demand read 125-190%
+    and a single chart was throttled from 20.7 fps to 13.5 fps.
+  * v2 measured lateness but only decayed the throttle below a second, lower
+    threshold. Steady-state lateness sat BETWEEN the two thresholds, so the
+    startup backlog ratcheted the scale up and nothing ever brought it back.
+
+So the first thing this gate asserts is that an on-time desk is left alone.
 """
 
 from __future__ import annotations
@@ -16,7 +25,9 @@ import sys
 
 sys.path.insert(0, __file__.rsplit("tests", 1)[0])
 
-from omnitrix.ui.framegov import FrameGovernor, TARGET, MAX_INTERVAL_MS
+from omnitrix.ui.framegov import (
+    FrameGovernor, LATE_HIGH, MAX_SCALE, MAX_INTERVAL_MS,
+)
 
 FAILS: list[str] = []
 
@@ -27,102 +38,106 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         FAILS.append(name)
 
 
-def actual_demand(g: FrameGovernor) -> float:
-    """Demand once every window is running at the interval it was GRANTED."""
-    total = 0.0
-    for key, e in g._reg.items():
-        if not e.alive:
-            continue
-        total += e.cost_s / (g.interval(key) / 1000.0)
-    return total
-
-
 def build(*windows) -> FrameGovernor:
-    """windows: (key, base_ms, cost_ms, priority)"""
+    """windows: (key, base_ms, priority)"""
     g = FrameGovernor()
-    for key, base, cost, prio in windows:
+    for key, base, prio in windows:
         g.register(key, base, prio)
-        e = g._reg[key]
-        e.refresh_s = 0.0
-        e.paint_s = cost / 1000.0
     return g
 
 
-print("frame budget")
+def run(g: FrameGovernor, lateness: float, frames: int = 400) -> None:
+    """Feed the loop a steady observed lateness and let it settle."""
+    for _ in range(frames):
+        for key in list(g._reg):
+            granted = g.interval(key)
+            g.note_gap(key, granted / 1000.0 * lateness)
 
-# ---- 1. under budget: nobody is touched ------------------------------------
-g = build((1, 33, 5, 0), (2, 80, 5, 1))
+
+print("frame governor")
+
+# ---- 1. an on-time desk must be left completely alone ----------------------
+g = build((1, 33, 0), (2, 80, 1))
 g.set_focus(1)
-check("under budget the main window keeps its rate", g.interval(1) == 33,
-      f"got {g.interval(1)}ms")
-check("under budget a bookmap keeps its rate", g.interval(2) == 80,
-      f"got {g.interval(2)}ms")
-
-# ---- 2. THE measured case: main + 4 bookmaps -------------------------------
-g = build((1, 33, 26, 0), *[(i, 80, 11, 1) for i in range(2, 6)])
-g.set_focus(1)
-d0 = g.demand()
-d1 = actual_demand(g)
-# The MAX_INTERVAL_MS floor is deliberate and irreducible, so the guarantee is
-# "within the budget plus whatever the floored windows cost at the floor" - we
-# would rather overshoot a little than freeze a window that is on screen.
-floor_cost = sum(e.cost_s / (MAX_INTERVAL_MS / 1000.0)
-                 for k, e in g._reg.items() if k != 1)
-check("main + 4 bookmaps is over budget before throttling", d0 > TARGET,
-      f"raw demand {d0*100:.0f}%")
-check("throttled demand is inside the budget", d1 <= TARGET + 1e-6,
-      f"{d1*100:.0f}% vs target {TARGET*100:.0f}% "
-      f"(floor accounts for {floor_cost*100:.0f}%)")
-# The main window costs 26 ms every 33 ms - 79% - so it is over budget ON ITS
-# OWN and cannot keep its full rate no matter what else is open. The invariant
-# that matters is not "the chart is never throttled", it is that the chart is
-# throttled PROPORTIONALLY LESS than the background windows.
-main_stretch = g.interval(1) / 33
-bm_stretch = g.interval(2) / 80
-check("the focused chart is throttled less than the background",
-      main_stretch < bm_stretch,
-      f"main x{main_stretch:.2f} ({g.interval(1)}ms), "
-      f"bookmap x{bm_stretch:.2f} ({g.interval(2)}ms)")
-
-# ---- 3. hiding windows must GIVE BACK budget -------------------------------
-# Hiding background windows must buy the FOCUSED window a faster rate - that
-# is the whole point of the visibility guard feeding the budget.
-before = g.interval(1)
-for i in (3, 4, 5):
-    g.set_alive(i, False)
-after = g.interval(1)
-check("hiding background windows speeds the focused one up", after < before,
-      f"main {before}ms -> {after}ms with 3 of 4 bookmaps hidden")
-
-# ---- 4. protected set alone over budget: it is throttled too ---------------
-g = build((1, 33, 60, 0), (2, 80, 11, 1))
-g.set_focus(1)
-check("an unaffordable main window is throttled as well", g.interval(1) > 33,
-      f"granted {g.interval(1)}ms")
-check("and the others are pushed to the floor", g.interval(2) == MAX_INTERVAL_MS,
+run(g, lateness=1.0)
+check("on time: the main chart keeps its full rate", g.interval(1) == 33,
+      f"granted {g.interval(1)}ms, scale {g.scale():.2f}")
+check("on time: the bookmap keeps its full rate", g.interval(2) == 80,
       f"granted {g.interval(2)}ms")
 
-# ---- 5. nothing is ever starved completely ---------------------------------
-g = build((1, 33, 200, 0), *[(i, 80, 50, 1) for i in range(2, 10)])
+# ---- 2. normal slack is NOT overload --------------------------------------
+# Our callback returns before Qt paints, so a healthy window still measures
+# ~1.18. Reacting to that is what made v2 throttle an idle machine.
+g = build((1, 33, 0), (2, 80, 1))
 g.set_focus(1)
-worst = max(g.interval(k) for k in g._reg)
-check("no window is stretched past the floor", worst <= MAX_INTERVAL_MS,
-      f"worst granted {worst}ms")
+run(g, lateness=1.18)
+check("routine slack does not trigger throttling", g.interval(1) == 33,
+      f"at lateness 1.18 -> scale {g.scale():.2f}")
 
-# ---- 6. a window is never made FASTER than it asked for --------------------
-g = build((1, 33, 1, 0), (2, 80, 1, 1))
+# ---- 3. genuine overload IS throttled -------------------------------------
+g = build((1, 33, 0), *[(i, 80, 1) for i in range(2, 6)])
 g.set_focus(1)
-check("throttling never speeds a window up",
+run(g, lateness=2.1)
+check("real overload throttles", g.scale() > 1.2, f"scale {g.scale():.2f}")
+main_stretch = g.interval(1) / 33
+bm_stretch = g.interval(2) / 80
+check("the focused chart is throttled LESS than the background",
+      main_stretch < bm_stretch,
+      f"main x{main_stretch:.2f} ({g.interval(1)}ms), "
+      f"background x{bm_stretch:.2f} ({g.interval(2)}ms)")
+
+# ---- 4. THE v2 BUG: the throttle must come back off ------------------------
+run(g, lateness=1.0)
+check("the throttle is released once frames are on time again",
+      g.interval(1) == 33 and g.interval(2) == 80,
+      f"scale {g.scale():.2f}, main {g.interval(1)}ms, bg {g.interval(2)}ms")
+
+# ---- 5. a startup backlog must not leave a permanent throttle --------------
+g = build((1, 33, 0), (2, 80, 1))
+g.set_focus(1)
+run(g, lateness=3.5, frames=200)      # prefill: genuinely far behind
+stuck = g.scale()
+run(g, lateness=1.15, frames=400)     # settled: normal slack
+check("a startup backlog does not permanently throttle the desk",
+      g.interval(1) == 33,
+      f"scale {stuck:.2f} during backlog -> {g.scale():.2f} after")
+
+# ---- 6. bounds -------------------------------------------------------------
+g = build((1, 33, 0), (2, 80, 1))
+g.set_focus(1)
+run(g, lateness=4.0, frames=1000)
+check("the throttle is bounded", g.scale() <= MAX_SCALE + 1e-9,
+      f"scale {g.scale():.2f} vs ceiling {MAX_SCALE}")
+check("no window is stretched past the floor",
+      max(g.interval(k) for k in g._reg) <= MAX_INTERVAL_MS,
+      f"worst {max(g.interval(k) for k in g._reg)}ms")
+check("no window is ever made FASTER than it asked for",
       g.interval(1) >= 33 and g.interval(2) >= 80)
 
-# ---- 7. unregistering is clean --------------------------------------------
-g = build((1, 33, 26, 0), (2, 80, 11, 1))
+# ---- 7. one bad frame must not slam the desk ------------------------------
+g = build((1, 33, 0), (2, 80, 1))
 g.set_focus(1)
-g.unregister(2)
-check("closing a window removes its demand", abs(g.demand() - 26 / 33) < 1e-6,
-      f"demand {g.demand()*100:.0f}%")
-check("closing the focused window clears focus", g.unregister(1) is None
-      and g._focus is None)
+run(g, lateness=1.0)
+g.note_gap(1, 5.0)                     # a 5-second GC pause / resize stall
+check("a single pathological frame does not collapse the rate",
+      g.interval(1) <= 40, f"granted {g.interval(1)}ms after one 5 s stall")
+
+# ---- 8. hidden windows do not drive the loop ------------------------------
+g = build((1, 33, 0), (2, 80, 1))
+g.set_focus(1)
+g.set_alive(2, False)
+before = g.scale()
+for _ in range(200):
+    g.note_gap(2, 1.0)                 # a hidden window reporting nonsense
+check("a hidden window cannot throttle the visible ones",
+      abs(g.scale() - before) < 1e-9, f"scale {before:.2f} -> {g.scale():.2f}")
+
+# ---- 9. bookkeeping --------------------------------------------------------
+g = build((1, 33, 0), (2, 80, 1))
+g.set_focus(1)
+g.unregister(1)
+check("closing the focused window clears focus", g._focus is None)
+check("an unknown key still returns a usable interval", g.interval(999) == 33)
 
 print()
 if FAILS:

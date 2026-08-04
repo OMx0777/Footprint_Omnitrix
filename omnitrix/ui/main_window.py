@@ -14,10 +14,12 @@ from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, QEvent
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QMainWindow, QToolBar, QLabel, QComboBox, QCheckBox, QPushButton, QWidget,
-    QSizePolicy, QDockWidget, QLineEdit, QGraphicsRectItem,
+    QSizePolicy, QDockWidget, QLineEdit, QGraphicsRectItem, QMenu,
+    QToolButton, QWidgetAction, QHBoxLayout, QGridLayout,
 )
 
 from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
+from .chart_pane import ChartPane
 from ..engine import (
     Instruments, BarSeries, BookmapBuffer, SessionProfile, Feed,
 )
@@ -93,6 +95,12 @@ MODES = {
 
 # Footprint price aggregation, as a PRICE not a tick count, so "10c" means 10c
 # whatever the instrument's tick is. 0.0 = Auto (chosen from the zoom).
+# Chart grid layouts: label -> (panes, rows, cols). Four is the ceiling on a
+# 1920x1080 screen - a fifth chart is 640 px wide and the footprint numbers
+# stop being legible, which is worse than not showing it.
+LAYOUTS = {"1 chart": (1, 1, 1), "2 charts": (2, 1, 2), "4 charts": (4, 2, 2)}
+MAX_PANES = 4
+
 PRICE_STEPS = {
     "Auto": 0.0,
     "1¢": 0.01, "5¢": 0.05, "10¢": 0.10, "25¢": 0.25, "50¢": 0.50,
@@ -116,12 +124,15 @@ class OmnitrixWindow(QMainWindow):
         # Your fills per symbol, oldest first. Bounded: a marker you can no
         # longer scroll to is a marker nobody will ever look at.
         self.executions: dict[str, list] = {}
-        self.active_symbol = ""
+        # Set before _build_ui: _bind_pane reads it to decide whether to draw
+        # the active-pane border at all.
+        self._n_panes = 1
+        self._pending_active_symbol = ""
         self.tf_s = 60
         self.theme = DARK
-        self.auto_scroll = True
+        # auto_scroll / _auto_y / _needs_center are PER PANE (see the
+        # properties below) - each chart follows its own symbol independently.
         self._dirty = False
-        self._centered_once = False
         self._known_symbols: set[str] = set()
 
         # thread-safe hand-off: feed thread appends, GUI timer drains.
@@ -162,6 +173,63 @@ class OmnitrixWindow(QMainWindow):
         self.glw.set_gov_key(id(self))
         GOVERNOR.set_focus(id(self))
         self._timer.start()
+
+    # Per-pane view state, exposed under the names the rest of the window (and
+    # the workspace, and the tests) already use. Each delegates to the pane the
+    # toolbar is driving, so "the chart" always means the one you selected.
+    @property
+    def auto_scroll(self) -> bool:
+        p = getattr(self, "_active_pane", None)
+        return p.auto_scroll if p is not None else True
+
+    @auto_scroll.setter
+    def auto_scroll(self, v: bool) -> None:
+        # A timeframe change applies to every chart, so this deliberately sets
+        # ALL panes rather than only the active one.
+        for p in getattr(self, "_panes", ()):
+            p.auto_scroll = bool(v)
+
+    @property
+    def _auto_y(self) -> bool:
+        p = getattr(self, "_active_pane", None)
+        return p.auto_y if p is not None else True
+
+    @_auto_y.setter
+    def _auto_y(self, v: bool) -> None:
+        p = getattr(self, "_active_pane", None)
+        if p is not None:
+            p.auto_y = bool(v)
+
+    @property
+    def _needs_center(self) -> bool:
+        p = getattr(self, "_active_pane", None)
+        return p._needs_center if p is not None else True
+
+    @_needs_center.setter
+    def _needs_center(self, v: bool) -> None:
+        p = getattr(self, "_active_pane", None)
+        if p is not None:
+            p._needs_center = bool(v)
+
+    @property
+    def active_symbol(self) -> str:
+        """The symbol of the pane the toolbar is driving.
+
+        A property rather than an attribute because with a grid there is no
+        single 'current symbol' any more - there is one per pane, and the
+        toolbar acts on whichever is selected. Every existing call site keeps
+        working because the name and the type are unchanged.
+        """
+        pane = getattr(self, "_active_pane", None)
+        return pane.symbol if pane is not None else self._pending_active_symbol
+
+    @active_symbol.setter
+    def active_symbol(self, value: str) -> None:
+        pane = getattr(self, "_active_pane", None)
+        if pane is None:                     # during __init__, before panes exist
+            self._pending_active_symbol = value
+        else:
+            pane.symbol = value
 
     def start_feed(self) -> None:
         """Begin streaming.
@@ -214,6 +282,16 @@ class OmnitrixWindow(QMainWindow):
         self.sym_combo.currentTextChanged.connect(self._on_symbol)
         tb.addWidget(self.sym_combo)
 
+        tb.addWidget(QLabel("  Grid "))
+        self.layout_combo = QComboBox()
+        self.layout_combo.addItems(list(LAYOUTS))
+        self.layout_combo.setToolTip(
+            "Show one, two or four charts at once. Each pane keeps its own "
+            "symbol, zoom and drawings; the highlighted one is what the "
+            "toolbar and the drawing tools act on. Click a chart to select it.")
+        self.layout_combo.currentTextChanged.connect(self._on_layout)
+        tb.addWidget(self.layout_combo)
+
         tb.addWidget(QLabel("  TF "))
         self.tf_combo = QComboBox()
         self.tf_combo.addItems(list(TF_CHOICES))
@@ -243,64 +321,99 @@ class OmnitrixWindow(QMainWindow):
         self.lbl_step.setStyleSheet("color:#8A93A6;font-weight:600;")
         tb.addWidget(self.lbl_step)
 
+        # ---- Overlays menu ----------------------------------------------
+        # These were nine checkboxes and a combo strung across the toolbar,
+        # which pushed the live stats readout off the right-hand edge on a
+        # 1920-wide screen. They are settings you change occasionally, not
+        # controls you reach for every minute, so they belong behind a menu.
+        #
+        # Deliberately QAction, not QCheckBox: QAction exposes the same
+        # isChecked()/setChecked()/toggled API, so workspace.py persists them
+        # with no change at all.
         tb.addSeparator()
-        self.chk_imb = QCheckBox("Imbalance")
-        self.chk_imb.setChecked(True)
-        self.chk_imb.toggled.connect(lambda v: self.fp.set_show_imbalance(v))
-        tb.addWidget(self.chk_imb)
+        self.menu_overlays = QMenu("Overlays", self)
+        btn_overlays = QToolButton()
+        btn_overlays.setText("Overlays ▾")
+        btn_overlays.setMenu(self.menu_overlays)
+        btn_overlays.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        tb.addWidget(btn_overlays)
 
-        tb.addWidget(QLabel(" ×"))
+        def _act(menu, label, checked, slot, tip=""):
+            a = menu.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(checked)
+            if tip:
+                a.setToolTip(tip)
+            a.toggled.connect(slot)
+            return a
+
+        self.chk_imb = _act(self.menu_overlays, "Imbalance", True,
+                            lambda v: self.fp.set_show_imbalance(v))
+
+        # The imbalance factor is a choice among values, not a toggle, so it
+        # goes in as a real widget rather than four mutually exclusive items.
+        w_imb = QWidget()
+        _l = QHBoxLayout(w_imb)
+        _l.setContentsMargins(24, 2, 8, 2)
+        _l.addWidget(QLabel("Imbalance ×"))
         self.imb_combo = QComboBox()
         self.imb_combo.addItems(["2.0", "3.0", "4.0", "5.0"])
         self.imb_combo.setCurrentText("3.0")
         self.imb_combo.currentTextChanged.connect(
-            lambda s: self.fp.set_imbalance_factor(float(s)))
-        tb.addWidget(self.imb_combo)
+            lambda t: self.fp.set_imbalance_factor(float(t)))
+        _l.addWidget(self.imb_combo)
+        wa = QWidgetAction(self)
+        wa.setDefaultWidget(w_imb)
+        self.menu_overlays.addAction(wa)
 
-        self.chk_va = QCheckBox("Value Area")
-        self.chk_va.setChecked(True)
-        self.chk_va.toggled.connect(lambda v: self.fp.set_show_va(v))
-        tb.addWidget(self.chk_va)
+        self.chk_va = _act(self.menu_overlays, "Value Area", True,
+                           lambda v: self.fp.set_show_va(v))
+        self.chk_numbers = _act(
+            self.menu_overlays, "Numbers", True, self._on_numbers,
+            "Show the volume numbers inside cells and the per-bar "
+            "delta/volume footer")
+        self.chk_fills = _act(
+            self.menu_overlays, "My fills", True, self._on_fills,
+            "Mark your own executions: hollow green = bought, red = sold, "
+            "radius by size")
 
-        self.chk_numbers = QCheckBox("Numbers")
-        self.chk_numbers.setChecked(True)
-        self.chk_numbers.setToolTip(
-            "Show the volume numbers inside cells and the per-bar delta/volume "
-            "footer — applies to Footprint, Cluster, Profile and Delta modes")
-        self.chk_numbers.toggled.connect(self._on_numbers)
-        tb.addWidget(self.chk_numbers)
+        self.menu_overlays.addSeparator()
+        self.chk_cvd = _act(self.menu_overlays, "CVD pane", True,
+                            self._on_cvd_pane,
+                            "Show the cumulative-delta sub-chart")
+        self.chk_vwap = _act(self.menu_overlays, "VWAP", True,
+                             self._on_vwap_toggled)
+        self.chk_cpr = _act(self.menu_overlays, "CPR", False,
+                            self._on_cpr_toggled)
+        self.chk_ema = _act(self.menu_overlays, "EMAs", False,
+                            self._on_ema_toggled)
 
-        self.chk_fills = QCheckBox("My fills")
-        self.chk_fills.setChecked(True)
-        self.chk_fills.setToolTip(
-            "Mark your own executions on the chart: hollow green = bought, "
-            "red = sold, radius by size. "
-            "Derived from position changes in the feed, so several fills inside "
-            "one snapshot appear as one marker at the snapshot's last price.")
-        self.chk_fills.toggled.connect(self._on_fills)
-        tb.addWidget(self.chk_fills)
+        # ---- Windows menu ------------------------------------------------
+        self.menu_windows = QMenu("Windows", self)
+        btn_windows = QToolButton()
+        btn_windows.setText("Windows ▾")
+        btn_windows.setMenu(self.menu_windows)
+        btn_windows.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        tb.addWidget(btn_windows)
+        for label, slot, tip in (
+            ("Bookmap", self._open_bookmap, "Liquidity heatmap for a symbol"),
+            ("Tape", self._open_tape,
+             "Tape reader: every print, speed and running delta"),
+            ("Profile", self._open_profile, "Session volume profile"),
+            ("Analytics", self._open_analytics, "Order-flow analytics"),
+            ("Monitor", self._open_monitor, "Market monitor across symbols"),
+            ("DOM", self._open_dom, "Depth-of-market ladder"),
+        ):
+            a = self.menu_windows.addAction(label)
+            a.setToolTip(tip)
+            a.triggered.connect(slot)
 
-        self.chk_cvd = QCheckBox("CVD pane")
-        self.chk_cvd.setChecked(True)
-        self.chk_cvd.setToolTip("Show the cumulative-delta sub-chart")
-        self.chk_cvd.toggled.connect(self._on_cvd_pane)
-        tb.addWidget(self.chk_cvd)
-
-        self.chk_vwap = QCheckBox("VWAP")
-        self.chk_vwap.setChecked(True)
-        self.chk_vwap.toggled.connect(self._on_vwap_toggled)
-        tb.addWidget(self.chk_vwap)
-
-        tb.addSeparator()
-        self.chk_cpr = QCheckBox("CPR")
-        self.chk_cpr.setChecked(False)
-        self.chk_cpr.toggled.connect(self._on_cpr_toggled)
-        tb.addWidget(self.chk_cpr)
-
-        self.chk_ema = QCheckBox("EMAs")
-        self.chk_ema.setChecked(False)
-        self.chk_ema.toggled.connect(self._on_ema_toggled)
-        tb.addWidget(self.chk_ema)
+        self.menu_windows.addSeparator()
+        tile = self.menu_windows.addMenu("Tile bookmaps")
+        tile.setToolTip("Arrange the open Bookmap windows into a grid")
+        for label, count in (("Single", 1), ("1 × 2", 2), ("2 × 2", 4)):
+            a = tile.addAction(label)
+            a.triggered.connect(lambda _=False, c=count: self.tile_bookmaps(c))
 
         tb.addSeparator()
         tb.addWidget(QLabel(" Theme "))
@@ -309,33 +422,9 @@ class OmnitrixWindow(QMainWindow):
         self.theme_combo.currentTextChanged.connect(self._on_theme)
         tb.addWidget(self.theme_combo)
 
-        self.btn_bookmap = QPushButton("Bookmap")
-        self.btn_bookmap.clicked.connect(self._open_bookmap)
-        tb.addWidget(self.btn_bookmap)
-
-        self.btn_tape = QPushButton("Tape")
-        self.btn_tape.setToolTip("Tape reader: every print, speed and running "
-                                 "delta on one time axis")
-        self.btn_tape.clicked.connect(self._open_tape)
-        tb.addWidget(self.btn_tape)
-
-        self.btn_profile = QPushButton("Profile")
-        self.btn_profile.clicked.connect(self._open_profile)
-        tb.addWidget(self.btn_profile)
-
-        self.btn_analytics = QPushButton("Analytics")
-        self.btn_analytics.clicked.connect(self._open_analytics)
-        tb.addWidget(self.btn_analytics)
-
-        self.btn_monitor = QPushButton("Monitor")
-        self.btn_monitor.clicked.connect(self._open_monitor)
-        tb.addWidget(self.btn_monitor)
-
-        self.btn_dom = QPushButton("DOM")
-        self.btn_dom.clicked.connect(self._open_dom)
-        tb.addWidget(self.btn_dom)
-
-        self.btn_settings = QPushButton("⚙ Settings")
+        self.btn_settings = QPushButton("⚙")
+        self.btn_settings.setToolTip("Settings")
+        self.btn_settings.setFixedWidth(34)
         self.btn_settings.clicked.connect(self._open_settings)
         tb.addWidget(self.btn_settings)
 
@@ -403,14 +492,36 @@ class OmnitrixWindow(QMainWindow):
         btn_clear_drawings.clicked.connect(self._clear_drawings)
         dtb.addWidget(btn_clear_drawings)
 
-        # ---- two linked panes: price (top), CVD (bottom) ----
-        self.glw = GovernedPlotWidget()
-        self.setCentralWidget(self.glw)
+        # ---- chart grid: one, two or four panes -------------------------
+        # The central widget is a grid container rather than a single plot, so
+        # the layout can go to 1x2 or 2x2 without rebuilding anything. Panes
+        # are created ONCE, up front, and shown or hidden - constructing and
+        # destroying plots on every layout change would orphan the drawings
+        # that live on them.
+        self._grid_host = QWidget()
+        self._grid = QGridLayout(self._grid_host)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setSpacing(2)
+        self.setCentralWidget(self._grid_host)
+
+        self._panes = [
+            ChartPane(self, id(self), self.theme, self.instruments, i)
+            for i in range(MAX_PANES)
+        ]
+        for pane in self._panes:
+            pane.glw.scene().sigMouseMoved.connect(
+                lambda pos, p=pane: self._on_mouse_move(pos, p))
+            pane.glw.scene().sigMouseClicked.connect(
+                lambda ev, p=pane: self._on_mouse_click(ev, p))
+            pane.price_plot.getViewBox().sigRangeChangedManually.connect(
+                lambda *_a, p=pane: self._on_view(p))
+        self._active_pane = self._panes[0]
+        self._bind_pane(self._panes[0])
+        self._apply_layout(1)
 
         # TradingView-style ticker search: start typing a symbol anywhere on the
-        # chart and a floating box appears; Enter opens it, Escape cancels. A
-        # child of the chart widget so it floats over the plot; hidden until used.
-        self.sym_search = QLineEdit(self.glw)
+        # chart and a floating box appears; Enter opens it, Escape cancels.
+        self.sym_search = QLineEdit(self._grid_host)
         self.sym_search.setPlaceholderText("Type ticker, Enter to open")
         self.sym_search.setStyleSheet(
             "QLineEdit { background:#12161F; color:#F0F0F0; border:2px solid #26A69A;"
@@ -421,109 +532,7 @@ class OmnitrixWindow(QMainWindow):
         self.sym_search.returnPressed.connect(self._apply_sym_search)
         self.sym_search.installEventFilter(self)
 
-        # Two time axes, one per pane. Only the bottom-most VISIBLE pane shows
-        # its own, so hiding the CVD pane hands the axis up to the price chart
-        # instead of leaving the chart with no time scale at all. An axis item
-        # belongs to the plot it was built into and cannot be moved between
-        # them, so the second one is created up front and kept in sync.
-        self.price_time_axis = TimeAxis(orientation="bottom")
-        # The price scale reads the instrument's tick through a callable rather
-        # than a captured value: the tick is a Settings field, and the axis has
-        # to follow a change without the plot being rebuilt.
-        self.price_axis = PriceAxis(
-            orientation="right",
-            tick_fn=lambda: self.instruments.tick(self.active_symbol or "QQQ"))
-        self.price_plot = self.glw.addPlot(
-            row=0, col=0, axisItems={"bottom": self.price_time_axis,
-                                     "right": self.price_axis})
-        self.price_plot.showAxis("right")
-        self.price_plot.hideAxis("left")
-        self.price_plot.hideAxis("bottom")     # CVD pane carries it by default
-        self.price_plot.showGrid(x=True, y=True, alpha=0.25)
-
-        self.time_axis = TimeAxis(orientation="bottom")
-        self.cvd_plot = self.glw.addPlot(row=1, col=0,
-                                         axisItems={"bottom": self.time_axis})
-        self.cvd_plot.showAxis("right")
-        self.cvd_plot.hideAxis("left")
-        self.cvd_plot.showGrid(x=True, y=True, alpha=0.2)
-        self.cvd_plot.setXLink(self.price_plot)
-        self.glw.ci.layout.setRowStretchFactor(0, 4)
-        self.glw.ci.layout.setRowStretchFactor(1, 1)
-
-        self.heatmap = HeatmapItem(self.instruments.tick("QQQ"))
-        self.heatmap.setVisible(False)
-        self.price_plot.addItem(self.heatmap)
-
-        self.fp = FootprintItem(self.instruments.tick("QQQ"), self.theme)
-        self.price_plot.addItem(self.fp)
-
-        self.exec_item = ExecutionMarkersItem()
-        self.price_plot.addItem(self.exec_item)
-
-        # Indicators
-        self.cpr_item = CPRItem()
-        self.cpr_item.setVisible(False)
-        self.price_plot.addItem(self.cpr_item)
-
-        self.ema9_item = EMAItem(period=9, color=QColor(33, 150, 243))
-        self.ema21_item = EMAItem(period=21, color=QColor(255, 193, 7))
-        self.ema9_item.setVisible(False)
-        self.ema21_item.setVisible(False)
-        self.price_plot.addItem(self.ema9_item)
-        self.price_plot.addItem(self.ema21_item)
-
-        self.vwap_curve = pg.PlotDataItem(pen=pg.mkPen(self.theme.vwap, width=2))
-        self.price_plot.addItem(self.vwap_curve)
-
-        # VWAP standard-deviation bands (±1σ, ±2σ) — institutional mean-reversion
-        # envelope; price outside ±2σ is statistically stretched.
-        self.vwap_bands = []
-        for mult, alpha, dash in ((1, 150, Qt.PenStyle.DashLine),
-                                  (2, 90, Qt.PenStyle.DotLine)):
-            for _ in range(2):                    # upper + lower
-                c = pg.PlotDataItem(pen=pg.mkPen(self.theme.vwap, width=1,
-                                                 style=dash))
-                c.setOpacity(alpha / 255.0)
-                self.price_plot.addItem(c)
-                self.vwap_bands.append((mult, c))
-
-        self.cvd_curve = pg.PlotDataItem(pen=pg.mkPen(self.theme.cvd, width=2))
-        self.cvd_plot.addItem(self.cvd_curve)
-        self.cvd_zero = pg.InfiniteLine(angle=0, pos=0, movable=False,
-                                        pen=pg.mkPen("#666", style=Qt.PenStyle.DashLine))
-        self.cvd_plot.addItem(self.cvd_zero, ignoreBounds=True)
-
-        self.price_line = pg.InfiniteLine(angle=0, movable=False,
-                                          pen=pg.mkPen(self.theme.cvd, width=1,
-                                                       style=Qt.PenStyle.DashLine))
-        self.price_plot.addItem(self.price_line, ignoreBounds=True)
-        self.vline = pg.InfiniteLine(angle=90, movable=False,
-                                     pen=pg.mkPen("#666", style=Qt.PenStyle.DashLine))
-        self.hline = pg.InfiniteLine(angle=0, movable=False,
-                                     pen=pg.mkPen("#666", style=Qt.PenStyle.DashLine))
-        self.price_plot.addItem(self.vline, ignoreBounds=True)
-        self.price_plot.addItem(self.hline, ignoreBounds=True)
-
-        # Same component every other chart uses - see render/crosshair.py.
-        # Lines are owned here (the drawing tools read them), badges by it.
-        self.xhair = Crosshair(self.price_plot, x_label=self._time_at,
-                               add_lines=False, connect=False)
-        self.xhair_price = self.xhair.price      # kept: workspace + tests
-        self.xhair_time = self.xhair.time
         self._last_cursor = None
-        self.glw.scene().sigMouseMoved.connect(self._on_mouse_move)
-        # Rubber band shown between the two creation clicks.
-        self._preview = QGraphicsRectItem()
-        self._preview.setPen(pg.mkPen("#5C9DFF", width=1,
-                                      style=Qt.PenStyle.DashLine))
-        self._preview.setBrush(pg.mkBrush(92, 157, 255, 26))
-        self._preview.setZValue(80)
-        self._preview.setVisible(False)
-        self.price_plot.addItem(self._preview)
-
-        self.glw.scene().sigMouseClicked.connect(self._on_mouse_click)
-        self.price_plot.getViewBox().sigRangeChangedManually.connect(self._on_view)
 
         # ---- Time & Sales tape dock (right) ----
         self.tape = TapeWidget(
@@ -643,7 +652,9 @@ class OmnitrixWindow(QMainWindow):
                 self._profile(ev.symbol).add_trade(ev)
                 if ev.symbol not in self._known_symbols:
                     self._register_symbol(ev.symbol)
-                if ev.symbol == self.active_symbol:
+                # ANY visible pane, not just the active one - otherwise the
+                # three charts you are not clicking on would sit frozen.
+                if self._shows(ev.symbol):
                     self._dirty = True
             else:  # BookSnapshot
                 self.latest_book[ev.symbol] = ev
@@ -660,7 +671,7 @@ class OmnitrixWindow(QMainWindow):
                 s = self.series.get(ev.symbol)
                 if s is not None:
                     s.add_book(ev)
-                if ev.symbol == self.active_symbol:
+                if self._shows(ev.symbol):
                     self._dirty = True
 
         # Refresh the live indicator ~2x/sec even when no data is flowing, so
@@ -672,10 +683,86 @@ class OmnitrixWindow(QMainWindow):
         if self._dirty and self.active_symbol:
             self._redraw()
             self._dirty = False
-            _s = self.series.get(self.active_symbol)
-            if not self._centered_once and _s is not None and _s.view(self.tf_s):
-                self._center()
-                self._centered_once = True
+
+    # ---- chart panes -----------------------------------------------------
+    def _shows(self, sym: str) -> bool:
+        """Is this symbol on screen in any visible pane?"""
+        return any(p.symbol == sym for p in self._panes[:self._n_panes])
+
+    def _bind_pane(self, pane) -> None:
+        """Point the window's chart attributes at `pane`.
+
+        Everything outside this file - drawing tools, the settings dialog, the
+        crosshair helpers, workspace restore - was written against `self.fp`,
+        `self.price_plot` and friends. Rebinding those names on activation
+        means all of it keeps working unchanged and always acts on the chart
+        the user is actually pointing at, instead of every call site having to
+        learn about panes.
+        """
+        self._active_pane = pane
+        self.glw = pane.glw
+        self.fp = pane.fp
+        self.heatmap = pane.heatmap
+        self.price_plot = pane.price_plot
+        self.cvd_plot = pane.cvd_plot
+        self.price_axis = pane.price_axis
+        self.time_axis = pane.time_axis
+        self.price_time_axis = pane.price_time_axis
+        self.exec_item = pane.exec_item
+        self.cpr_item = pane.cpr_item
+        self.ema9_item = pane.ema9_item
+        self.ema21_item = pane.ema21_item
+        self.vwap_curve = pane.vwap_curve
+        self.vwap_bands = pane.vwap_bands
+        self.cvd_curve = pane.cvd_curve
+        self.cvd_zero = pane.cvd_zero
+        self.price_line = pane.price_line
+        self.vline = pane.vline
+        self.hline = pane.hline
+        self.xhair = pane.xhair
+        self.xhair_price = pane.xhair.price      # kept: workspace + tests
+        self.xhair_time = pane.xhair.time
+        self._preview = pane.preview
+        self.drawing_items = pane.drawing_items
+        multi = self._n_panes > 1
+        for p in self._panes:
+            p.set_active_look(p is pane, multi)
+
+    def _visible_panes(self) -> list:
+        return self._panes[:self._n_panes]
+
+    def _apply_layout(self, n: int) -> None:
+        """Show `n` panes in a grid. Panes keep their symbol and drawings."""
+        n = max(1, min(MAX_PANES, int(n)))
+        rows, cols = next((r, c) for (p, r, c) in LAYOUTS.values() if p == n)
+        self._n_panes = n
+        for pane in self._panes:
+            self._grid.removeWidget(pane.glw)
+            # HIDE, do not unparent. setParent(None) hands the widget to Python
+            # while Qt still owns its QGraphicsScene and every signal connected
+            # to it, and the two then disagree about who frees what at teardown
+            # - an intermittent segfault on exit. Leaving every pane parented to
+            # the grid host keeps destruction order Qt's problem, which it
+            # handles correctly.
+            pane.glw.setVisible(False)
+        for i in range(n):
+            self._grid.addWidget(self._panes[i].glw, i // cols, i % cols)
+            self._panes[i].glw.setVisible(True)
+        # The active pane must be one that is on screen, or the toolbar would
+        # be driving a chart nobody can see.
+        if self._active_pane not in self._visible_panes():
+            self._bind_pane(self._panes[0])
+        else:
+            self._bind_pane(self._active_pane)
+        # A new pane starts on the toolbar's symbol so the grid is never blank.
+        for pane in self._visible_panes():
+            if not pane.symbol:
+                pane.symbol = self.active_symbol
+                pane._needs_center = True
+        self._dirty = True
+
+    def _on_layout(self, txt: str) -> None:
+        self._apply_layout(LAYOUTS.get(txt, (1, 1, 1))[0])
 
     def _register_symbol(self, sym: str) -> None:
         self._known_symbols.add(sym)
@@ -695,81 +782,84 @@ class OmnitrixWindow(QMainWindow):
             self.fp.tick = self.instruments.tick(sym)
 
     def _redraw(self) -> None:
+        """Redraw every VISIBLE pane, each against its own symbol."""
+        for pane in self._visible_panes():
+            self._redraw_pane(pane)
+
+    def _redraw_pane(self, pane) -> None:
         # A tick change (or a symbol selected before its first print) leaves the
         # series absent until the next trade rebuilds it. Every accessor below
         # must tolerate that or the GUI raises on the very next frame.
-        s = self.series.get(self.active_symbol)
+        sym = pane.symbol
+        s = self.series.get(sym)
         if s is None:
             # Selecting a symbol that has depth but no prints yet, or a tick
             # change that dropped the series, used to `return` here - which left
             # the PREVIOUS symbol's bars painted on screen under the new
             # symbol's name. Clear instead, so an empty chart honestly means
             # "no trades for this symbol yet".
-            self.fp.set_bars([])
-            self.heatmap.set_bars([])
-            self.time_axis.set_bars([])
-            self.price_time_axis.set_bars([])
-            self.exec_item.set_data([], [])
-            for item in (self.cpr_item, self.ema9_item, self.ema21_item):
-                if item.isVisible():
-                    item.set_bars([])
-            self.vwap_curve.setData([], [])
-            self.cvd_curve.setData([], [])
-            for _, curve in self.vwap_bands:
-                curve.setData([], [])
-            self.lbl_stats.setText(f"  {self.active_symbol}   (no prints yet)  ")
+            pane.clear()
+            if pane is self._active_pane:
+                self.lbl_stats.setText(f"  {sym}   (no prints yet)  ")
             return
-        self._sync_step_label()
+        if pane is self._active_pane:
+            self._sync_step_label()
         bars = s.view(self.tf_s)
-        self.fp.set_bars(bars)
-        if self.heatmap.isVisible():
-            self.heatmap.set_bars(bars)
+        pane.fp.set_bars(bars)
+        if pane.heatmap.isVisible():
+            pane.heatmap.set_bars(bars)
         # Both axes stay fed: whichever one is showing must have the bars, and
         # the cost is a list reference, not a copy.
-        self.time_axis.set_bars(bars)
-        self.price_time_axis.set_bars(bars)
-        if self.exec_item.isVisible():
-            self.exec_item.set_data(bars,
-                                    self.executions.get(self.active_symbol, []))
+        pane.time_axis.set_bars(bars)
+        pane.price_time_axis.set_bars(bars)
+        if pane.exec_item.isVisible():
+            pane.exec_item.set_data(bars, self.executions.get(sym, []))
 
+        if pane.cpr_item.isVisible(): pane.cpr_item.set_bars(bars)
+        if pane.ema9_item.isVisible(): pane.ema9_item.set_bars(bars)
+        if pane.ema21_item.isVisible(): pane.ema21_item.set_bars(bars)
 
-        if self.cpr_item.isVisible(): self.cpr_item.set_bars(bars)
-        if self.ema9_item.isVisible(): self.ema9_item.set_bars(bars)
-        if self.ema21_item.isVisible(): self.ema21_item.set_bars(bars)
-        
-        self._update_overlays(s, bars)
+        self._update_overlays(s, bars, pane)
         if bars:
-            self.price_line.setPos(bars[-1].close)
-            if self.auto_scroll:
+            if pane._needs_center:
+                # First bars for this symbol - fit the view to THEM instead of
+                # leaving the previous instrument's price range on screen.
+                pane._needs_center = False
+                self._center(pane)
+            elif pane.auto_scroll and pane.auto_y:
+                self._follow_price(bars, pane)
+            pane.price_line.setPos(bars[-1].close)
+            if pane.auto_scroll:
                 n = len(bars)
-                vr = self.price_plot.getViewBox().viewRect()
+                vr = pane.price_plot.getViewBox().viewRect()
                 if vr.right() < n + 1:
-                    self.price_plot.setXRange(max(-1, n - 22), n + 3, padding=0)
-            self._update_stats(bars[-1])
+                    pane.price_plot.setXRange(max(-1, n - 22), n + 3, padding=0)
+            if pane is self._active_pane:
+                self._update_stats(bars[-1])
 
-    def _update_overlays(self, series: BarSeries, bars: list) -> None:
+    def _update_overlays(self, series: BarSeries, bars: list, pane) -> None:
         if not bars:
-            self.vwap_curve.setData([], [])
-            self.cvd_curve.setData([], [])
-            for _, c in self.vwap_bands:
+            pane.vwap_curve.setData([], [])
+            pane.cvd_curve.setData([], [])
+            for _, c in pane.vwap_bands:
                 c.setData([], [])
             return
-        tick = self.instruments.tick(self.active_symbol)
+        tick = self.instruments.tick(pane.symbol)
         # One memoized pass over the bars' cached moments, not a full walk of
         # every price cell in the history on every frame.
         vy, vstd, cy = series.overlays(self.tf_s, tick)
         xs = list(range(len(vy)))
 
-        self.vwap_curve.setData(xs, vy)
-        show_bands = self.vwap_curve.isVisible()
-        for k, (mult, curve) in enumerate(self.vwap_bands):
+        pane.vwap_curve.setData(xs, vy)
+        show_bands = pane.vwap_curve.isVisible()
+        for k, (mult, curve) in enumerate(pane.vwap_bands):
             sign = 1 if k % 2 == 0 else -1
             if show_bands and vstd:
                 curve.setData(xs, [m + sign * mult * s
                                    for m, s in zip(vy, vstd)])
             else:
                 curve.setData([], [])
-        self.cvd_curve.setData(list(range(len(cy))), cy)
+        pane.cvd_curve.setData(list(range(len(cy))), cy)
 
     def _update_stats(self, bar) -> None:
         self.lbl_stats.setText(
@@ -824,6 +914,12 @@ class OmnitrixWindow(QMainWindow):
             self.active_symbol = sym
             self.fp.tick = self.instruments.tick(sym)
             self.auto_scroll = True
+            # Centre on the new symbol WITHOUT the user reaching for Alt+R.
+            # This cannot be done here: a symbol selected before its first
+            # print has no bars yet, and the old price range is meaningless
+            # for the new instrument (QQQ at 400 and a $12 stock share an
+            # axis). So arm it and let _redraw fire once bars exist.
+            self._needs_center = True
             self._dirty = True
 
     # ---- TradingView-style ticker search --------------------------------
@@ -1010,6 +1106,41 @@ class OmnitrixWindow(QMainWindow):
         win = BookmapWindow(self._bookmap(sym), self.instruments.tick(sym), self)
         self._register_child(f"bookmap:{sym}", win)
 
+    # ---- bookmap grid ----------------------------------------------------
+    def tile_bookmaps(self, n: int) -> None:
+        """Arrange the open Bookmap windows as a 1, 1x2 or 2x2 grid.
+
+        Bookmaps are separate top-level windows, so their "grid" is a tiling of
+        the screen rather than a layout inside one widget. Opening four and
+        dragging them into place by hand is the thing this replaces.
+
+        If more bookmaps are open than the requested grid holds, the EXTRA ones
+        are left untouched rather than stacked or hidden: silently moving a
+        window the user positioned deliberately is worse than leaving it.
+        """
+        from PyQt6.QtWidgets import QApplication
+        wins = [w for k, w in self._child_windows.items()
+                if k.startswith("bookmap:") and w.isVisible()]
+        if not wins:
+            return
+        n = max(1, min(4, int(n)))
+        rows, cols = {1: (1, 1), 2: (1, 2), 4: (2, 2)}[n]
+        scr = QApplication.primaryScreen()
+        if scr is None:
+            return
+        area = scr.availableGeometry()
+        # Tile only as many as the grid has cells, oldest first - that is the
+        # order they were opened in, which is the order the user expects.
+        cw = area.width() // cols
+        ch = area.height() // rows
+        for i, w in enumerate(wins[:n]):
+            if w.isMinimized():
+                w.showNormal()
+            w.setGeometry(area.x() + (i % cols) * cw,
+                          area.y() + (i // cols) * ch,
+                          cw, ch)
+            w.raise_()
+
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self)
         if not dlg.exec():
@@ -1038,7 +1169,9 @@ class OmnitrixWindow(QMainWindow):
             # stale block on screen priced at the new tick.
             self.fp.set_bars([])
             self.heatmap.set_bars([])
-            self._centered_once = False
+            # A tick change reprices the axis; re-fit rather than leave the
+            # view framed for the old grid.
+            self._needs_center = True
         self.fp.configure(
             imbalance_factor=v["imbalance_factor"],
             min_imbalance_vol=v["min_imbalance_vol"],
@@ -1076,7 +1209,27 @@ class OmnitrixWindow(QMainWindow):
         self._last_cursor = None
         self.xhair.hide()
 
-    def _on_mouse_move(self, pos) -> None:
+    def _select_pane(self, pane) -> None:
+        """Make `pane` the one the toolbar and drawing tools act on."""
+        if pane is self._active_pane or pane not in self._visible_panes():
+            return
+        self._bind_pane(pane)
+        # The toolbar must follow the selection, not the other way round, or
+        # clicking a chart would silently retarget it to the wrong symbol.
+        if pane.symbol:
+            self.sym_combo.blockSignals(True)
+            if self.sym_combo.findText(pane.symbol) >= 0:
+                self.sym_combo.setCurrentText(pane.symbol)
+            self.sym_combo.blockSignals(False)
+        self._dirty = True
+
+    def _on_mouse_move(self, pos, pane=None) -> None:
+        pane = pane or self._active_pane
+        # Each pane owns its scene, so a move here IS a move on this pane -
+        # no hit-testing against sibling charts, and the crosshair can never
+        # end up on the wrong one.
+        if pane is not self._active_pane:
+            return
         if not self.price_plot.sceneBoundingRect().contains(pos):
             # Leaving the chart must clear the readouts, or they sit there
             # asserting a price the pointer is no longer on.
@@ -1127,7 +1280,13 @@ class OmnitrixWindow(QMainWindow):
         self._add_drawing(item)
         return True
 
-    def _on_mouse_click(self, ev) -> None:
+    def _on_mouse_click(self, ev, pane=None) -> None:
+        # Clicking a chart selects it. Done before anything else so the very
+        # first click on a background pane retargets the tools rather than
+        # drawing on the pane you were previously using.
+        if pane is not None and pane is not self._active_pane:
+            self._select_pane(pane)
+            return
         pos = ev.scenePos()
         if not self.price_plot.sceneBoundingRect().contains(pos):
             return
@@ -1341,16 +1500,69 @@ class OmnitrixWindow(QMainWindow):
         self._selected_drawing = None
         self._set_drawing_tool(None)
 
-    def _on_view(self) -> None:
-        s = self.series.get(self.active_symbol) if self.active_symbol else None
+    def _on_view(self, pane=None) -> None:
+        pane = pane or self._active_pane
+        s = self.series.get(pane.symbol) if pane.symbol else None
         if s is None:
             return
         bars = s.view(self.tf_s)
-        vr = self.price_plot.getViewBox().viewRect()
-        self.auto_scroll = vr.right() >= len(bars) - 1.0
+        vr = pane.price_plot.getViewBox().viewRect()
+        pane.auto_scroll = vr.right() >= len(bars) - 1.0
+        # sigRangeChangedManually only fires for a USER pan or zoom, so this is
+        # a reliable "they took the wheel" signal. Their vertical zoom is now
+        # theirs until they ask for it back.
+        pane.auto_y = False
+        # Touching a chart is also how you choose it in a grid.
+        if pane is not self._active_pane:
+            self._select_pane(pane)
 
-    def _center(self) -> None:
-        s = self.series.get(self.active_symbol) if self.active_symbol else None
+    def _follow_price(self, bars: list, pane=None) -> None:
+        """Keep live price on screen while following, without nagging the view.
+
+        Centring on a symbol change is not enough on its own: price then walks
+        out of the frame it was given. Measured on a quiet six-second sample the
+        view was 399.89..400.24 while price had already reached 400.83 - off
+        screen, and the only cure was Alt+R again. That is the same complaint
+        as the symbol switch, with a different cause.
+
+        HYSTERESIS IS THE POINT. Re-fitting every frame would set a slightly
+        different range every frame, and every range change is a full repaint -
+        it would spend the frame budget the governor just finished protecting,
+        on a view that never visibly moves. So we only act when price actually
+        nears the edge, and then we re-frame with room to spare so the next
+        move does not immediately trip it again.
+        """
+        pane = pane or self._active_pane
+        vb = pane.price_plot.getViewBox()
+        y0, y1 = vb.viewRange()[1]
+        span = y1 - y0
+        if span <= 0:
+            return
+        last = bars[-1].close
+        # Comfortable zone: the middle 70% of the view. Outside it, re-frame.
+        pad = span * 0.15
+        if y0 + pad <= last <= y1 - pad:
+            return
+        # Re-frame on what is actually visible, not on a fixed bar count, so a
+        # zoomed-out view does not snap back to a narrow one.
+        x0, x1 = vb.viewRange()[0]
+        lo_i = max(0, int(x0))
+        hi_i = min(len(bars), int(x1) + 1)
+        vis = bars[lo_i:hi_i] or bars[-24:]
+        lo = min(b.low for b in vis)
+        hi = max(b.high for b in vis)
+        # Preserve the user's zoom LEVEL where we can - re-centre a span they
+        # chose rather than imposing one, unless the data no longer fits.
+        need = (hi - lo) * 1.24 or 1.0
+        keep = max(span, need)
+        mid = (hi + lo) * 0.5
+        pane.price_plot.setYRange(mid - keep * 0.5, mid + keep * 0.5, padding=0)
+
+    def _center(self, pane=None) -> None:
+        """Frame the latest bars. Alt+R and the Center button hit the ACTIVE
+        pane; the redraw passes the pane it is drawing."""
+        pane = pane or self._active_pane
+        s = self.series.get(pane.symbol) if pane.symbol else None
         if s is None:
             return
         bars = s.view(self.tf_s)
@@ -1360,9 +1572,10 @@ class OmnitrixWindow(QMainWindow):
         lo = min(b.low for b in vis)
         hi = max(b.high for b in vis)
         margin = (hi - lo) * 0.12 or 1.0
-        self.price_plot.setYRange(lo - margin, hi + margin, padding=0)
-        self.price_plot.setXRange(max(-1, len(bars) - 22), len(bars) + 3, padding=0)
-        self.auto_scroll = True
+        pane.price_plot.setYRange(lo - margin, hi + margin, padding=0)
+        pane.price_plot.setXRange(max(-1, len(bars) - 22), len(bars) + 3, padding=0)
+        pane.auto_scroll = True
+        pane.auto_y = True
 
     def changeEvent(self, ev):
         if (ev.type() == QEvent.Type.ActivationChange
