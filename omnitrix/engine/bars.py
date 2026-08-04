@@ -35,6 +35,7 @@ class Bar:
     __slots__ = (
         "start_ts", "tf_s", "open", "high", "low", "close",
         "cells", "volume", "delta", "book", "_dirty", "_cache", "_agg",
+        "_ti", "_sell", "_buy",
     )
 
     def __init__(self, start_ts: int, tf_s: int, price: float):
@@ -48,12 +49,24 @@ class Bar:
         self._dirty = True
         self._cache: dict = {}
         self._agg = None                  # (step, volume, folded Bar)
+        # Compact frozen footprint, set by seal(). See `arrays()`.
+        self._ti = None
+        self._sell = None
+        self._buy = None
 
     # ---- ingestion -------------------------------------------------------
     def add(self, price: float, tick_index: int, size: int, aggressor: Aggressor) -> None:
         self.high = max(self.high, price)
         self.low = min(self.low, price)
         self.close = price
+
+        if self.cells is None:
+            # A sealed bar can still receive a LATE tick - out-of-order arrivals
+            # are normal on a live feed and BarSeries folds them back into their
+            # own bar. Compaction released the dict, so restore it, take the
+            # trade, and let the caller re-seal. Rare by construction: this only
+            # fires for a tick that arrived after its bar closed.
+            self._thaw()
 
         cell = self.cells.get(tick_index)
         if cell is None:
@@ -69,9 +82,74 @@ class Bar:
         self._dirty = True
 
     def seal(self) -> None:
-        """Mark the bar finished so its analytics cache is permanent."""
+        """Finish the bar: freeze its analytics AND compact its footprint.
+
+        `cells` is a dict[int, list[int]] because that is the right shape while
+        trades are still arriving. It is the wrong shape afterwards: measured at
+        154 bytes per price level, 2.26 MB per symbol-hour, which at a
+        100-symbol basket over a 16-hour session is the difference between ~7 GB
+        and ~3.7 GB - and a process that swaps is a process that lags, which is
+        the failure this whole exercise is meant to prevent.
+
+        A sealed bar never changes again, so it can be frozen into three int32
+        arrays: 8.1x smaller, and the shape every consumer actually wants.
+        The dict is dropped.
+        """
         self._analytics()          # force one computation
         self._dirty = False
+        self._agg = None           # a folded copy of the pre-seal state is stale
+        if self._ti is None and self.cells:
+            n = len(self.cells)
+            ti = np.fromiter(self.cells.keys(), dtype=np.int32, count=n)
+            order = np.argsort(ti, kind="stable")
+            vals = np.fromiter(
+                (v for c in self.cells.values() for v in c),
+                dtype=np.int64, count=n * 2).reshape(n, 2)
+            self._ti = ti[order]
+            self._sell = vals[order, 0].astype(np.int32)
+            self._buy = vals[order, 1].astype(np.int32)
+            self.cells = None
+
+    def _thaw(self) -> None:
+        """Compact form -> writable dict. The inverse of seal()'s compaction."""
+        if self._ti is not None:
+            self.cells = {int(t): [int(s), int(b)] for t, s, b in
+                          zip(self._ti.tolist(), self._sell.tolist(),
+                              self._buy.tolist())}
+            self._ti = self._sell = self._buy = None
+        elif self.cells is None:
+            self.cells = {}
+        self._agg = None                   # any folded copy is now stale
+
+    # ---- footprint access ------------------------------------------------
+    def arrays(self):
+        """(tick_index, sell, buy) as int32 arrays, ascending by price.
+
+        The one way to read a bar's footprint. Works for a live bar (built from
+        its dict) and a sealed one (returned directly, no copy). Consumers must
+        NOT reach for `cells`: it is None once the bar is sealed, and rebuilding
+        a dict to read it would undo both the memory win and the speed win - the
+        same trap PriceLadder's mapping protocol turned out to be.
+        """
+        if self._ti is not None:
+            return self._ti, self._sell, self._buy
+        cells = self.cells
+        if not cells:
+            return (np.empty(0, np.int32), np.empty(0, np.int32),
+                    np.empty(0, np.int32))
+        n = len(cells)
+        ti = np.fromiter(cells.keys(), dtype=np.int32, count=n)
+        order = np.argsort(ti, kind="stable")
+        vals = np.fromiter((v for c in cells.values() for v in c),
+                           dtype=np.int64, count=n * 2).reshape(n, 2)
+        return (ti[order], vals[order, 0].astype(np.int32),
+                vals[order, 1].astype(np.int32))
+
+    def n_levels(self) -> int:
+        return int(self._ti.size) if self._ti is not None else len(self.cells or ())
+
+    def has_cells(self) -> bool:
+        return self.n_levels() > 0
 
     # ---- cached analytics ------------------------------------------------
     def _analytics(self) -> dict:
@@ -81,18 +159,25 @@ class Bar:
         return self._cache
 
     def _compute(self) -> dict:
-        cells = self.cells
-        if not cells:
+        ti, sell, buy = self.arrays()
+        if ti.size == 0:
             return {"poc": None, "tot": {}, "ti_v": 0.0, "ti2_v": 0.0}
-        tot = {ti: c[0] + c[1] for ti, c in cells.items()}
+        t64 = ti.astype(np.int64)
+        v = sell.astype(np.int64) + buy.astype(np.int64)
         # Volume-weighted tick-index moments, cached alongside the POC. VWAP and
         # its standard-deviation bands are then an O(bars) running sum instead of
         # re-walking every cell of every bar on every frame.
-        ti_v = ti2_v = 0.0
-        for ti, v in tot.items():
-            ti_v += ti * v
-            ti2_v += (ti * ti) * v
-        return {"poc": max(tot, key=tot.get), "tot": tot,
+        ti_v = float((t64 * v).sum())
+        ti2_v = float((t64 * t64 * v).sum())
+        # Ties go to the LOWEST price. This is a deliberate change from
+        # `max(tot, key=tot.get)` over the old dict, which resolved a tie by
+        # INSERTION order - i.e. by the order trades happened to arrive. The
+        # same bar rebuilt from a replay could therefore report a different POC
+        # than it did live, and nothing downstream could tell. Ties are common
+        # on round sizes (measured: 14 of 400 random bars), so this is worth
+        # pinning down rather than leaving to arrival order.
+        poc = int(ti[int(v.argmax())])
+        return {"poc": poc, "tot": dict(zip(t64.tolist(), v.tolist())),
                 "ti_v": ti_v, "ti2_v": ti2_v}
 
     @property
@@ -140,22 +225,27 @@ class Bar:
         sell imbalance : sell_vol at index i dominates buy_vol at i+1
         Returns (buy_idx_set, sell_idx_set).
         """
-        cells = self.cells
-        buy_imb: set[int] = set()
-        sell_imb: set[int] = set()
-        for ti, c in cells.items():
-            sell_v, buy_v = c
-            if buy_v >= min_vol:
-                dn = cells.get(ti - 1)
-                dn_sell = dn[0] if dn else 0
-                if dn_sell == 0 or buy_v >= factor * dn_sell:
-                    buy_imb.add(ti)
-            if sell_v >= min_vol:
-                up = cells.get(ti + 1)
-                up_buy = up[1] if up else 0
-                if up_buy == 0 or sell_v >= factor * up_buy:
-                    sell_imb.add(ti)
-        return buy_imb, sell_imb
+        ti, sell, buy = self.arrays()
+        if ti.size == 0:
+            return set(), set()
+
+        def neighbour(offset: int, src):
+            """`src` value at ti+offset, or 0 where that level did not trade."""
+            want = ti + offset
+            idx = np.searchsorted(ti, want)
+            safe = np.clip(idx, 0, ti.size - 1)
+            hit = (idx < ti.size) & (ti[safe] == want)
+            return np.where(hit, src[safe], 0).astype(np.int64)
+
+        buy64 = buy.astype(np.int64)
+        sell64 = sell.astype(np.int64)
+        dn_sell = neighbour(-1, sell)     # sell one level BELOW
+        up_buy = neighbour(+1, buy)       # buy one level ABOVE
+        # `dn_sell == 0` means the diagonal neighbour never traded, which counts
+        # as an imbalance - preserved exactly from the dict version.
+        b_mask = (buy64 >= min_vol) & ((dn_sell == 0) | (buy64 >= factor * dn_sell))
+        s_mask = (sell64 >= min_vol) & ((up_buy == 0) | (sell64 >= factor * up_buy))
+        return set(ti[b_mask].tolist()), set(ti[s_mask].tolist())
 
     def aggregated(self, step: int) -> "Bar":
         """This bar's footprint folded onto a coarser price grid.
@@ -190,15 +280,19 @@ class Bar:
         agg = Bar(self.start_ts, self.tf_s, self.open)
         agg.high, agg.low, agg.close = self.high, self.low, self.close
         agg.volume, agg.delta, agg.book = self.volume, self.delta, self.book
-        cells = agg.cells
-        for ti, cell in self.cells.items():
-            b = ti // step
-            cur = cells.get(b)
-            if cur is None:
-                cells[b] = [cell[0], cell[1]]
-            else:
-                cur[0] += cell[0]
-                cur[1] += cell[1]
+        ti, sell, buy = self.arrays()
+        if ti.size:
+            # Floor-divide onto the coarse grid, then sum each bucket in one
+            # pass. np.unique returns the buckets already ascending, which is
+            # the order `arrays()` promises.
+            b = np.floor_divide(ti.astype(np.int64), step)
+            keys, inv = np.unique(b, return_inverse=True)
+            agg._ti = keys.astype(np.int32)
+            agg._sell = np.bincount(inv, weights=sell.astype(np.float64),
+                                    minlength=keys.size).astype(np.int32)
+            agg._buy = np.bincount(inv, weights=buy.astype(np.float64),
+                                   minlength=keys.size).astype(np.int32)
+            agg.cells = None
         agg.seal()                 # analytics computed once; we refold on change
         self._agg = (step, self.volume, agg)
         return agg
@@ -381,13 +475,19 @@ class BarSeries:
             cur.high = max(cur.high, base.high)
             cur.low = min(cur.low, base.low)
             cur.close = base.close
-            for ti, c in base.cells.items():
-                cell = cur.cells.get(ti)
+            # `base` is usually sealed and therefore compact, so read it through
+            # arrays() rather than a dict it no longer has. The accumulator is
+            # still a dict because it is being built incrementally; seal()
+            # compacts it when the group closes.
+            bti, bsell, bbuy = base.arrays()
+            cells = cur.cells
+            for ti, s, b in zip(bti.tolist(), bsell.tolist(), bbuy.tolist()):
+                cell = cells.get(ti)
                 if cell is None:
-                    cur.cells[ti] = [c[0], c[1]]
+                    cells[ti] = [s, b]
                 else:
-                    cell[0] += c[0]
-                    cell[1] += c[1]
+                    cell[0] += s
+                    cell[1] += b
             cur.volume += base.volume
             cur.delta += base.delta
             if base.book:

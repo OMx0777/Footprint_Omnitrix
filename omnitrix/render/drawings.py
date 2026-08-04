@@ -575,7 +575,9 @@ class FixedVolumeProfile(_DrawTool):
         buy: dict[int, int] = {}
         sell: dict[int, int] = {}
         for b in bars:
-            for ti, (sell_v, buy_v) in b.cells.items():
+            bti, bsell, bbuy = b.arrays()
+            for ti, sell_v, buy_v in zip(bti.tolist(), bsell.tolist(),
+                                         bbuy.tolist()):
                 if sell_v:
                     sell[ti] = sell.get(ti, 0) + sell_v
                 if buy_v:

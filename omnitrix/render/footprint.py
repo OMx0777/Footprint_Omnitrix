@@ -159,7 +159,7 @@ class FootprintItem(pg.GraphicsObject):
             cc = c_bull if bar.is_bull else c_bear
             if self.show_candles:
                 self._paint_candle(p, x, bar, cc, half, tick)
-            if self.draw_cells and bar.cells:
+            if self.draw_cells and bar.has_cells():
                 # Fold onto the drawn grid first, so POC, value area and the
                 # diagonal imbalances all describe the rows on screen.
                 self._paint_block(p, x, bar.aggregated(step), half, row_h,
@@ -186,7 +186,11 @@ class FootprintItem(pg.GraphicsObject):
         """`bar` is already folded onto the drawn grid; its cell keys are BUCKET
         indices and one row spans `row_h` in price."""
         t = self.theme
-        cells = bar.cells
+        # Sealed bars have no dict - see Bar.arrays(). Boxing once here is the
+        # same cost the dict iteration used to be, and every cell is drawn
+        # individually anyway.
+        _ti, _sell, _buy = bar.arrays()
+        cells = list(zip(_ti.tolist(), _sell.tolist(), _buy.tolist()))
         poc = bar.poc
         vah, val = bar.value_area(self.va_pct)
         mode = self.mode
@@ -206,11 +210,11 @@ class FootprintItem(pg.GraphicsObject):
                 p.drawLine(QPointF(x - half, edge), QPointF(x + half, edge))
 
         # scaling references for Profile / Delta modes
-        max_tot = max((s + b for s, b in cells.values()), default=1) or 1
-        max_abs_d = max((abs(b - s) for s, b in cells.values()), default=1) or 1
+        max_tot = max((s + b for _t, s, b in cells), default=1) or 1
+        max_abs_d = max((abs(b - s) for _t, s, b in cells), default=1) or 1
 
         tr = p.transform()
-        for ti, (sell_v, buy_v) in cells.items():
+        for ti, sell_v, buy_v in cells:
             tot = sell_v + buy_v
             if tot == 0:
                 continue

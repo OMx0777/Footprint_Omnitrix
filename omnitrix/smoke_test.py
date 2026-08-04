@@ -45,7 +45,7 @@ def main() -> None:
         print(f"===== {sym}  ({len(bars)} bar(s), base_tf=60s) =====")
         print(f"  OHLC  O:{bar.open:.2f} H:{bar.high:.2f} L:{bar.low:.2f} C:{bar.close:.2f}")
         print(f"  volume={bar.volume}  delta={bar.delta:+d}  bull={bar.is_bull}")
-        print(f"  price levels={len(bar.cells)}")
+        print(f"  price levels={bar.n_levels()}")
         if poc is not None:
             print(f"  POC={instruments.to_price(sym, poc):.2f}  "
                   f"VAH={instruments.to_price(sym, vah):.2f}  "
@@ -59,8 +59,10 @@ def main() -> None:
 
         # show a few footprint rows around the POC (ATAS-style bid x ask)
         print("  footprint (price     sell x buy):")
-        for ti in sorted(bar.cells, reverse=True)[:8]:
-            sell_v, buy_v = bar.cells[ti]
+        _t, _s, _b = bar.arrays()
+        _fp = dict(zip(_t.tolist(), zip(_s.tolist(), _b.tolist())))
+        for ti in sorted(_fp, reverse=True)[:8]:
+            sell_v, buy_v = _fp[ti]
             mark = " <-- POC" if ti == poc else ""
             print(f"    {instruments.to_price(sym, ti):8.2f}   "
                   f"{sell_v:6d} x {buy_v:<6d}{mark}")
