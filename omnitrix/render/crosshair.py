@@ -14,8 +14,28 @@ sit there asserting a price the cursor is no longer on.
 
 from __future__ import annotations
 
+import time
+
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt
+
+def clock_label(t: float, fmt: str = "%H:%M:%S") -> str:
+    """Epoch seconds -> clock text, or "" when the value is not a real time.
+
+    `time.localtime()` raises OSError on a negative or absurdly large value,
+    and both the crosshair and the time axis are asked to label the whole VIEW
+    - which extends past the data whenever you pan or zoom out beyond it. That
+    exception came out of paint(), aborting the render half-drawn, which is a
+    blank label at best and a smear of leftover pixels at worst. Every
+    epoch->text conversion on a paint path must go through here.
+    """
+    if not (0.0 < t < 32503680000.0) or t != t:      # 1970..3000, and not NaN
+        return ""
+    try:
+        return time.strftime(fmt, time.localtime(t))
+    except (OSError, OverflowError, ValueError):
+        return ""
+
 
 BADGE_BG = "#9FB0C8"
 BADGE_FG = "#0B0E14"

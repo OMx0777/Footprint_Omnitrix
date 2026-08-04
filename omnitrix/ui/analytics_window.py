@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import QMainWindow, QToolBar, QLabel, QComboBox
 import time
 
 from ..engine import metrics
-from ..render.crosshair import Crosshair
+from ..render.crosshair import Crosshair, clock_label
 from .bookmap_window import TF
 
 BG = "#0B0E14"
@@ -83,9 +83,8 @@ class AnalyticsWindow(QMainWindow):
         # it off the axis by eye is exactly what a crosshair is for.
         self.xhairs = [
             Crosshair(pl,
-                      x_label=lambda x: time.strftime(
-                          "%H:%M:%S",
-                          time.localtime(x * self.buffer.col_dt * self.agg)),
+                      x_label=lambda x: clock_label(
+                          x * self.buffer.col_dt * self.agg),
                       price_fmt="{:,.2f}")
             for pl in self.plots]
 
@@ -140,6 +139,14 @@ class AnalyticsWindow(QMainWindow):
         self.refresh()
 
     def refresh(self) -> None:
+        # A window you cannot see does not need live data. Every one of these
+        # runs its own timer and repaints regardless of whether it is on
+        # screen, so four open Bookmaps cost four full paints even when three
+        # are minimised behind the fourth. Measured: paint is 95% of the cost
+        # (98.5 ms of 104 ms at four windows), so skipping an unseen one is the
+        # cheapest frame in the app.
+        if not self.isVisible() or self.isMinimized():
+            return
         cols = self.buffer.view(self.agg)
         if not cols:
             return

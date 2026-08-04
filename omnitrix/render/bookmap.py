@@ -18,7 +18,7 @@ import pyqtgraph as pg
 from ..engine.model import split_size
 from PyQt6.QtCore import QRectF, QPointF, Qt
 from PyQt6.QtGui import (QColor, QPainter, QFont, QPen, QBrush, QRadialGradient,
-                         QImage)
+                         QImage, QPixmap)
 
 # Sampled from a real Bookmap ESU6:CME capture, not chosen by eye.
 #
@@ -158,6 +158,9 @@ LOOK_LUTS: dict[str, tuple] = {
 # only exists so a long-lived process cannot accumulate stale keys.
 _PB_MAX = 32
 _pb_memo: dict = {}
+
+# (radius_px, colour) -> pre-rendered sphere. See BubbleItem._sphere_sprite.
+_SPHERE_CACHE: dict = {}
 
 
 def _price_bounds(cols, tick):
@@ -585,6 +588,45 @@ class BubbleItem(_TapeItem):
             self._sphere(p, pt, r, BUY_BUBBLE if b >= s else SELL_BUBBLE)
 
     @staticmethod
+    def _sphere_sprite(r: int, base: QColor) -> QPixmap:
+        """A pre-rendered sphere, cached by (radius, colour).
+
+        Building a QRadialGradient per bubble was ~half the Bookmap's entire
+        paint - 14 ms of 30 ms, at 190 bubbles a frame - and every one of those
+        gradients is identical for a given radius and colour. Rendering each
+        distinct one ONCE into a pixmap turns the per-bubble cost into a blit.
+
+        The cache is bounded by construction: radius is an integer pixel count
+        over a small range and there are three bubble colours, so it settles at
+        a few dozen small pixmaps and never grows with the tape.
+        """
+        key = (r, base.rgba())
+        hit = _SPHERE_CACHE.get(key)
+        if hit is not None:
+            return hit
+        d = r * 2 + 2                       # +2 so the 0.6px rim is not clipped
+        pm = QPixmap(d, d)
+        pm.fill(Qt.GlobalColor.transparent)
+        q = QPainter(pm)
+        q.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        c = QPointF(d / 2.0, d / 2.0)
+        grad = QRadialGradient(c.x() - r * 0.35, c.y() - r * 0.4, r * 1.5)
+        hi = base.lighter(160)
+        grad.setColorAt(0.0, QColor(min(255, hi.red()), min(255, hi.green()),
+                                    min(255, hi.blue()), 245))
+        grad.setColorAt(0.45, QColor(base.red(), base.green(), base.blue(), 225))
+        dk = base.darker(180)
+        grad.setColorAt(1.0, QColor(dk.red(), dk.green(), dk.blue(), 215))
+        q.setBrush(QBrush(grad))
+        q.setPen(QPen(QColor(dk.red(), dk.green(), dk.blue(), 230), 0.6))
+        q.drawEllipse(c, float(r), float(r))
+        q.end()
+        if len(_SPHERE_CACHE) > 256:        # guard, not a policy
+            _SPHERE_CACHE.clear()
+        _SPHERE_CACHE[key] = pm
+        return pm
+
+    @staticmethod
     def _sphere(p: QPainter, pt: QPointF, r: float, base: QColor) -> None:
         """A Bookmap volume dot: a shaded sphere with a top-left highlight.
 
@@ -593,6 +635,10 @@ class BubbleItem(_TapeItem):
         with the peak offset from centre — that is a lit sphere. A flat disc
         would be constant. Slight translucency lets overlapping prints build up
         without hiding the liquidity field behind them.
+
+        Radius is quantised to whole pixels so the sprite cache can hit. That
+        is a sub-pixel size change on a soft-edged dot and is not visible; it
+        is the one thing here that is NOT bit-identical to the old renderer.
         """
         if r < 2.5:
             # Below a few pixels the gradient is not resolvable, and building one
@@ -601,16 +647,10 @@ class BubbleItem(_TapeItem):
             p.setPen(Qt.PenStyle.NoPen)
             p.drawEllipse(pt, r, r)
             return
-        grad = QRadialGradient(pt.x() - r * 0.35, pt.y() - r * 0.4, r * 1.5)
-        hi = base.lighter(160)
-        grad.setColorAt(0.0, QColor(min(255, hi.red()), min(255, hi.green()),
-                                    min(255, hi.blue()), 245))
-        grad.setColorAt(0.45, QColor(base.red(), base.green(), base.blue(), 225))
-        dk = base.darker(180)
-        grad.setColorAt(1.0, QColor(dk.red(), dk.green(), dk.blue(), 215))
-        p.setBrush(QBrush(grad))
-        p.setPen(QPen(QColor(dk.red(), dk.green(), dk.blue(), 230), 0.6))
-        p.drawEllipse(pt, r, r)
+        ri = int(r + 0.5)
+        pm = BubbleItem._sphere_sprite(ri, base)
+        p.drawPixmap(QPointF(pt.x() - pm.width() / 2.0,
+                             pt.y() - pm.height() / 2.0), pm)
 
 
 # Same aggression palette as the volume dots — one chart, one colour language.

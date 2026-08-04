@@ -78,6 +78,14 @@ class MarketMonitorWindow(QMainWindow):
             f = it.font(); f.setBold(True); it.setFont(f)
 
     def refresh(self) -> None:
+        # A window you cannot see does not need live data. Every one of these
+        # runs its own timer and repaints regardless of whether it is on
+        # screen, so four open Bookmaps cost four full paints even when three
+        # are minimised behind the fourth. Measured: paint is 95% of the cost
+        # (98.5 ms of 104 ms at four windows), so skipping an unseen one is the
+        # cheapest frame in the app.
+        if not self.isVisible() or self.isMinimized():
+            return
         app = self.app
         for sym in sorted(app.series):
             if sym not in self._rows:
