@@ -46,8 +46,16 @@ class Crosshair:
             plot.addItem(self.vline, ignoreBounds=True)
             plot.addItem(self.hline, ignoreBounds=True)
 
-        self.price = self._badge(plot, colour, (0, 0.5))
-        self.time = self._badge(plot, colour, (0.5, 0))
+        # Anchors point the text INWARD.
+        #
+        # A TextItem's anchor is the fraction of its own box placed at the given
+        # position, so (0, 0.5) puts its LEFT edge on the right border and the
+        # label extends outward, where the ViewBox clips it - measured at 1% of
+        # the badge actually on screen. (1, 0.5) hangs it inside instead.
+        # Likewise (0.5, 1) sits the bottom edge on the lower border so the
+        # label rises into the chart rather than dropping under the axis.
+        self.price = self._badge(plot, colour, (1, 0.5))
+        self.time = self._badge(plot, colour, (0.5, 1))
         self._last = None
 
         if connect:
