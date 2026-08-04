@@ -153,36 +153,53 @@ class FootprintItem(pg.GraphicsObject):
 
         c_bull = QColor(t.bull)
         c_bear = QColor(t.bear)
+        # Pens, brushes and theme colours built ONCE per frame, not per bar and
+        # not per cell. Profiling a 150-bar view found 2,250 mkPen and 3,000
+        # mkColor calls a frame - rebuilding identical objects cost as much as
+        # drawing the footprint itself.
+        pens = {}
+        for cc in (c_bull, c_bear):
+            pens[(cc.name(), 2)] = pg.mkPen(cc, width=2)
+            pens[(cc.name(), 1)] = pg.mkPen(cc, width=1)
+        brushes = {cc.name(): pg.mkBrush(cc) for cc in (c_bull, c_bear)}
+        pal = {
+            "poc_bg": QColor(t.poc_bg), "bid_bg": QColor(t.bid_bg),
+            "ask_bg": QColor(t.ask_bg), "bull": QColor(t.bull),
+            "bear": QColor(t.bear), "va_line": QColor(t.va_line),
+        }
 
         for x in range(x_lo, x_hi):
             bar = self.bars[x]
             cc = c_bull if bar.is_bull else c_bear
             if self.show_candles:
-                self._paint_candle(p, x, bar, cc, half, tick)
+                self._paint_candle(p, x, bar, cc, half, tick,
+                                   pens[(cc.name(), 2)], pens[(cc.name(), 1)],
+                                   brushes[cc.name()])
             if self.draw_cells and bar.has_cells():
                 # Fold onto the drawn grid first, so POC, value area and the
                 # diagonal imbalances all describe the rows on screen.
                 self._paint_block(p, x, bar.aggregated(step), half, row_h,
-                                  show_text)
+                                  show_text, pal)
 
     def _step_ticks(self, px_h: float) -> int:
         """Ticks per drawn footprint row (`price_step` <= 0 selects auto)."""
         return step_ticks(self.price_step, self.tick, px_h,
                           self.AUTO_TARGET_PX)
 
-    def _paint_candle(self, p, x, bar, color, half, tick) -> None:
+    def _paint_candle(self, p, x, bar, color, half, tick,
+                      pen2, pen1, brush) -> None:
         cx = x - half - self.CANDLE_GAP
-        p.setPen(pg.mkPen(color, width=2))
+        p.setPen(pen2)
         p.drawLine(QPointF(cx, bar.low), QPointF(cx, bar.high))
         top = max(bar.open, bar.close)
         bot = min(bar.open, bar.close)
         if top == bot:
             top += tick / 8
-        p.setPen(pg.mkPen(color, width=1))
-        p.setBrush(pg.mkBrush(color))
+        p.setPen(pen1)
+        p.setBrush(brush)
         p.drawRect(QRectF(cx - 0.09, bot, 0.18, top - bot))
 
-    def _paint_block(self, p, x, bar, half, row_h, show_text) -> None:
+    def _paint_block(self, p, x, bar, half, row_h, show_text, pal) -> None:
         """`bar` is already folded onto the drawn grid; its cell keys are BUCKET
         indices and one row spans `row_h` in price."""
         t = self.theme
@@ -222,8 +239,8 @@ class FootprintItem(pg.GraphicsObject):
             is_poc = ti == poc
 
             if mode == "Footprint":
-                c_sell = QColor(t.poc_bg) if is_poc else QColor(t.bid_bg)
-                c_buy = QColor(t.poc_bg) if is_poc else QColor(t.ask_bg)
+                c_sell = pal["poc_bg"] if is_poc else pal["bid_bg"]
+                c_buy = pal["poc_bg"] if is_poc else pal["ask_bg"]
                 if ti in sell_imb:
                     c_sell = t.sell_imb
                 if ti in buy_imb:
@@ -235,7 +252,7 @@ class FootprintItem(pg.GraphicsObject):
                                    t.poc_text if is_poc else t.cell_text)
 
             elif mode == "Cluster":
-                bg = QColor(t.poc_bg) if is_poc else (
+                bg = pal["poc_bg"] if is_poc else (
                     t.ask_bg if bar.is_bull else t.bid_bg)
                 p.fillRect(QRectF(x - half, y, self.BOX_W, row_h), bg)
                 if show_text:
@@ -244,9 +261,9 @@ class FootprintItem(pg.GraphicsObject):
 
             elif mode == "Profile":
                 w = self.BOX_W * (tot / max_tot)
-                col = QColor(t.bull) if buy_v >= sell_v else QColor(t.bear)
+                col = pal["bull"] if buy_v >= sell_v else pal["bear"]
                 if is_poc:
-                    col = QColor(t.va_line)
+                    col = pal["va_line"]
                 p.fillRect(QRectF(x - half, y, w, row_h), col)
                 if show_text:
                     self._cell_one(p, tr, x, y, row_h, half, _fmt(tot),
@@ -255,7 +272,7 @@ class FootprintItem(pg.GraphicsObject):
             elif mode == "Delta":
                 d = buy_v - sell_v
                 inten = min(1.0, abs(d) / max_abs_d)
-                base = QColor(t.bull) if d >= 0 else QColor(t.bear)
+                base = pal["bull"] if d >= 0 else pal["bear"]
                 col = QColor(base.red(), base.green(), base.blue(),
                              int(60 + 195 * inten))
                 p.fillRect(QRectF(x - half, y, self.BOX_W, row_h), col)

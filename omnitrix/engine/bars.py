@@ -35,7 +35,7 @@ class Bar:
     __slots__ = (
         "start_ts", "tf_s", "open", "high", "low", "close",
         "cells", "volume", "delta", "book", "_dirty", "_cache", "_agg",
-        "_ti", "_sell", "_buy",
+        "_ti", "_sell", "_buy", "_imb",
     )
 
     def __init__(self, start_ts: int, tf_s: int, price: float):
@@ -53,6 +53,7 @@ class Bar:
         self._ti = None
         self._sell = None
         self._buy = None
+        self._imb = None                  # (factor, min_vol, buy_set, sell_set)
 
     # ---- ingestion -------------------------------------------------------
     def add(self, price: float, tick_index: int, size: int, aggressor: Aggressor) -> None:
@@ -80,6 +81,7 @@ class Bar:
 
         self.volume += size
         self._dirty = True
+        self._imb = None
 
     def seal(self) -> None:
         """Finish the bar: freeze its analytics AND compact its footprint.
@@ -117,6 +119,7 @@ class Bar:
                           zip(self._ti.tolist(), self._sell.tolist(),
                               self._buy.tolist())}
             self._ti = self._sell = self._buy = None
+            self._imb = None
         elif self.cells is None:
             self.cells = {}
         self._agg = None                   # any folded copy is now stale
@@ -225,8 +228,17 @@ class Bar:
         sell imbalance : sell_vol at index i dominates buy_vol at i+1
         Returns (buy_idx_set, sell_idx_set).
         """
+        # Cached per (factor, min_vol). The renderer asks every visible bar for
+        # this on EVERY frame - measured at 150 calls and ~14 ms a frame on a
+        # normal chart - and a sealed bar's answer can never change. `add()`
+        # clears it, so the live bar stays correct.
+        c = self._imb
+        if c is not None and c[0] == factor and c[1] == min_vol:
+            return c[2], c[3]
+
         ti, sell, buy = self.arrays()
         if ti.size == 0:
+            self._imb = (factor, min_vol, set(), set())
             return set(), set()
 
         def neighbour(offset: int, src):
@@ -245,7 +257,9 @@ class Bar:
         # as an imbalance - preserved exactly from the dict version.
         b_mask = (buy64 >= min_vol) & ((dn_sell == 0) | (buy64 >= factor * dn_sell))
         s_mask = (sell64 >= min_vol) & ((up_buy == 0) | (sell64 >= factor * up_buy))
-        return set(ti[b_mask].tolist()), set(ti[s_mask].tolist())
+        out = (set(ti[b_mask].tolist()), set(ti[s_mask].tolist()))
+        self._imb = (factor, min_vol, out[0], out[1])
+        return out
 
     def aggregated(self, step: int) -> "Bar":
         """This bar's footprint folded onto a coarser price grid.
