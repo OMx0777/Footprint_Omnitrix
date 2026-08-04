@@ -82,6 +82,13 @@ class PipeFeed(TakionDecoder):
                 log.exception("%s reader crashed", key.upper())
             finally:
                 self.connected[key] = False
+                # L1 and L2 are separate pipes, so each resets only its own
+                # state: a book half-assembled on L2, or the cumulative-volume
+                # baseline on L1. See TakionDecoder.
+                if key == "l2":
+                    self.on_disconnect()
+                else:
+                    self.on_l1_disconnect()
                 if handle is not None:
                     try:
                         import win32file as _wf

@@ -76,6 +76,10 @@ class NetworkFeed(TakionDecoder):
                 log.exception("Network reader crashed")
             finally:
                 self.connected["network"] = False
+                # Both record types share this ONE link, so a drop interrupts
+                # both a sweep and the volume baseline. See TakionDecoder.
+                self.on_disconnect()
+                self.on_l1_disconnect()
                 try:
                     sock.close()
                 except Exception:

@@ -86,6 +86,12 @@ def to_epoch_ms(raw: int) -> int:
 class TakionDecoder(Feed):
     """Turns L1/L2 records into Trade / BookSnapshot events."""
 
+    # A sweep that never sends its 'C' marker would otherwise accumulate every
+    # price it ever saw. 4096 is ~16x the deepest real sweep (128 per side, and
+    # the DLL is capped at 1024), so hitting it means the stream is broken, not
+    # that the book is unusually deep.
+    MAX_PARTIAL_LEVELS = 4096
+
     def __init__(self, symbols: list[str] | None = None,
                  lot_multiplier: int = 1):
         super().__init__()
@@ -103,6 +109,7 @@ class TakionDecoder(Feed):
         self._last_px: dict[str, float] = {}    # for the tick test
         self._bids: dict[str, dict[float, int]] = {}
         self._asks: dict[str, dict[float, int]] = {}
+        self._overflow_warned: set = set()   # (symbol, side) already logged
         # "dll" | "receipt", logged once so a stale DLL is visible rather than
         # silently degrading book timing back to arrival time.
         self.sweep_clock: str | None = None
@@ -111,6 +118,55 @@ class TakionDecoder(Feed):
         # lagging the prints, and a high `unknown` share means the chart's
         # delta is being carried by an even split rather than by evidence.
         self.cls = {"quote": 0, "mid": 0, "tick": 0, "unknown": 0}
+
+    # ---- connection lifecycle --------------------------------------------
+    def on_l1_disconnect(self) -> None:
+        """Forget cumulative volume. MUST be called when the L1 link drops.
+
+        A trade's size is the change in cumulative volume between consecutive
+        snapshots. Across an outage that difference spans the whole gap, so the
+        first record back emitted ONE synthetic print carrying every share that
+        traded while we were away - measured at 3,999,900 shares on a 30-second
+        gap. That is a fabricated block: it lands at a single price with a
+        single aggressor, trips the block detector, and moves delta by millions.
+
+        Clearing the counter makes the first record after a reconnect re-seed
+        instead, so the missed volume is simply absent rather than invented. It
+        IS a gap either way; an honest gap is far less harmful than a fake
+        block, and `dropped`/status already tell the user the feed broke.
+        """
+        if self._last_vol:
+            log.info("L1 link dropped: forgetting cumulative volume for %d "
+                     "symbols so the gap is not emitted as one huge print",
+                     len(self._last_vol))
+        self._last_vol.clear()
+
+    def on_disconnect(self) -> None:
+        """Drop every half-assembled book. MUST be called when a link drops.
+
+        A sweep is assembled across many records and only published on its 'C'
+        marker, so a link that drops mid-sweep leaves a partial book behind.
+        Nothing used to clear it, and the merge is additive:
+
+            d[price] = d.get(price, 0) + size
+
+        so the FIRST sweep after every reconnect was silently corrupt - levels
+        present on both sides of the outage reported their combined size, and
+        levels pulled during the outage survived as liquidity that no longer
+        existed. A phantom wall on the heatmap is exactly the kind of false
+        data a trader would act on.
+
+        Cumulative volume is deliberately NOT reset: `_on_l1` already treats a
+        decrease as a restart, and clearing it would emit one bogus trade for
+        the whole session's volume on the next record.
+        """
+        n = sum(len(d) for d in self._bids.values()) + \
+            sum(len(d) for d in self._asks.values())
+        if n:
+            log.info("link dropped mid-sweep: discarding %d partial book "
+                     "levels rather than merging them into the next sweep", n)
+        self._bids.clear()
+        self._asks.clear()
 
     # ---- clock -----------------------------------------------------------
     def _wanted(self, sym: str) -> bool:
@@ -245,6 +301,16 @@ class TakionDecoder(Feed):
         if not sym or not self._wanted(sym):
             return
 
+        # An unpriceable record cannot become a trade. `last` is 0.0 whenever
+        # the Security has no last price yet (the struct is memset to zero and
+        # every fallback in the DLL failed), and a print at price 0 is not a
+        # harmless oddity: it is classified SELL because 0 <= bid, it drags the
+        # bar's low - and therefore the whole chart's y-range - down to zero,
+        # and it poisons VWAP and the volume profile for the session. One bad
+        # record used to be enough to make the chart unreadable.
+        if not (last > 0.0) or last != last:          # <=0, NaN
+            return
+
         prev = self._last_vol.get(sym)
         self._last_vol[sym] = cum_vol
         if prev is None or cum_vol <= prev:
@@ -288,9 +354,20 @@ class TakionDecoder(Feed):
             if bids or asks:
                 self._emit_book(BookSnapshot(sym, bids, asks,
                                              self._sweep_ts(price)))
-        elif side == "B":
-            d = self._bids.setdefault(sym, {})
-            d[price] = d.get(price, 0) + size * self.lot_multiplier
-        elif side == "A":
-            d = self._asks.setdefault(sym, {})
-            d[price] = d.get(price, 0) + size * self.lot_multiplier
+        elif side == "B" or side == "A":
+            # Sizes at one price SUM across market makers - that is real depth,
+            # not double counting.
+            d = (self._bids if side == "B" else self._asks).setdefault(sym, {})
+            if price in d or len(d) < self.MAX_PARTIAL_LEVELS:
+                d[price] = d.get(price, 0) + size * self.lot_multiplier
+            else:
+                # Guard, not a policy: a sweep this deep never completes, so it
+                # would otherwise grow for the life of the process. Existing
+                # levels still update, so the book stays coherent - it just
+                # stops accepting NEW prices until a 'C' clears it.
+                key = (sym, side)
+                if key not in self._overflow_warned:
+                    self._overflow_warned.add(key)
+                    log.warning("%s %s side passed %d levels with no sweep "
+                                "marker; refusing further prices until it "
+                                "completes", sym, side, self.MAX_PARTIAL_LEVELS)
