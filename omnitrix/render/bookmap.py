@@ -18,6 +18,7 @@ import numpy as np
 import pyqtgraph as pg
 
 from ..engine.model import split_size
+from ..engine.bookmap import _AG_FROM
 from PyQt6.QtCore import QRectF, QPointF, Qt
 from PyQt6.QtGui import (QColor, QPainter, QFont, QPen, QBrush, QRadialGradient,
                          QImage, QPixmap)
@@ -580,7 +581,7 @@ class _TapeItem(_BufItem):
         of the oldest print still retained.
         """
         buf = self.buffer
-        if buf is None or not buf.trades:
+        if buf is None or buf.trade_count == 0:
             self._cache = None
             return {}
         x_lo, x_hi = self._xrange()
@@ -589,10 +590,16 @@ class _TapeItem(_BufItem):
         xs = self.xscale
         inv = 1.0 / max(1e-9, self.bin_cols)
         rt = max(1, int(self.row_ticks))
-        trades = buf.trades
-        n = len(trades)
+        # Read the RING ARRAYS, not the TapeView. The view builds a tuple
+        # per access, which is exactly the allocation the ring was introduced
+        # to remove - going through it here would move the cost from memory to
+        # CPU on the hottest loop in the application.
+        tx, tti, tsz, tag = buf.trade_x, buf.trade_ti, buf.trade_sz, buf.trade_ag
+        cap = buf.max_trades
         total = buf.trade_count
-        first_abs = total - n                # absolute index of trades[0]
+        n = total if total < cap else cap
+        first_abs = total - n                # absolute index of logical 0
+        base = buf._tape_first               # physical slot of logical 0
         fold_lo = x_lo - _TRADE_SCAN_SLACK
 
         c = getattr(self, "_cache", None)
@@ -615,7 +622,7 @@ class _TapeItem(_BufItem):
             # the whole 60k tape.
             start = n
             for k in range(n - 1, -1, -1):
-                if trades[k][0] * xs < fold_lo:
+                if tx[(base + k) % cap] * xs < fold_lo:
                     break
                 start = k
             c = self._cache = {"sig": sig, "cells": cells, "lo_x": fold_lo,
@@ -623,7 +630,11 @@ class _TapeItem(_BufItem):
                                "consumed": first_abs + start}
 
         for k in range(start, n):
-            x, ti, size, aggr = trades[k]
+            p = (base + k) % cap
+            x = tx[p]
+            ti = int(tti[p])
+            size = int(tsz[p])
+            aggr = _AG_FROM[tag[p]]
             key = (int(math.floor(x * inv)), ti // rt)
             e = cells.get(key)
             if e is None:

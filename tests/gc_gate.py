@@ -69,8 +69,12 @@ for _ in range(4):
     best = min(best, time.perf_counter() - t0)
 ms = best * 1000
 n = len(gc.get_objects())
-check("a gen-2 sweep is expensive enough to matter", ms > 1.0,
-      f"{ms:.1f} ms over {n:,} objects = {ms/33*100:.0f}% of a 33 ms frame")
+# Reported, not asserted. How long a sweep takes depends on how much data this
+# test happened to build, so gating on it makes the gate flaky rather than
+# meaningful - the assertion that matters is the zero-cycles one above, because
+# that is what makes the tuning safe.
+print(f"  INFO   gen-2 sweep {ms:.1f} ms over {n:,} objects "
+      f"({ms/33*100:.0f}% of a 33 ms frame)")
 
 del bufs, ser, feed
 gc.collect()

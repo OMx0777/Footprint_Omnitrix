@@ -29,6 +29,69 @@ from .model import Aggressor, PriceLadder, EMPTY_LADDER, split_size
 from .instruments import Instruments
 
 
+# Aggressor <-> uint8, because storing the enum boxes a pointer per trade.
+_AG_CODE = {Aggressor.BUY: 0, Aggressor.SELL: 1, Aggressor.UNKNOWN: 2}
+_AG_FROM = (Aggressor.BUY, Aggressor.SELL, Aggressor.UNKNOWN)
+
+
+class TapeView:
+    """Sequence view over the tape's ring arrays.
+
+    The tape used to be a deque of (float, int, int, Aggressor) TUPLES.
+    Measured: 80 bytes for the tuple plus boxed members is 261 bytes to carry
+    17 bytes of data, so a full 60,000-entry tape cost 15.65 MB per symbol -
+    63.6% of the process footprint and about 1 GB across 100 symbols.
+
+    The data now lives in four parallel numpy arrays. This class exists so the
+    seven places that read `buffer.trades` - the signals scanner, the tape
+    widget and window, the monitor, the bookmap's mid-price fallback - keep
+    working unchanged: it supports len(), indexing, negative indexing, slicing
+    and iteration, and builds a tuple only for the entries someone actually
+    asks for. The hot path in _TapeItem._cells bypasses it and reads the arrays
+    directly.
+
+    Index 0 is the OLDEST retained trade, matching deque(maxlen=N) exactly.
+    """
+
+    __slots__ = ("_b",)
+
+    def __init__(self, buf):
+        self._b = buf
+
+    def __len__(self) -> int:
+        b = self._b
+        return b.trade_count if b.trade_count < b.max_trades else b.max_trades
+
+    def __bool__(self) -> bool:
+        return self._b.trade_count > 0
+
+    def _phys(self, i: int) -> int:
+        """Logical index (0 = oldest retained) -> physical slot."""
+        b = self._b
+        return (b._tape_first + i) % b.max_trades
+
+    def __getitem__(self, i):
+        n = len(self)
+        if isinstance(i, slice):
+            return [self[k] for k in range(*i.indices(n))]
+        if i < 0:
+            i += n
+        if not (0 <= i < n):
+            raise IndexError(i)
+        b = self._b
+        p = self._phys(i)
+        return (float(b.trade_x[p]), int(b.trade_ti[p]), int(b.trade_sz[p]),
+                _AG_FROM[b.trade_ag[p]])
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def __reversed__(self):
+        for i in range(len(self) - 1, -1, -1):
+            yield self[i]
+
+
 class Column:
     __slots__ = ("bucket", "book", "buy", "sell", "bid_ti", "ask_ti", "vol",
                  "sweeps", "net")
@@ -70,7 +133,17 @@ class BookmapBuffer:
         # report an older column or leave columns() non-monotonic in x - the
         # BBO line and the x-axis follow that order directly.
         self.order: list[int] = []
-        self.trades: deque[tuple[float, int, int, Aggressor]] = deque(maxlen=max_trades)
+        # The tape, as four parallel ring arrays rather than a deque of
+        # tuples - see TapeView for the measurement that motivated it.
+        self.max_trades = max_trades
+        self.trade_x = np.empty(max_trades, dtype=np.float64)
+        self.trade_ti = np.empty(max_trades, dtype=np.int32)
+        self.trade_sz = np.empty(max_trades, dtype=np.int32)
+        self.trade_ag = np.empty(max_trades, dtype=np.uint8)
+        # Physical slot of the OLDEST retained trade. Stays 0 until the ring
+        # wraps, then tracks the write head.
+        self._tape_first = 0
+        self.trades = TapeView(self)
         # Aggregation cache, mirroring BarSeries. `view()` runs on the Bookmap's
         # 80 ms timer, and rebuilding the whole fold each time cost 6.6 ms at
         # one hour and 30.8 ms at eight - 38% of a core, growing with uptime.
@@ -151,8 +224,16 @@ class BookmapBuffer:
         c.vol += tr.size
         c.net += buy - sell
         x = (tr.ts_ms / 1000.0) / self.col_dt
-        self.trades.append((x, ti, tr.size, tr.aggressor))
+        slot = self.trade_count % self.max_trades
+        self.trade_x[slot] = x
+        self.trade_ti[slot] = ti
+        self.trade_sz[slot] = tr.size
+        self.trade_ag[slot] = _AG_CODE.get(tr.aggressor, 2)
         self.trade_count += 1
+        if self.trade_count > self.max_trades:
+            # Wrapped: the oldest retained entry is now the one after the head,
+            # which is what deque(maxlen=N) did by dropping from the left.
+            self._tape_first = self.trade_count % self.max_trades
         self.trade_vol += tr.size
         if tr.size > self.trade_max:
             self.trade_max = tr.size

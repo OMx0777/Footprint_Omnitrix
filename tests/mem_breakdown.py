@@ -66,7 +66,10 @@ for b in allbars:
         fp += sys.getsizeof(getattr(b, "cells", {}) or {})
 # column trade dicts
 coldicts = sum(sys.getsizeof(c.buy) + sys.getsizeof(c.sell) for c in allcols)
-tapes = sum(sys.getsizeof(b.trades) + len(b.trades) * 72 for b in bufs.values())
+# The tape is four ring arrays now, so measure them - the old estimate
+# (getsizeof(deque) + 72 B/entry) describes a structure that no longer exists.
+tapes = sum(b.trade_x.nbytes + b.trade_ti.nbytes + b.trade_sz.nbytes
+            + b.trade_ag.nbytes for b in bufs.values())
 bar_obj = len(allbars) * 200
 col_obj = len(allcols) * 120
 
@@ -76,12 +79,12 @@ print(f"  bars                {len(allbars):,}   columns {len(allcols):,}")
 print()
 for name, val in (("Bar.book ladders", bar_book), ("Column.book ladders", col_book),
                   ("Bar footprint cells", fp), ("Column buy/sell dicts", coldicts),
-                  ("tape deques", tapes), ("Bar objects", bar_obj),
+                  ("tape ring arrays", tapes), ("Bar objects", bar_obj),
                   ("Column objects", col_obj)):
     print(f"    {name:24s} {val/1e6:8.2f} MB")
 shared = n_bar_lad + n_col_lad
 print(f"\n  distinct ladders: {n_bar_lad:,} on bars, {n_col_lad:,} on columns")
 tot = bar_book + col_book + fp + coldicts + tapes + bar_obj + col_obj
 print(f"    accounted        {tot/1e6:8.2f} MB of {(r1-r0)/1e6:.1f} MB RSS growth")
-print(f"    Bar.book share   {bar_book/max(tot,1)*100:8.1f}%  "
-      f"<- what Gemini's plan compresses")
+for name, val in (("Bar.book", bar_book), ("tape", tapes)):
+    print(f"    {name:16s} share {val/max(tot,1)*100:5.1f}%")

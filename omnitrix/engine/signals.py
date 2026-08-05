@@ -143,8 +143,12 @@ def detect_all(buffer, agg: int = 1, cols_window: int = COLS_WINDOW,
         cols = cols[-cols_window:]
     trades = buffer.trades
     if trades_window and len(trades) > trades_window:
-        # A deque slices badly; take the tail without copying the whole thing.
-        trades = list(islice(trades, len(trades) - trades_window, None))
+        # SLICE, do not islice. That comment used to read "a deque slices
+        # badly" and it was true of a deque - but the tape is now a view over
+        # ring arrays, and islice walks it from index 0, materialising a tuple
+        # for every entry it then throws away. Measured: 34 ms -> 77 ms on
+        # detect_all. The view's slice builds only the entries asked for.
+        trades = trades[-trades_window:]
     ev = (detect_blocks(trades)
           + detect_absorption(cols)
           + detect_wall_breaks(cols))

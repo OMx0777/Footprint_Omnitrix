@@ -64,7 +64,10 @@ class TapeWidget(QWidget):
         dt = self._dt_fn() or 1.0
         p.setFont(self.font)
         n = max(0, (self.height() - 24) // self.ROW_H)
-        rows = list(src)[-n:][::-1]      # newest first
+        # Slice BEFORE materialising. list(src)[-n:] built a tuple for all
+        # 60,000 tape entries every repaint and then threw away all but the ~40
+        # that fit on screen; the view's slice builds only those.
+        rows = src[-n:][::-1] if n else []      # newest first
         y = 24
         for x, ti, size, aggr in rows:
             is_buy = aggr.value == "buy"
