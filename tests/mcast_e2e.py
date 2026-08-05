@@ -209,8 +209,12 @@ DROP["at"] = {N + 40, N + 41, N + 42, N + 43}
 threading.Thread(target=publisher, daemon=True).start()
 time.sleep(0.3)
 
+# L2 backfill is OFF by default (depth is snapshot-based and rebuilds from the
+# next sweep; replaying it costs 1.3 GB after 15 minutes). Turn it on here
+# explicitly, because this test is specifically about the backfill/live JOIN.
 feed = MulticastFeed(group=GROUP, port=MPORT, iface="0.0.0.0",
-                     replay_host="127.0.0.1", replay_port=REPLAY_PORT)
+                     replay_host="127.0.0.1", replay_port=REPLAY_PORT,
+                     backfill_l2_s=3600)
 applied = []
 feed._on_l2 = lambda c, o: applied.append(1)
 feed._on_l1 = lambda c, o: None
@@ -239,6 +243,42 @@ check("a repaired gap does NOT discard the book",
       dropped_state["n"] == 0,
       "the replay restores exactly those bytes, so throwing state away first "
       "would discard what the replay rebuilds on")
+
+# ---- 3b. the backfill must be BOUNDED, not "everything since sequence 0" --
+# Asking from 0 is what froze a live terminal: 1.3 GB of L2 after 15 minutes,
+# capped at 256 MB, downloaded and applied on the receive thread while the
+# socket went unread. The request must be derived from a measured rate.
+asked = []
+_orig_req = MulticastFeed._request
+
+
+def spy_request(self, sock, line):
+    asked.append(line)
+    return _orig_req(self, sock, line)
+
+
+MulticastFeed._request = spy_request
+feed3 = MulticastFeed(group=GROUP, port=MPORT, iface="0.0.0.0",
+                      replay_host="127.0.0.1", replay_port=REPLAY_PORT,
+                      backfill_l1_s=60, backfill_l2_s=30)
+# 1000 batches/sec measured live, so 30 s of L2 is ~30,000 batches back - not 0.
+feed3._backfill({wire.CH_L2: 500_000}, {wire.CH_L2: 1000.0})
+MulticastFeed._request = _orig_req
+replay_lines = [a for a in asked if a.startswith("REPLAY")]
+check("the backfill asks for a bounded range, not from sequence 0",
+      bool(replay_lines) and replay_lines[0].split()[2] != "0",
+      replay_lines[0] if replay_lines else "no request made")
+if replay_lines:
+    lo = int(replay_lines[0].split()[2])
+    check("the range matches the requested seconds x the measured rate",
+          abs((500_000 - lo) - 30_000) <= 1, f"asked for {500_000-lo} batches")
+
+feed4 = MulticastFeed(group=GROUP, port=MPORT, iface="0.0.0.0",
+                      replay_host="127.0.0.1", replay_port=REPLAY_PORT)
+check("L2 backfill is OFF by default", feed4.backfill_l2_s == 0,
+      f"{feed4.backfill_l2_s}s - depth rebuilds from the next sweep")
+check("L1 backfill is ON by default", feed4.backfill_l1_s > 0,
+      f"{feed4.backfill_l1_s}s - this is the chart history")
 
 # ---- 4. no replay server: the book MUST be dropped, not kept stale --------
 feed2 = MulticastFeed(group=GROUP, port=MPORT, iface="0.0.0.0",

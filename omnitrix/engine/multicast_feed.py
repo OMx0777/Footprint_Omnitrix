@@ -130,6 +130,8 @@ class MulticastFeed(TakionDecoder):
                  iface: str = "0.0.0.0",
                  replay_host: str = "", replay_port: int = 9998,
                  backfill_seconds: float = 0.0,
+                 backfill_l1_s: float | None = None,
+                 backfill_l2_s: float | None = None,
                  symbols: list[str] | None = None, lot_multiplier: int = 1,
                  token: str | None = None):
         super().__init__(symbols=symbols, lot_multiplier=lot_multiplier)
@@ -138,6 +140,31 @@ class MulticastFeed(TakionDecoder):
         self.iface = iface
         self.replay_host = replay_host
         self.replay_port = replay_port
+        # BACKFILL IS BOUNDED BY TIME, PER CHANNEL, and the two channels get
+        # very different budgets on purpose. Measured from a live server log:
+        #
+        #     L1    104 batches/s   0.023 MB/s
+        #     L2   1079 batches/s   1.477 MB/s
+        #
+        # so "replay the session so far" costs 21 MB of L1 after 15 minutes and
+        # 1.3 GB of L2. An earlier version asked from sequence 0 on BOTH
+        # channels and relied on the server's 256 MB cap to bound it. That is
+        # not a bound - it is 256 MB downloaded and applied synchronously on
+        # this thread, during which the socket is not drained and datagrams are
+        # lost. Observed on the real server: a 19 MB backfill after 13 seconds
+        # of recording, 70 datagrams lost, none repaired, terminal frozen.
+        #
+        # L2 defaults to OFF because the book does not need it: depth is
+        # snapshot-based and the next full sweep rebuilds it within a second.
+        # Only the bookmap's historical heat field gains anything, and that
+        # fills in live. L1 is what builds the chart history somebody opens the
+        # app to see, and it is two orders of magnitude cheaper.
+        self.backfill_l1_s = (
+            backfill_l1_s if backfill_l1_s is not None
+            else float(os.environ.get("OMNITRIX_BACKFILL_L1", "900")))
+        self.backfill_l2_s = (
+            backfill_l2_s if backfill_l2_s is not None
+            else float(os.environ.get("OMNITRIX_BACKFILL_L2", "0")))
         self.backfill_seconds = backfill_seconds
         # Same default as NetworkFeed. A hardcoded "" meant the replay server
         # rejected every client the moment the server had a token set, which
@@ -154,6 +181,8 @@ class MulticastFeed(TakionDecoder):
         self.repairs = 0
         self.repair_bytes = 0
         self.unrepaired = 0
+        # Datagrams read while a replay was being applied, held until it is.
+        self._catchup: list[bytes] = []
 
     # ---- lifecycle -------------------------------------------------------
     def start(self) -> None:
@@ -203,7 +232,9 @@ class MulticastFeed(TakionDecoder):
         # JOIN FIRST, buffer, THEN backfill - see the module docstring.
         buffered: list[bytes] = []
         first_seq: dict[int, int] = {}
-        t_end = time.perf_counter() + 1.0
+        counts: dict[int, int] = {}
+        t_start = time.perf_counter()
+        t_end = t_start + 1.0
         while self._running and time.perf_counter() < t_end:
             dg = self._recv()
             if dg is None:
@@ -213,14 +244,29 @@ class MulticastFeed(TakionDecoder):
                 continue
             ch, _count, seq = hdr
             first_seq.setdefault(ch, seq)
+            counts[ch] = counts.get(ch, 0) + 1
             buffered.append(dg)
+        # Batches per second, per channel, MEASURED rather than assumed: it is
+        # what converts "N seconds of history" into a sequence range, and it
+        # differs by an order of magnitude between the two channels.
+        elapsed = max(1e-6, time.perf_counter() - t_start)
+        rates = {ch: n / elapsed for ch, n in counts.items()}
 
         if self.replay_host and first_seq:
-            self._backfill(first_seq)
+            self._backfill(first_seq, rates)
 
+        # ORDER: `buffered` was collected during the join window, BEFORE the
+        # backfill ran; `_catchup` was read while it ran. So buffered is the
+        # older of the two and must go first. Applying them the other way round
+        # replays older depth over newer, and - because the gap detector keeps
+        # a high-water mark - the older batches then register as reordering
+        # rather than as the gap they contain, so a real hole goes unreported.
         for dg in buffered:
             self._on_datagram(dg)
         buffered.clear()
+        for dg in self._catchup:
+            self._on_datagram(dg)
+        self._catchup.clear()
 
         last_repair = time.perf_counter()
         while self._running:
@@ -306,7 +352,8 @@ class MulticastFeed(TakionDecoder):
             out.extend(chunk)
         return bytes(out)
 
-    def _backfill(self, first_seq: dict[int, int]) -> None:
+    def _backfill(self, first_seq: dict[int, int],
+                  rates: dict[int, float] | None = None) -> None:
         """Fetch history up to the first sequence we already hold.
 
         The upper bound is `first_live - 1` on each channel, so the replayed
@@ -322,20 +369,29 @@ class MulticastFeed(TakionDecoder):
             self.connected["replay"] = False
             return
         try:
+            rates = rates or {}
             for ch, live_from in sorted(first_seq.items()):
-                lo = 0
-                if self.backfill_seconds > 0:
-                    # Sequence numbers are not time, so an exact "last N
-                    # minutes" needs the server's help. Until that exists,
-                    # asking from 0 and letting the server cap the reply is
-                    # honest and bounded - it returns the most it will serve.
-                    lo = 0
+                want_s = (self.backfill_l1_s if ch == wire.CH_L1
+                          else self.backfill_l2_s)
+                if want_s <= 0:
+                    log.info("backfill ch%d: disabled", ch)
+                    continue
+                rate = rates.get(ch, 0.0)
+                if rate <= 0:
+                    log.info("backfill ch%d: no live rate measured; skipping "
+                             "rather than guessing a range", ch)
+                    continue
+                # Sequence numbers are not time, but the measured rate converts
+                # between them, so "the last N seconds" needs no server support
+                # and cannot run away as the session lengthens.
+                lo = max(0, int(live_from - rate * want_s))
                 data = self._request(s, f"REPLAY {ch} {lo} {live_from - 1}")
                 if not data:
                     continue
-                log.info("backfill ch%d: %.1f MB up to seq %d",
-                         ch, len(data) / 1e6, live_from - 1)
-                self._apply_replay(data, ch)
+                log.info("backfill ch%d: %.1f MB, %.0f s of history "
+                         "(seq %d..%d)",
+                         ch, len(data) / 1e6, want_s, lo, live_from - 1)
+                self._apply_replay(data, ch, keep_draining=True)
             try:
                 s.sendall(b"BYE\n")
             except OSError:
@@ -346,14 +402,22 @@ class MulticastFeed(TakionDecoder):
             except OSError:
                 pass
 
-    def _apply_replay(self, data: bytes, channel: int) -> None:
+    def _apply_replay(self, data: bytes, channel: int,
+                      keep_draining: bool = False) -> None:
         """Feed replayed batches through the same path as live ones.
 
         Sequence numbers are NOT fed to the gap detector here: the detector
         tracks the LIVE stream's continuity, and replaying an older range
         would look like a huge reordering and reset its high-water mark.
+
+        `keep_draining` interleaves reads of the multicast socket. Applying a
+        large replay straight through leaves the socket unread for as long as
+        it takes, the kernel buffer overflows, and the backfill CAUSES the loss
+        it then has to repair - measured at 70 datagrams on a 19 MB replay.
+        What is read here is held and applied once the replay is in.
         """
         buf = bytearray(data)
+        n_since_drain = 0
         while buf:
             hdr = wire.decode_header(buf)
             if hdr is None:
@@ -365,6 +429,34 @@ class MulticastFeed(TakionDecoder):
             body = bytearray(buf[wire.HEADER_SIZE:end])
             del buf[:end]
             self._drain_records(body)
+            n_since_drain += 1
+            if keep_draining and n_since_drain >= 200:
+                n_since_drain = 0
+                self._pump_socket()
+
+    def _pump_socket(self, budget: int = 128) -> None:
+        """Read whatever is waiting and stash it, without applying it."""
+        if self._sock is None:
+            return
+        try:
+            self._sock.setblocking(False)
+        except OSError:
+            return
+        try:
+            for _ in range(budget):
+                try:
+                    dg = self._sock.recv(65535)
+                except (BlockingIOError, OSError):
+                    break
+                if not dg:
+                    break
+                self._catchup.append(dg)
+        finally:
+            try:
+                self._sock.setblocking(True)
+                self._sock.settimeout(1.0)
+            except OSError:
+                pass
 
     @staticmethod
     def _batch_end(buf: bytearray, count: int) -> int:
