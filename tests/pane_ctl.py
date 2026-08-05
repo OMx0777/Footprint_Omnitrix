@@ -58,6 +58,33 @@ check("two panes on the same ticker are both drawn",
       and len(win._panes[0].time_axis._bars) > 0
       and len(win._panes[3].time_axis._bars) > 0)
 
+# ---- 2b. per-pane TIMEFRAME ----------------------------------------------
+# The point of a grid is comparing horizons, so one window-wide timeframe would
+# defeat it: the same name at 10s and at 5m side by side has to be possible.
+for pane, tf in zip(win._panes, ["10s", "1m", "5m", "15m"]):
+    pane.tf_combo.setCurrentText(tf)
+pump(win, app, 90)
+got_tf = [p.tf_combo.currentText() for p in win._panes]
+check("each pane holds its own timeframe", got_tf == ["10s", "1m", "5m", "15m"], f"{got_tf}")
+secs = [p.tf_s for p in win._panes]
+check("the timeframes really differ in seconds", secs == [10, 60, 300, 900], f"{secs}")
+bars = []
+for p_ in win._panes:
+    ser = win.series.get(p_.symbol)
+    bars.append(len(ser.view(p_.tf_s)) if ser else 0)
+check("a finer timeframe yields more bars than a coarser one",
+      bars[0] >= bars[1] >= bars[2] >= bars[3] and bars[0] > bars[3], f"{bars}")
+check("each pane's axis follows its OWN timeframe",
+      [len(p_.time_axis._bars) for p_ in win._panes] == bars,
+      f"{[len(p_.time_axis._bars) for p_ in win._panes]} vs {bars}")
+win._select_pane(win._panes[2])
+check("the toolbar shows the selected pane's timeframe",
+      win.tf_combo.currentText() == "5m" and win.tf_s == 300,
+      f"{win.tf_combo.currentText()} / {win.tf_s}")
+for pane in win._panes:
+    pane.tf_combo.setCurrentText("1m")
+pump(win, app, 40)
+
 # ---- 3. per-pane headers visible only in a grid ---------------------------
 check("pane headers appear in a grid", all(p.header.isVisible() for p in win._panes[:4]))
 win.layout_combo.setCurrentText("1 chart"); pump(win, app)

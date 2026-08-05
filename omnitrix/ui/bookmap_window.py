@@ -17,7 +17,8 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, QPointF, QEvent
 from PyQt6.QtWidgets import (
     QMainWindow, QToolBar, QLabel, QComboBox, QPushButton, QCheckBox, QLineEdit,
-    QWidget, QVBoxLayout, QSplitter,
+    QWidget, QVBoxLayout, QSplitter, QMenu, QToolButton, QWidgetAction,
+    QHBoxLayout,
 )
 
 from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
@@ -628,55 +629,76 @@ class BookmapWindow(QMainWindow):
         self.min_combo.currentTextChanged.connect(self._on_minsize)
         tb.addWidget(self.min_combo)
 
-        tb.addWidget(QLabel("   Walls "))
-        self.wall_combo = QComboBox()
-        self.wall_combo.addItems(["Sensitive", "Normal", "Strict"])
-        self.wall_combo.setCurrentText("Normal")
-        self.wall_combo.currentTextChanged.connect(self._on_wall)
-        tb.addWidget(self.wall_combo)
+        # ---- Display menu -------------------------------------------------
+        # Walls, Fade gaps, S/R, Volume, Look and Focus were six controls
+        # strung across the toolbar, which pushed the zoom and Follow buttons
+        # off the right-hand edge in a grid layout. They are settings you
+        # change occasionally, not controls you reach for every minute.
+        #
+        # QAction rather than QCheckBox for the toggles: same
+        # isChecked/setChecked/toggled API, so nothing that reads them changes.
+        self.menu_display = QMenu("Display", self)
+        btn_display = QToolButton()
+        btn_display.setText("Display ▾")
+        btn_display.setMenu(self.menu_display)
+        btn_display.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        tb.addWidget(btn_display)
 
-        # Honesty switch. The heatmap forward-fills a ladder across columns that
-        # received no sweep, which is right for a wall that is genuinely still
-        # resting - but it makes unmeasured time indistinguishable from stable
-        # time. On (the default) fades those columns; off restores the solid
-        # field for a cleaner screenshot.
-        self.chk_gaps = QCheckBox("Fade gaps")
-        self.chk_gaps.setChecked(True)
-        self.chk_gaps.setToolTip(
+        def _combo_row(label, items, current, slot, tip=""):
+            w = QWidget()
+            lay = QHBoxLayout(w)
+            lay.setContentsMargins(24, 2, 10, 2)
+            lay.addWidget(QLabel(label))
+            c = QComboBox()
+            c.addItems(list(items))
+            if current:
+                c.setCurrentText(current)
+            if tip:
+                c.setToolTip(tip)
+            c.currentTextChanged.connect(slot)
+            lay.addWidget(c)
+            act = QWidgetAction(self)
+            act.setDefaultWidget(w)
+            self.menu_display.addAction(act)
+            return c
+
+        def _toggle(label, checked, slot, tip=""):
+            act = self.menu_display.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(checked)
+            if tip:
+                act.setToolTip(tip)
+            act.toggled.connect(slot)
+            return act
+
+        self.look_combo = _combo_row(
+            "Look", LOOKS, None, self._on_look,
+            "Colour scheme for the liquidity field")
+        self.recency_combo = _combo_row(
+            "Focus", RECENCY, None, self._on_recency,
+            "Live gradient: fade older columns so the field is dominated by "
+            "current liquidity")
+        self.wall_combo = _combo_row(
+            "Walls", ["Sensitive", "Normal", "Strict"], "Normal", self._on_wall,
+            "How readily a resting level counts as a wall")
+
+        self.menu_display.addSeparator()
+        # Honesty switch. The heatmap forward-fills a ladder across columns
+        # that received no sweep, which is right for a wall that is genuinely
+        # still resting - but it makes unmeasured time indistinguishable from
+        # stable time. On (the default) fades those columns.
+        self.chk_gaps = _toggle(
+            "Fade gaps", True, self._on_gaps,
             "Fade columns that received no book sweep, so liquidity that was "
             "measured is visibly distinct from liquidity that was assumed")
-        self.chk_gaps.toggled.connect(self._on_gaps)
-        tb.addWidget(self.chk_gaps)
-
-        self.chk_sr = QCheckBox("S/R")
-        self.chk_sr.setChecked(True)
-        self.chk_sr.setToolTip("Show the persistence-weighted support and "
-                               "resistance lines")
-        self.chk_sr.toggled.connect(self._on_sr)
-        tb.addWidget(self.chk_sr)
-
-        self.chk_vol = QCheckBox("Volume")
-        self.chk_vol.setChecked(True)
-        self.chk_vol.setToolTip("Show the bottom volume pane")
-        self.chk_vol.toggled.connect(self._on_volpane)
-        tb.addWidget(self.chk_vol)
-
-        tb.addWidget(QLabel("   Look "))
-        self.look_combo = QComboBox()
-        self.look_combo.addItems(list(LOOKS))
-        self.look_combo.setToolTip("Colour scheme for the liquidity field")
-        self.look_combo.currentTextChanged.connect(self._on_look)
-        tb.addWidget(self.look_combo)
-
-        tb.addWidget(QLabel(" Focus "))
-        self.recency_combo = QComboBox()
-        self.recency_combo.addItems(list(RECENCY))
-        self.recency_combo.setToolTip(
-            "Live gradient: fade older columns so the field is dominated by "
-            "current liquidity — makes the magnets in front of price stand out "
-            "instead of competing with history")
-        self.recency_combo.currentTextChanged.connect(self._on_recency)
-        tb.addWidget(self.recency_combo)
+        self.chk_vol = _toggle("Volume pane", True, self._on_volpane,
+                               "Show the bottom volume pane")
+        # OFF by default: the S/R lines are drawn full width across the field,
+        # and on a fresh book they are the least-supported thing on screen -
+        # they need minutes of history before they mean anything. Opt in.
+        self.chk_sr = _toggle(
+            "S/R lines", False, self._on_sr,
+            "Show the persistence-weighted support and resistance lines")
 
         self.btn_follow = QPushButton("⏵ Follow")
         self.btn_follow.clicked.connect(self._reset_view)

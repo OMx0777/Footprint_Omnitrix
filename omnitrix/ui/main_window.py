@@ -128,7 +128,6 @@ class OmnitrixWindow(QMainWindow):
         # the active-pane border at all.
         self._n_panes = 1
         self._pending_active_symbol = ""
-        self.tf_s = 60
         self.theme = DARK
         # auto_scroll / _auto_y / _needs_center are PER PANE (see the
         # properties below) - each chart follows its own symbol independently.
@@ -177,6 +176,19 @@ class OmnitrixWindow(QMainWindow):
     # Per-pane view state, exposed under the names the rest of the window (and
     # the workspace, and the tests) already use. Each delegates to the pane the
     # toolbar is driving, so "the chart" always means the one you selected.
+    @property
+    def tf_s(self) -> int:
+        """Timeframe of the pane the toolbar is driving. Per pane, so a grid
+        can show the same name on four horizons at once."""
+        p = getattr(self, "_active_pane", None)
+        return p.tf_s if p is not None else 60
+
+    @tf_s.setter
+    def tf_s(self, v: int) -> None:
+        p = getattr(self, "_active_pane", None)
+        if p is not None:
+            p.tf_s = int(v)
+
     @property
     def auto_scroll(self) -> bool:
         p = getattr(self, "_active_pane", None)
@@ -547,6 +559,10 @@ class OmnitrixWindow(QMainWindow):
             for i in range(MAX_PANES)
         ]
         for pane in self._panes:
+            pane.tf_combo.addItems(list(TF_CHOICES))
+            pane.tf_combo.setCurrentText("1m")
+            pane.tf_combo.currentTextChanged.connect(
+                lambda t, p=pane: self._set_pane_tf(p, t))
             pane.mode_combo.addItems(list(MODES))
             pane.mode_combo.currentTextChanged.connect(
                 lambda t, p=pane: self._on_pane_mode(p, t))
@@ -621,10 +637,24 @@ class OmnitrixWindow(QMainWindow):
     # ---- theme -----------------------------------------------------------
     def _apply_theme(self) -> None:
         t = self.theme
-        self.fp.set_theme(t)
-        self.vwap_curve.setPen(pg.mkPen(t.vwap, width=2))
-        self.cvd_curve.setPen(pg.mkPen(t.cvd, width=2))
-        self.glw.setBackground(t.bg)
+        # EVERY pane, not just the active one. This used to run through the
+        # `self.fp` / `self.glw` aliases, which point at the selected chart, so
+        # in a grid the other three never got themed at all and kept
+        # pyqtgraph's default black background while the selected one was the
+        # theme colour. That is the "bottom charts are black" report.
+        for pane in self._panes:
+            pane.theme = t
+            pane.fp.set_theme(t)
+            pane.vwap_curve.setPen(pg.mkPen(t.vwap, width=2))
+            pane.cvd_curve.setPen(pg.mkPen(t.cvd, width=2))
+            for mult, curve in pane.vwap_bands:
+                curve.setPen(pg.mkPen(t.vwap, width=1,
+                                      style=(Qt.PenStyle.DashLine if mult == 1
+                                             else Qt.PenStyle.DotLine)))
+            pane.price_line.setPen(pg.mkPen(t.cvd, width=1,
+                                            style=Qt.PenStyle.DashLine))
+            pane.glw.setBackground(t.bg)
+            pane.container.setStyleSheet(pane.container.styleSheet())
         # Restrained, terminal-like chrome. Painting every QPushButton in the
         # bull accent turned the toolbars into a wall of teal that competed with
         # the chart for attention; controls are now neutral, with the accent
@@ -659,11 +689,12 @@ class OmnitrixWindow(QMainWindow):
             f" QTabBar::tab:selected {{ background:{t.grid};"
             f"   border-bottom:2px solid {t.bull}; }}"
         )
-        for plot in (self.price_plot, self.cvd_plot):
-            for ax_name in ("bottom", "right"):
-                ax = plot.getAxis(ax_name)
-                ax.setPen(pg.mkPen(t.axis))
-                ax.setTextPen(pg.mkPen(t.text))
+        for pane in self._panes:
+            for plot in (pane.price_plot, pane.cvd_plot):
+                for ax_name in ("bottom", "right"):
+                    ax = plot.getAxis(ax_name)
+                    ax.setPen(pg.mkPen(t.axis))
+                    ax.setTextPen(pg.mkPen(t.text))
 
     # ---- feed drain + redraw (GUI thread) --------------------------------
     def _tick(self) -> None:
@@ -779,7 +810,8 @@ class OmnitrixWindow(QMainWindow):
         self._sync_toolbar_to(pane)
 
     def _sync_toolbar_to(self, pane) -> None:
-        for widget, value in ((self.mode_combo, pane.mode_combo.currentText()),):
+        for widget, value in ((self.mode_combo, pane.mode_combo.currentText()),
+                              (self.tf_combo, pane.tf_combo.currentText())):
             if value and widget.currentText() != value:
                 widget.blockSignals(True)
                 widget.setCurrentText(value)
@@ -827,10 +859,15 @@ class OmnitrixWindow(QMainWindow):
         else:
             self._bind_pane(self._active_pane)
         # A new pane starts on the toolbar's symbol so the grid is never blank.
+        active_tf = self._active_pane.tf_combo.currentText()
         for pane in self._visible_panes():
             if not pane.symbol:
                 pane.symbol = self.active_symbol
                 pane._needs_center = True
+            # A pane the user has never given a timeframe adopts the one in
+            # use, so a new grid opens on the timeframe you were looking at.
+            if not pane.tf_explicit and pane is not self._active_pane:
+                self._set_pane_tf(pane, active_tf, explicit=False)
             if pane.symbol and pane.sym_combo.currentText() != pane.symbol:
                 pane.sym_combo.blockSignals(True)
                 pane.sym_combo.setCurrentText(pane.symbol)
@@ -943,7 +980,7 @@ class OmnitrixWindow(QMainWindow):
             return
         if pane is self._active_pane:
             self._sync_step_label()
-        bars = s.view(self.tf_s)
+        bars = s.view(pane.tf_s)
         pane.fp.set_bars(bars)
         if pane.heatmap.isVisible():
             pane.heatmap.set_bars(bars)
@@ -990,7 +1027,7 @@ class OmnitrixWindow(QMainWindow):
         tick = self.instruments.tick(pane.symbol)
         # One memoized pass over the bars' cached moments, not a full walk of
         # every price cell in the history on every frame.
-        vy, vstd, cy = series.overlays(self.tf_s, tick)
+        vy, vstd, cy = series.overlays(pane.tf_s, tick)
         xs = list(range(len(vy)))
 
         pane.vwap_curve.setData(xs, vy)
@@ -1142,8 +1179,26 @@ class OmnitrixWindow(QMainWindow):
             self.sym_search.move(max(8, (gw - self.sym_search.width()) // 2), 12)
 
     def _on_tf(self, txt: str) -> None:
-        self.tf_s = TF_CHOICES.get(txt, 60)
-        self.auto_scroll = True
+        self._set_pane_tf(self._active_pane, txt)
+
+    def _set_pane_tf(self, pane, txt: str, explicit: bool = True) -> None:
+        """Timeframe of ONE chart. The other panes keep theirs."""
+        pane.tf_s = TF_CHOICES.get(txt, 60)
+        if explicit:
+            pane.tf_explicit = True
+        pane.auto_scroll = True
+        # A different horizon reframes the whole chart - the old price window
+        # described a different number of bars - so re-fit rather than leave
+        # the previous timeframe's view.
+        pane._needs_center = True
+        if pane.tf_combo.currentText() != txt:
+            pane.tf_combo.blockSignals(True)
+            pane.tf_combo.setCurrentText(txt)
+            pane.tf_combo.blockSignals(False)
+        if pane is self._active_pane and self.tf_combo.currentText() != txt:
+            self.tf_combo.blockSignals(True)
+            self.tf_combo.setCurrentText(txt)
+            self.tf_combo.blockSignals(False)
         self._dirty = True
 
     def _on_vwap_toggled(self, on: bool) -> None:
@@ -1327,8 +1382,8 @@ class OmnitrixWindow(QMainWindow):
         self._dirty = True
 
     def _time_at(self, x: float) -> str:
-        """Wall-clock label for a bar position, matching the time axis."""
-        bars = self.time_axis._bars
+        """Wall-clock label for a bar position on the SELECTED chart."""
+        bars = self._active_pane.time_axis._bars
         i = int(round(x))
         if not (0 <= i < len(bars)):
             return ""
@@ -1630,7 +1685,7 @@ class OmnitrixWindow(QMainWindow):
         s = self.series.get(pane.symbol) if pane.symbol else None
         if s is None:
             return
-        bars = s.view(self.tf_s)
+        bars = s.view(pane.tf_s)
         vr = pane.price_plot.getViewBox().viewRect()
         pane.auto_scroll = vr.right() >= len(bars) - 1.0
         # sigRangeChangedManually only fires for a USER pan or zoom, so this is
@@ -1690,7 +1745,7 @@ class OmnitrixWindow(QMainWindow):
         s = self.series.get(pane.symbol) if pane.symbol else None
         if s is None:
             return
-        bars = s.view(self.tf_s)
+        bars = s.view(pane.tf_s)
         if not bars:
             return
         vis = bars[-24:]

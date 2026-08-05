@@ -547,23 +547,83 @@ class _TapeItem(_BufItem):
         self.setZValue(0)
 
     def _cells(self) -> dict:
-        """(x_bin, price_bucket) -> [buy, sell] over the visible tape."""
-        if self.buffer is None or not self.buffer.trades:
+        """(x_bin, price_bucket) -> [buy, sell] over the VISIBLE tape.
+
+        INCREMENTAL. Re-binning every visible print on every frame was ~49% of
+        the bubble overlay's cost and the single largest item on a busy desk:
+        a dense tape puts 15,000+ prints inside the view, and all but the
+        handful that arrived since the last frame were re-folded into exactly
+        the bins they were already in.
+
+        The bins are keyed by ABSOLUTE time bin and price bucket, so they do
+        not depend on the viewport - which is what makes reuse possible at all.
+        The cache is kept honest by rebuilding whenever anything could make it
+        disagree with the tape:
+
+          * the binning parameters or the buffer changed;
+          * the view scrolled LEFT of the span we folded, into bins we never
+            built;
+          * eviction has eaten into the folded span. The tape is a bounded
+            deque, so old prints are dropped silently; a bin built from prints
+            the tape no longer holds would draw volume that cannot be shown
+            anywhere else on the chart, which is exactly the kind of
+            can't-check-it discrepancy this codebase treats as false data.
+            This is tested on ABSOLUTE PRINT INDEX, not on position: comparing
+            x coordinates instead made a fresh session - where the oldest print
+            legitimately sits inside the view - look identical to one that had
+            evicted, and rebuilt on every single frame;
+          * the folded span has grown past a few screens, which bounds the
+            cache so a long session cannot inflate it.
+
+        Eviction is detectable exactly because the buffer counts every print it
+        has ever appended, so `trade_count - len(trades)` is the absolute index
+        of the oldest print still retained.
+        """
+        buf = self.buffer
+        if buf is None or not buf.trades:
+            self._cache = None
             return {}
         x_lo, x_hi = self._xrange()
+        if x_hi <= x_lo:
+            return {}
         xs = self.xscale
         inv = 1.0 / max(1e-9, self.bin_cols)
         rt = max(1, int(self.row_ticks))
-        cells: dict[tuple, list] = {}
-        # Scan newest-first and stop once past the left edge: the tape holds up
-        # to 60k prints and walking all of them every frame dominated the frame
-        # time. The slack lets a slightly out-of-order print still be found.
-        for x, ti, size, aggr in reversed(self.buffer.trades):
-            xd = x * xs
-            if xd < x_lo - _TRADE_SCAN_SLACK:
-                break
-            if xd > x_hi:
-                continue
+        trades = buf.trades
+        n = len(trades)
+        total = buf.trade_count
+        first_abs = total - n                # absolute index of trades[0]
+        fold_lo = x_lo - _TRADE_SCAN_SLACK
+
+        c = getattr(self, "_cache", None)
+        sig = (id(buf), xs, inv, rt)
+        reusable = (
+            c is not None
+            and c["sig"] == sig
+            and first_abs <= c["fold_start"]    # no FOLDED print has been evicted
+            and x_lo >= c["lo_x"]               # view still inside the fold
+            and (x_lo - c["lo_x"]) <= 3.0 * (x_hi - x_lo)   # cache stays bounded
+        )
+
+        if reusable:
+            cells = c["cells"]
+            start = c["consumed"] - first_abs
+        else:
+            cells = {}
+            # Rebuild scans newest-first and stops at the left edge, so a cold
+            # cache costs exactly what the old unconditional pass did - never
+            # the whole 60k tape.
+            start = n
+            for k in range(n - 1, -1, -1):
+                if trades[k][0] * xs < fold_lo:
+                    break
+                start = k
+            c = self._cache = {"sig": sig, "cells": cells, "lo_x": fold_lo,
+                               "fold_start": first_abs + start,
+                               "consumed": first_abs + start}
+
+        for k in range(start, n):
+            x, ti, size, aggr = trades[k]
             key = (int(math.floor(x * inv)), ti // rt)
             e = cells.get(key)
             if e is None:
@@ -574,10 +634,21 @@ class _TapeItem(_BufItem):
             # be classified, and the overlay systematically overstated buying
             # by the whole unclassified volume. That is the "everything is
             # green" report, and it was false data, not a colour choice.
-            b, s = split_size(size, aggr, ti)
+            b, sl = split_size(size, aggr, ti)
             e[0] += b
-            e[1] += s
-        return cells
+            e[1] += sl
+        c["consumed"] = total
+
+        # The fold covers [lo_x, live edge]; the caller may be looking at less
+        # than that, so the visible subset is selected here. Bin -> x is exact
+        # (the key IS floor(x / bin_cols)), so this filter is the same one the
+        # old per-trade scan applied.
+        span = self.bin_cols * xs
+        lo_bin = math.floor((x_lo / xs) * inv) - 1
+        hi_bin = math.floor((x_hi / xs) * inv) + 1
+        if span <= 0:
+            return dict(cells)
+        return {k: v for k, v in cells.items() if lo_bin <= k[0] <= hi_bin}
 
     def _binned(self) -> list[tuple]:
         """[(x_display, price, buy, sell, total)] largest last, capped."""

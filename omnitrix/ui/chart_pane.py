@@ -48,6 +48,15 @@ class ChartPane:
         # Empty means "follow the toolbar's symbol". Only panes 1..3 in a grid
         # carry their own, so a single-pane layout behaves exactly as before.
         self.symbol = ""
+        # Timeframe is PER PANE: the point of a grid is comparing the same or
+        # different names on different horizons at once - a 10s footprint next
+        # to a 5m one - so a single window-wide timeframe would defeat it.
+        self.tf_s = 60
+        # False until the user picks a timeframe for THIS chart. A pane that
+        # has never been set follows the one you are looking at when it first
+        # appears, so opening a 2x2 grid gives four charts on the timeframe you
+        # were already using rather than three silently on the default.
+        self.tf_explicit = False
         self._needs_center = True
         self.auto_scroll = True
         self.auto_y = True
@@ -74,6 +83,10 @@ class ChartPane:
         self.mode_combo.setMinimumWidth(120)
         self.mode_combo.setToolTip("Chart type for THIS chart")
         _h.addWidget(self.mode_combo)
+        self.tf_combo = QComboBox()
+        self.tf_combo.setMinimumWidth(58)
+        self.tf_combo.setToolTip("Timeframe for THIS chart")
+        _h.addWidget(self.tf_combo)
         self.lbl_last = QLabel("")
         self.lbl_last.setStyleSheet("color:#8A93A6;font-weight:600;")
         _h.addWidget(self.lbl_last)
@@ -209,7 +222,7 @@ class ChartPane:
         if not (0 <= i < len(bars)):
             return ""
         lt = time.localtime(bars[i].start_ts)
-        fmt = "%H:%M:%S" if self.win.tf_s < 60 else "%d %b  %H:%M"
+        fmt = "%H:%M:%S" if self.tf_s < 60 else "%d %b  %H:%M"
         return time.strftime(fmt, lt)
 
     def clear(self) -> None:

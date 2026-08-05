@@ -161,6 +161,11 @@ class BookmapPane:
         # drawn full width so price can be watched approaching them.
         self.sr = SRTracker()
         self.sr_item = SRLinesItem(self.tick)
+        # Hidden to match the toolbar default. A checkbox that starts unchecked
+        # only emits toggled on CHANGE, so leaving the item visible here would
+        # show S/R lines the menu says are off - and the two would stay out of
+        # step until the user clicked it twice.
+        self.sr_item.setVisible(False)
         self.main.addItem(self.sr_item)
 
         # ---- crosshair with live price / time / liquidity readout ----
