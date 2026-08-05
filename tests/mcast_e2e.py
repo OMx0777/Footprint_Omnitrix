@@ -275,10 +275,20 @@ if replay_lines:
 
 feed4 = MulticastFeed(group=GROUP, port=MPORT, iface="0.0.0.0",
                       replay_host="127.0.0.1", replay_port=REPLAY_PORT)
-check("L2 backfill is OFF by default", feed4.backfill_l2_s == 0,
-      f"{feed4.backfill_l2_s}s - depth rebuilds from the next sweep")
-check("L1 backfill is ON by default", feed4.backfill_l1_s > 0,
-      f"{feed4.backfill_l1_s}s - this is the chart history")
+# BOTH channels off by default. Backfilling one and not the other is what made
+# a working bookmap look broken: trade history over a black heat field, because
+# the chart had a past and the book did not. Whatever the default is, the two
+# channels must agree - a half-populated time axis is worse than an empty one.
+check("backfill is OFF by default on BOTH channels",
+      feed4.backfill_l1_s == 0 and feed4.backfill_l2_s == 0,
+      f"L1={feed4.backfill_l1_s}s L2={feed4.backfill_l2_s}s")
+check("the default cannot be asymmetric",
+      (feed4.backfill_l1_s > 0) == (feed4.backfill_l2_s > 0),
+      "one channel with history and the other without draws a chart whose "
+      "two halves disagree about how far back the data goes")
+check("the replay link is still wanted, for gap repair",
+      feed4.replay_host != "",
+      "no history does not mean no recovery - a lost datagram still needs it")
 
 # ---- 4. no replay server: the book MUST be dropped, not kept stale --------
 feed2 = MulticastFeed(group=GROUP, port=MPORT, iface="0.0.0.0",

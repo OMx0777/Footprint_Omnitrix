@@ -140,28 +140,33 @@ class MulticastFeed(TakionDecoder):
         self.iface = iface
         self.replay_host = replay_host
         self.replay_port = replay_port
-        # BACKFILL IS BOUNDED BY TIME, PER CHANNEL, and the two channels get
-        # very different budgets on purpose. Measured from a live server log:
+        # BACKFILL IS OFF BY DEFAULT. Deliberately, and after two live
+        # failures caused by it rather than by the live path:
         #
-        #     L1    104 batches/s   0.023 MB/s
-        #     L2   1079 batches/s   1.477 MB/s
+        #   1. asking from sequence 0 pulled the whole session - 19 MB after 13
+        #      seconds of recording, 1.3 GB of depth after 15 minutes - and
+        #      applied it on the receive thread, which froze the terminal and
+        #      dropped 70 datagrams because the socket went unread;
         #
-        # so "replay the session so far" costs 21 MB of L1 after 15 minutes and
-        # 1.3 GB of L2. An earlier version asked from sequence 0 on BOTH
-        # channels and relied on the server's 256 MB cap to bound it. That is
-        # not a bound - it is 256 MB downloaded and applied synchronously on
-        # this thread, during which the socket is not drained and datagrams are
-        # lost. Observed on the real server: a 19 MB backfill after 13 seconds
-        # of recording, 70 datagrams lost, none repaired, terminal frozen.
+        #   2. bounding L1 but not L2 was worse in a subtler way: the chart had
+        #      40 seconds of trade history while the book had none, so the
+        #      bookmap drew bubbles across a black heat field. Nothing was
+        #      broken; the two halves of one time axis simply disagreed about
+        #      how far back the data went.
         #
-        # L2 defaults to OFF because the book does not need it: depth is
-        # snapshot-based and the next full sweep rebuilds it within a second.
-        # Only the bookmap's historical heat field gains anything, and that
-        # fills in live. L1 is what builds the chart history somebody opens the
-        # app to see, and it is two orders of magnitude cheaper.
+        # The live path never needed history to be correct. Depth is
+        # snapshot-based and rebuilds from the next sweep; bars build from the
+        # trades that arrive. Starting empty and filling in is honest, and it
+        # is the same picture every window shows.
+        #
+        # Turn it on per channel when the feature is finished, with the ranges
+        # measured rather than assumed:
+        #     set OMNITRIX_BACKFILL_L1=900     15 min of trades  (~21 MB)
+        #     set OMNITRIX_BACKFILL_L2=60      60 s of depth     (~89 MB)
+        # and turn BOTH on together, or the bookmap will look wrong again.
         self.backfill_l1_s = (
             backfill_l1_s if backfill_l1_s is not None
-            else float(os.environ.get("OMNITRIX_BACKFILL_L1", "900")))
+            else float(os.environ.get("OMNITRIX_BACKFILL_L1", "0")))
         self.backfill_l2_s = (
             backfill_l2_s if backfill_l2_s is not None
             else float(os.environ.get("OMNITRIX_BACKFILL_L2", "0")))
@@ -252,8 +257,22 @@ class MulticastFeed(TakionDecoder):
         elapsed = max(1e-6, time.perf_counter() - t_start)
         rates = {ch: n / elapsed for ch, n in counts.items()}
 
-        if self.replay_host and first_seq:
+        if (self.replay_host and first_seq
+                and (self.backfill_l1_s > 0 or self.backfill_l2_s > 0)):
             self._backfill(first_seq, rates)
+        elif self.replay_host:
+            # No history requested, but the replay server is still what repairs
+            # a lost datagram, so the link is still required. Probe it once so
+            # the status line reports the truth instead of assuming.
+            try:
+                probe = self._replay_socket()
+                probe.close()
+                self.connected["replay"] = True
+            except OSError:
+                self.connected["replay"] = False
+                log.warning("replay server unreachable at %s:%d - gaps will "
+                            "discard book state instead of being repaired",
+                            self.replay_host, self.replay_port)
 
         # ORDER: `buffered` was collected during the join window, BEFORE the
         # backfill ran; `_catchup` was read while it ran. So buffered is the
