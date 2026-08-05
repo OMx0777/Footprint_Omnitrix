@@ -18,6 +18,7 @@ import traceback
 
 from PyQt6.QtWidgets import QApplication
 
+from .engine.multicast_feed import MulticastFeed, check_interface
 from .engine import (Instruments, SyntheticFeed, PipeFeed, NetworkFeed,
                      Recorder, ReplayFeed)
 from .ui import OmnitrixWindow
@@ -69,8 +70,23 @@ def main() -> int:
     # can ship a host without forking this file - see Host_Omnitrix/client_app.
     ap.add_argument("--network", metavar="HOST[:PORT]",
                     default=os.environ.get("OMNITRIX_HOST", ""),
-                    help="connect to a remote Takion broadcaster "
+                    help="connect to a remote Takion broadcaster over TCP "
                          "(e.g. 192.168.1.50:9999)")
+    # Multicast is the mode a 100-desk LAN uses: one copy on the wire whatever
+    # the desk count, against 1.27 Gbit/s for 100 unicast copies. --network is
+    # kept for a single desk or for diagnosing whether a problem is the group.
+    ap.add_argument("--multicast", metavar="GROUP[:PORT]", nargs="?",
+                    const=os.environ.get("OMNITRIX_MCAST", "239.7.7.7"),
+                    default=os.environ.get("OMNITRIX_MCAST_ON_CLIENT", ""),
+                    help="join the multicast feed (default group 239.7.7.7:9997)")
+    ap.add_argument("--replay-host", metavar="HOST[:PORT]",
+                    default=os.environ.get("OMNITRIX_REPLAY", ""),
+                    help="replay server for history and gap recovery "
+                         "(default: the multicast server, port 9998)")
+    ap.add_argument("--iface", default=os.environ.get("OMNITRIX_MCAST_IF", "0.0.0.0"),
+                    help="LAN address to join the group on. REQUIRED on a "
+                         "machine with virtual adapters (Hyper-V/WSL/VMware), "
+                         "where the OS may otherwise pick one no desk is on")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -89,6 +105,26 @@ def main() -> int:
         feed = PipeFeed(symbols=syms or None)
         print("[omnitrix] LIVE mode — waiting for Takion to connect to "
               r"\\.\pipe\TakionOHLCV and \\.\pipe\TakionData …")
+    elif args.multicast:
+        group, _, gport_s = args.multicast.partition(":")
+        gport = int(gport_s) if gport_s else 9997
+        rhost, _, rport_s = (args.replay_host or "").partition(":")
+        rport = int(rport_s) if rport_s else 9998
+        if not rhost:
+            # Without a replay host there is no gap recovery, and a lost
+            # datagram then costs the book rather than a round trip. Say so
+            # plainly - it is a downgrade, not a detail.
+            print("[omnitrix] WARNING: no --replay-host; a lost datagram will "
+                  "discard book state instead of being repaired, and the "
+                  "chart will open with no history")
+        feed = MulticastFeed(group=group, port=gport, iface=args.iface,
+                             replay_host=rhost, replay_port=rport,
+                             symbols=syms or None)
+        warn = check_interface(args.iface)
+        if warn:
+            print(f"[omnitrix] WARNING: {warn}")
+        print(f"[omnitrix] MULTICAST mode — group {group}:{gport} via "
+              f"{args.iface}" + (f", replay {rhost}:{rport}" if rhost else ""))
     elif args.network:
         host, _, port_s = args.network.partition(":")
         port = int(port_s) if port_s else 9999
