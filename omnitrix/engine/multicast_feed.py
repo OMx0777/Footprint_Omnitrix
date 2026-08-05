@@ -66,33 +66,67 @@ def _is_virtual(ip: str) -> bool:
     warning, just an empty chart. It is the single most likely reason the
     terminal works on one PC and not the one next to it.
     """
+    # Deliberately broad: it catches Docker, WSL, Hyper-V AND this site's VPN
+    # (172.24.x on the desks, 172.26.x on the server). All of them are wrong to
+    # join the group on, so lumping them together is the right answer even
+    # though a VPN is not strictly "virtual". Only used as a fallback - the
+    # route lookup above is what normally decides.
     return ip.startswith(("172.1", "172.2", "172.3", "192.168.56.",
                           "169.254.", "10.0.75."))
 
 
-def pick_interface(peer_ip: str) -> str:
-    """The local address to join the group on.
+def outbound_ip(peer: str) -> str:
+    """The local address the OS would use to reach `peer`, or "".
 
-    Preference order, and the fallback matters as much as the match:
-
-      1. the interface on the SERVER's subnet - unambiguous, so use it;
-      2. failing that, the only non-virtual interface, if there is exactly
-         one. Returning 0.0.0.0 here lets Windows choose by routing metric,
-         and on a machine with Hyper-V or WSL that can be an adapter no other
-         desk is on;
-      3. only then 0.0.0.0, because with several real interfaces there is
-         nothing to go on and a wrong guess is worse than letting the OS try.
-
-    Matching on three octets is a /24 test, narrower than this site's /23. That
-    is deliberate: a wrong match sends the join out the wrong adapter, so it
-    errs toward the next rule rather than choosing confidently and wrongly.
+    A UDP connect() sends nothing - it only resolves the route - so this asks
+    Windows the exact question that matters and gets the answer from the real
+    routing table, including metrics, VPN routes and anything else installed.
+    Every heuristic below is a guess at what this returns directly.
     """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((peer, 9))
+        ip = s.getsockname()[0]
+        return "" if ip.startswith("127.") or ip == "0.0.0.0" else ip
+    except OSError:
+        return ""
+    finally:
+        s.close()
+
+
+def pick_interface(peer_ip: str, group: str = "239.7.7.7") -> str:
+    """The local address to join the multicast group on.
+
+    ASK THE OS FIRST. Routing is the OS's job and it already knows the answer;
+    string-matching addresses is guessing at it. This matters here because the
+    site runs a VPN alongside Docker and WSL, and a desk can carry five
+    addresses of which exactly one is right:
+
+        192.168.2.53   Ethernet          <- the LAN, and the answer
+        172.24.1.216   VPN
+        172.19.16.1    Docker / Hyper-V
+        172.21.240.1   WSL
+
+    Measured on that desk: the route lookup returns 192.168.2.53 for the group,
+    the server and the internet, which is correct in all three cases.
+
+    The fallbacks matter only when the lookup fails - a group with no route, or
+    a stack that refuses the connect:
+      1. the interface on the SERVER's subnet;
+      2. the only non-virtual interface, if there is exactly one;
+      3. 0.0.0.0, letting the OS choose, which is where it can pick a virtual
+         adapter and receive nothing at all.
+    """
+    ip = outbound_ip(group) or outbound_ip(peer_ip)
+    if ip:
+        return ip
+
     ips = [i for i in local_interfaces() if not i.startswith("127.")]
     if peer_ip:
         want = peer_ip.rsplit(".", 1)[0]
-        for ip in ips:
-            if ip.rsplit(".", 1)[0] == want:
-                return ip
+        for cand in ips:
+            if cand.rsplit(".", 1)[0] == want:
+                return cand
     real = [i for i in ips if not _is_virtual(i)]
     if len(real) == 1:
         return real[0]

@@ -118,7 +118,7 @@ def main() -> int:
             print("[omnitrix] WARNING: no --replay-host; a lost datagram will "
                   "discard book state instead of being repaired, and the "
                   "chart will open with no history")
-        iface = args.iface or pick_interface(rhost)
+        iface = args.iface or pick_interface(rhost, group)
         if not args.iface and iface != "0.0.0.0":
             print(f"[omnitrix] interface {iface} chosen automatically "
                   f"(same subnet as {rhost}); override with --iface")
