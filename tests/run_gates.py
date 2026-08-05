@@ -18,6 +18,7 @@ GATES = {
     "truth": "gate_truth.py",
     "perf": "gate_perf.py",
     "frames": "gate_frames.py",
+    "gc": "gc_gate.py",
 }
 
 
