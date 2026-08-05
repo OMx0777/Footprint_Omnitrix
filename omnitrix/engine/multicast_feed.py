@@ -57,29 +57,45 @@ def local_interfaces() -> list[str]:
     return sorted(ips)
 
 
-def pick_interface(peer_ip: str) -> str:
-    """The local address on the same subnet as `peer_ip`, or 0.0.0.0.
+def _is_virtual(ip: str) -> bool:
+    """Addresses handed out by Hyper-V, WSL, VMware and VirtualBox.
 
-    Rolling out to 100 desks by hand-editing an interface address on each one
-    is a hundred chances to get it wrong, and getting it wrong produces a chart
-    that silently never updates. The server's address is already known, and the
-    right interface is simply the local one that can reach it - so derive it.
-
-    Matching on the first three octets is a /24 test, which is narrower than
-    this site's actual /23. That is deliberate: a wrong match here sends the
-    join out the wrong adapter, so the test errs toward returning 0.0.0.0 and
-    letting the OS decide rather than confidently choosing something bogus.
-    Virtual adapters (172.x from Hyper-V and WSL) never match a 192.168.x
-    server, which is exactly the case this exists to disarm.
+    Joining a multicast group on one of these receives NOTHING - measured on a
+    live desk: 6,927 datagrams on the LAN address, zero on either virtual
+    adapter, with the server publishing perfectly the whole time. No error, no
+    warning, just an empty chart. It is the single most likely reason the
+    terminal works on one PC and not the one next to it.
     """
-    if not peer_ip:
-        return "0.0.0.0"
-    want = peer_ip.rsplit(".", 1)[0]
-    for ip in local_interfaces():
-        if ip.startswith("127."):
-            continue
-        if ip.rsplit(".", 1)[0] == want:
-            return ip
+    return ip.startswith(("172.1", "172.2", "172.3", "192.168.56.",
+                          "169.254.", "10.0.75."))
+
+
+def pick_interface(peer_ip: str) -> str:
+    """The local address to join the group on.
+
+    Preference order, and the fallback matters as much as the match:
+
+      1. the interface on the SERVER's subnet - unambiguous, so use it;
+      2. failing that, the only non-virtual interface, if there is exactly
+         one. Returning 0.0.0.0 here lets Windows choose by routing metric,
+         and on a machine with Hyper-V or WSL that can be an adapter no other
+         desk is on;
+      3. only then 0.0.0.0, because with several real interfaces there is
+         nothing to go on and a wrong guess is worse than letting the OS try.
+
+    Matching on three octets is a /24 test, narrower than this site's /23. That
+    is deliberate: a wrong match sends the join out the wrong adapter, so it
+    errs toward the next rule rather than choosing confidently and wrongly.
+    """
+    ips = [i for i in local_interfaces() if not i.startswith("127.")]
+    if peer_ip:
+        want = peer_ip.rsplit(".", 1)[0]
+        for ip in ips:
+            if ip.rsplit(".", 1)[0] == want:
+                return ip
+    real = [i for i in ips if not _is_virtual(i)]
+    if len(real) == 1:
+        return real[0]
     return "0.0.0.0"
 
 
@@ -102,7 +118,7 @@ def check_interface(iface: str) -> str:
                 "delivered over loopback on Windows. Use 0.0.0.0 or the LAN "
                 "address.")
     ips = [i for i in local_interfaces() if not i.startswith("127.")]
-    virt = [i for i in ips if i.startswith(("172.1", "172.2", "172.3", "192.168.56."))]
+    virt = [i for i in ips if _is_virtual(i)]
     if iface == "0.0.0.0" and virt and len(ips) > 1:
         return (f"iface=0.0.0.0 on a multi-homed host {ips}: the OS may bind "
                 f"the group to a virtual adapter ({', '.join(virt)}) that no "
