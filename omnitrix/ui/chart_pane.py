@@ -26,7 +26,9 @@ import time
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
-from PyQt6.QtWidgets import QGraphicsRectItem
+from PyQt6.QtWidgets import (
+    QGraphicsRectItem, QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel,
+)
 
 from .framegov import GovernedPlotWidget
 from ..render import (
@@ -50,7 +52,37 @@ class ChartPane:
         self.auto_scroll = True
         self.auto_y = True
 
+        # The pane is a container, not just a plot: in a grid each chart needs
+        # its own symbol and mode pickers, the way every multi-chart terminal
+        # does it. The header hides itself in single-chart mode, where the main
+        # toolbar already says the same thing and a second copy is just noise.
+        self.container = QWidget()
+        _v = QVBoxLayout(self.container)
+        _v.setContentsMargins(0, 0, 0, 0)
+        _v.setSpacing(0)
+
+        self.header = QWidget()
+        _h = QHBoxLayout(self.header)
+        _h.setContentsMargins(6, 2, 6, 2)
+        _h.setSpacing(6)
+        self.sym_combo = QComboBox()
+        self.sym_combo.setEditable(True)
+        self.sym_combo.setMinimumWidth(86)
+        self.sym_combo.setToolTip("Symbol for THIS chart")
+        _h.addWidget(self.sym_combo)
+        self.mode_combo = QComboBox()
+        self.mode_combo.setMinimumWidth(120)
+        self.mode_combo.setToolTip("Chart type for THIS chart")
+        _h.addWidget(self.mode_combo)
+        self.lbl_last = QLabel("")
+        self.lbl_last.setStyleSheet("color:#8A93A6;font-weight:600;")
+        _h.addWidget(self.lbl_last)
+        _h.addStretch(1)
+        self.header.setVisible(False)
+        _v.addWidget(self.header)
+
         self.glw = GovernedPlotWidget(gov_key=gov_key)
+        _v.addWidget(self.glw, 1)
 
         self.price_time_axis = TimeAxis(orientation="bottom")
         self.price_axis = PriceAxis(
@@ -145,6 +177,30 @@ class ChartPane:
         # or active pane never moves or orphans them.
         self.drawing_items: list = []
 
+        # CVD starts HIDDEN. It is a secondary study, and reserving a fifth of
+        # every chart for it by default costs the price pane exactly that much
+        # - four times over in a 2x2 grid. Turn it on per chart from Overlays.
+        self.set_cvd_visible(False)
+
+    # ---- per-chart settings ---------------------------------------------
+    def set_cvd_visible(self, on: bool) -> None:
+        self.cvd_plot.setVisible(on)
+        # The time axis lives on the bottom-most pane, so hiding CVD took the
+        # whole time scale with it. Hand it up to the price chart instead.
+        if on:
+            self.price_plot.hideAxis("bottom")
+        else:
+            self.price_plot.showAxis("bottom")
+        # Collapse the row too: hiding the plot alone leaves its band reserved,
+        # so the price chart does not reclaim the space.
+        self.glw.ci.layout.setRowStretchFactor(1, 1 if on else 0)
+        self.glw.ci.layout.setRowMinimumHeight(1, 0)
+
+    def set_mode(self, fp_mode: str, draw_cells: bool, hm_visible: bool) -> None:
+        self.fp.set_mode(fp_mode)
+        self.fp.set_draw_cells(draw_cells)
+        self.heatmap.setVisible(hm_visible)
+
     # ---- helpers ---------------------------------------------------------
     def _time_at(self, x: float) -> str:
         """Wall-clock label for a bar position, matching this pane's axis."""
@@ -177,8 +233,9 @@ class ChartPane:
         Only meaningful in a grid: with a single pane there is nothing to
         distinguish it from, and a border would just be noise.
         """
+        self.header.setVisible(multi)
         if not multi:
-            self.glw.setStyleSheet("")
+            self.container.setStyleSheet("")
             return
-        self.glw.setStyleSheet(
-            "border:2px solid #26A69A;" if active else "border:2px solid #232833;")
+        self.container.setStyleSheet(
+            "border:2px solid #26A69A;" if active else "border:1px solid #232833;")

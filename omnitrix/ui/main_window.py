@@ -15,7 +15,7 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QMainWindow, QToolBar, QLabel, QComboBox, QCheckBox, QPushButton, QWidget,
     QSizePolicy, QDockWidget, QLineEdit, QGraphicsRectItem, QMenu,
-    QToolButton, QWidgetAction, QHBoxLayout, QGridLayout,
+    QToolButton, QWidgetAction, QHBoxLayout, QSplitter, QVBoxLayout,
 )
 
 from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
@@ -378,9 +378,11 @@ class OmnitrixWindow(QMainWindow):
             "radius by size")
 
         self.menu_overlays.addSeparator()
-        self.chk_cvd = _act(self.menu_overlays, "CVD pane", True,
+        # OFF by default: a secondary study should not take a fifth of every
+        # chart before anyone asks for it - four times over in a 2x2 grid.
+        self.chk_cvd = _act(self.menu_overlays, "CVD pane", False,
                             self._on_cvd_pane,
-                            "Show the cumulative-delta sub-chart")
+                            "Show the cumulative-delta sub-chart on this chart")
         self.chk_vwap = _act(self.menu_overlays, "VWAP", True,
                              self._on_vwap_toggled)
         self.chk_cpr = _act(self.menu_overlays, "CPR", False,
@@ -498,17 +500,47 @@ class OmnitrixWindow(QMainWindow):
         # are created ONCE, up front, and shown or hidden - constructing and
         # destroying plots on every layout change would orphan the drawings
         # that live on them.
-        self._grid_host = QWidget()
-        self._grid = QGridLayout(self._grid_host)
-        self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setSpacing(2)
-        self.setCentralWidget(self._grid_host)
+        # SPLITTERS, not a fixed grid, so the panes are resizable by dragging.
+        # An outer vertical splitter holds one horizontal splitter per row; the
+        # two rows' column positions are kept in step (see _link_rows), so the
+        # vertical divider reads as ONE line through the whole grid and
+        # grabbing it anywhere - including where all four corners meet - moves
+        # both rows together. Two independent splitters would let the rows
+        # drift out of alignment and stop looking like a grid at all.
+        # A plain container holds the splitter. The floating ticker-search box
+        # is a child of THIS, not of the splitter: a QLineEdit parented to a
+        # QSplitter becomes a splitter section, so the search box was silently
+        # occupying a third row of the grid (sizes read [456, 456, 0]) and
+        # would have appeared as a resizable band the moment it was shown.
+        self._chart_host = QWidget()
+        _cv = QVBoxLayout(self._chart_host)
+        _cv.setContentsMargins(0, 0, 0, 0)
+        self._grid_host = QSplitter(Qt.Orientation.Vertical)
+        self._grid_host.setChildrenCollapsible(False)
+        self._grid_host.setHandleWidth(6)
+        self._rows = [QSplitter(Qt.Orientation.Horizontal) for _ in range(2)]
+        for r in self._rows:
+            r.setChildrenCollapsible(False)
+            r.setHandleWidth(6)
+            self._grid_host.addWidget(r)
+        self._syncing_rows = False
+        for r in self._rows:
+            r.splitterMoved.connect(lambda _p, _i, sp=r: self._link_rows(sp))
+        _cv.addWidget(self._grid_host)
+        self.setCentralWidget(self._chart_host)
 
         self._panes = [
             ChartPane(self, id(self), self.theme, self.instruments, i)
             for i in range(MAX_PANES)
         ]
         for pane in self._panes:
+            pane.mode_combo.addItems(list(MODES))
+            pane.mode_combo.currentTextChanged.connect(
+                lambda t, p=pane: self._on_pane_mode(p, t))
+            pane.sym_combo.currentTextChanged.connect(
+                lambda t, p=pane: self._on_pane_symbol(p, t))
+            pane.sym_combo.lineEdit().returnPressed.connect(
+                lambda p=pane: self._on_pane_symbol(p, p.sym_combo.currentText()))
             pane.glw.scene().sigMouseMoved.connect(
                 lambda pos, p=pane: self._on_mouse_move(pos, p))
             pane.glw.scene().sigMouseClicked.connect(
@@ -521,7 +553,7 @@ class OmnitrixWindow(QMainWindow):
 
         # TradingView-style ticker search: start typing a symbol anywhere on the
         # chart and a floating box appears; Enter opens it, Escape cancels.
-        self.sym_search = QLineEdit(self._grid_host)
+        self.sym_search = QLineEdit(self._chart_host)
         self.sym_search.setPlaceholderText("Type ticker, Enter to open")
         self.sym_search.setStyleSheet(
             "QLineEdit { background:#12161F; color:#F0F0F0; border:2px solid #26A69A;"
@@ -727,6 +759,24 @@ class OmnitrixWindow(QMainWindow):
         multi = self._n_panes > 1
         for p in self._panes:
             p.set_active_look(p is pane, multi)
+        # The toolbar describes whichever chart is selected, so its controls
+        # have to be re-read from that pane - otherwise selecting a Heatmap
+        # pane would still show "Footprint" and the next change would be
+        # applied from the wrong starting point.
+        self._sync_toolbar_to(pane)
+
+    def _sync_toolbar_to(self, pane) -> None:
+        for widget, value in ((self.mode_combo, pane.mode_combo.currentText()),):
+            if value and widget.currentText() != value:
+                widget.blockSignals(True)
+                widget.setCurrentText(value)
+                widget.blockSignals(False)
+        if hasattr(self, "chk_cvd"):
+            on = pane.cvd_plot.isVisible()
+            if self.chk_cvd.isChecked() != on:
+                self.chk_cvd.blockSignals(True)
+                self.chk_cvd.setChecked(on)
+                self.chk_cvd.blockSignals(False)
 
     def _visible_panes(self) -> list:
         return self._panes[:self._n_panes]
@@ -737,17 +787,26 @@ class OmnitrixWindow(QMainWindow):
         rows, cols = next((r, c) for (p, r, c) in LAYOUTS.values() if p == n)
         self._n_panes = n
         for pane in self._panes:
-            self._grid.removeWidget(pane.glw)
             # HIDE, do not unparent. setParent(None) hands the widget to Python
             # while Qt still owns its QGraphicsScene and every signal connected
             # to it, and the two then disagree about who frees what at teardown
-            # - an intermittent segfault on exit. Leaving every pane parented to
-            # the grid host keeps destruction order Qt's problem, which it
-            # handles correctly.
-            pane.glw.setVisible(False)
+            # - an intermittent segfault on exit. Reparenting into a splitter
+            # keeps destruction order Qt's problem, which it handles correctly.
+            pane.container.setVisible(False)
         for i in range(n):
-            self._grid.addWidget(self._panes[i].glw, i // cols, i % cols)
-            self._panes[i].glw.setVisible(True)
+            row = self._rows[i // cols]
+            pane = self._panes[i]
+            if pane.container.parent() is not row:
+                row.addWidget(pane.container)
+            pane.container.setVisible(True)
+        self._rows[1].setVisible(rows > 1)
+        # Equal split on a layout change. Anything the user dragged applied to
+        # a different number of panes, so carrying it over would be arbitrary.
+        for r in self._rows[:rows]:
+            vis = r.count()
+            if vis:
+                r.setSizes([10_000 // vis] * vis)
+        self._grid_host.setSizes([10_000 // rows] * rows)
         # The active pane must be one that is on screen, or the toolbar would
         # be driving a chart nobody can see.
         if self._active_pane not in self._visible_panes():
@@ -759,6 +818,64 @@ class OmnitrixWindow(QMainWindow):
             if not pane.symbol:
                 pane.symbol = self.active_symbol
                 pane._needs_center = True
+            if pane.symbol and pane.sym_combo.currentText() != pane.symbol:
+                pane.sym_combo.blockSignals(True)
+                pane.sym_combo.setCurrentText(pane.symbol)
+                pane.sym_combo.blockSignals(False)
+        self._dirty = True
+
+    def _link_rows(self, moved) -> None:
+        """Keep both rows' column split identical.
+
+        Without this the top and bottom rows resize independently and the
+        vertical divider becomes two unrelated lines that no longer meet - the
+        grid stops being a grid. Guarded against re-entry because setSizes on
+        the other row emits splitterMoved right back.
+        """
+        if self._syncing_rows or self._n_panes < 4:
+            return
+        sizes = moved.sizes()
+        if len(sizes) < 2:
+            return
+        self._syncing_rows = True
+        try:
+            for r in self._rows:
+                if r is not moved and r.count() == len(sizes):
+                    r.setSizes(sizes)
+        finally:
+            self._syncing_rows = False
+
+    def _on_pane_symbol(self, pane, sym: str) -> None:
+        """Change the ticker of ONE chart, leaving the other three alone."""
+        sym = (sym or "").strip().upper()
+        if not sym or sym == pane.symbol:
+            return
+        # Accept a symbol that has not been seen yet: in live mode the user
+        # knows what they want to watch before the first print arrives.
+        if sym not in self._known_symbols:
+            self._register_symbol(sym)
+        pane.symbol = sym
+        pane.fp.tick = self.instruments.tick(sym)
+        pane.auto_scroll = True
+        pane._needs_center = True
+        if pane.sym_combo.currentText() != sym:
+            pane.sym_combo.blockSignals(True)
+            pane.sym_combo.setCurrentText(sym)
+            pane.sym_combo.blockSignals(False)
+        if pane is self._active_pane:
+            self.sym_combo.blockSignals(True)
+            if self.sym_combo.findText(sym) >= 0:
+                self.sym_combo.setCurrentText(sym)
+            self.sym_combo.blockSignals(False)
+        self._dirty = True
+
+    def _on_pane_mode(self, pane, name: str) -> None:
+        """Chart type per pane - footprint here, delta there, heatmap next."""
+        pane.set_mode(*MODES.get(name, ("Footprint", True, False)))
+        if pane is self._active_pane and self.mode_combo.currentText() != name:
+            self.mode_combo.blockSignals(True)
+            self.mode_combo.setCurrentText(name)
+            self.mode_combo.blockSignals(False)
         self._dirty = True
 
     def _on_layout(self, txt: str) -> None:
@@ -769,6 +886,15 @@ class OmnitrixWindow(QMainWindow):
         self.sym_combo.blockSignals(True)
         self.sym_combo.addItem(sym)
         self.sym_combo.blockSignals(False)
+        # Every pane's own picker offers the same list, so switching one chart
+        # to a symbol another pane discovered does not need it typed again.
+        for pane in getattr(self, "_panes", ()):
+            if pane.sym_combo.findText(sym) < 0:
+                pane.sym_combo.blockSignals(True)
+                keep = pane.sym_combo.currentText()
+                pane.sym_combo.addItem(sym)
+                pane.sym_combo.setCurrentText(keep)
+                pane.sym_combo.blockSignals(False)
         # prefer the symbol restored from the saved workspace once it arrives
         if self._pending_symbol and sym == self._pending_symbol:
             self._pending_symbol = ""
@@ -834,6 +960,10 @@ class OmnitrixWindow(QMainWindow):
                 vr = pane.price_plot.getViewBox().viewRect()
                 if vr.right() < n + 1:
                     pane.price_plot.setXRange(max(-1, n - 22), n + 3, padding=0)
+            if pane.header.isVisible():
+                b = bars[-1]
+                pane.lbl_last.setText(
+                    f"{b.close:.2f}   Δ {b.delta:+,}")
             if pane is self._active_pane:
                 self._update_stats(bars[-1])
 
@@ -912,6 +1042,11 @@ class OmnitrixWindow(QMainWindow):
     def _on_symbol(self, sym: str) -> None:
         if sym:
             self.active_symbol = sym
+            pane = self._active_pane
+            if pane.sym_combo.currentText() != sym:
+                pane.sym_combo.blockSignals(True)
+                pane.sym_combo.setCurrentText(sym)
+                pane.sym_combo.blockSignals(False)
             self.fp.tick = self.instruments.tick(sym)
             self.auto_scroll = True
             # Centre on the new symbol WITHOUT the user reaching for Alt+R.
@@ -1014,10 +1149,13 @@ class OmnitrixWindow(QMainWindow):
         self._dirty = True
 
     def _on_mode(self, name: str) -> None:
-        fp_mode, draw_cells, hm_visible = MODES.get(name, ("Footprint", True, False))
-        self.fp.set_mode(fp_mode)
-        self.fp.set_draw_cells(draw_cells)
-        self.heatmap.setVisible(hm_visible)
+        """The toolbar drives the ACTIVE pane; the pane header mirrors it."""
+        pane = self._active_pane
+        pane.set_mode(*MODES.get(name, ("Footprint", True, False)))
+        if pane.mode_combo.currentText() != name:
+            pane.mode_combo.blockSignals(True)
+            pane.mode_combo.setCurrentText(name)
+            pane.mode_combo.blockSignals(False)
         self._dirty = True
 
     def _bookmap(self, sym: str) -> BookmapBuffer:
@@ -1447,17 +1585,8 @@ class OmnitrixWindow(QMainWindow):
         self._dirty = True
 
     def _on_cvd_pane(self, on: bool) -> None:
-        self.cvd_plot.setVisible(on)
-        # The time axis lives on the bottom-most pane, so hiding CVD took the
-        # whole time scale with it. Hand it up to the price chart instead.
-        if on:
-            self.price_plot.hideAxis("bottom")
-        else:
-            self.price_plot.showAxis("bottom")
-        # Collapse the row too: hiding the plot alone leaves its band reserved,
-        # so the price chart does not reclaim the space.
-        self.glw.ci.layout.setRowStretchFactor(1, 1 if on else 0)
-        self.glw.ci.layout.setRowMinimumHeight(1, 0)
+        """Show/hide the cumulative-delta sub-chart on the ACTIVE pane."""
+        self._active_pane.set_cvd_visible(on)
 
     def _get_bars_for_vp(self, x_min, x_max):
         s = self.series.get(self.active_symbol) if self.active_symbol else None
