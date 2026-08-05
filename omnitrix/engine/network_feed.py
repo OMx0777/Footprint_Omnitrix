@@ -19,6 +19,7 @@ import threading
 import time
 
 from .takion_decode import TakionDecoder, L1, L2
+from . import wire
 
 log = logging.getLogger("omnitrix.network")
 
@@ -41,6 +42,10 @@ class NetworkFeed(TakionDecoder):
             "OMNITRIX_TOKEN", "")
         self._thread: threading.Thread | None = None
         self.connected = {"network": False}
+        # Sequence continuity. Present on TCP too, where it should never fire -
+        # if it does, the stream was truncated and we want to know rather than
+        # assume TCP made that impossible.
+        self.gaps = wire.GapDetector()
 
     def start(self) -> None:
         if self._running:
@@ -88,34 +93,107 @@ class NetworkFeed(TakionDecoder):
                     time.sleep(1.0)
 
     def _drain(self, buf: bytearray) -> None:
-        """Consume every whole framed record in `buf`, leaving any partial."""
+        """Consume every whole framed record in `buf`, leaving any partial.
+
+        Accepts BOTH framings. A batch header means a sequenced server; a bare
+        type byte means the legacy stream. Supporting both is what lets the
+        server be upgraded before all 100 clients are, and vice versa - a flag
+        day across that many machines is not a deployment plan.
+        """
         while buf:
-            t = buf[0]
-            if t == _L1_TYPE:
-                n = L1.size
-                handler = self._on_l1
-            elif t == _L2_TYPE:
-                n = L2.size
-                handler = self._on_l2
-            else:
-                # TCP does not lose or reorder bytes, so a bad type means the
-                # stream is genuinely desynchronised. Resync by scanning for
-                # the next plausible type byte rather than clearing the buffer:
-                # dropping everything buffered threw away the good records
-                # sitting behind the bad byte as well.
-                nxt = -1
-                for i in range(1, len(buf)):
-                    if buf[i] in (_L1_TYPE, _L2_TYPE):
-                        nxt = i
-                        break
-                log.warning("bad frame type %d; resyncing (%d bytes dropped)",
-                            t, len(buf) if nxt < 0 else nxt)
-                if nxt < 0:
-                    buf.clear()
-                else:
-                    del buf[:nxt]
+            hdr = wire.decode_header(buf)
+            if hdr is not None:
+                channel, count, seq = hdr
+                # Wait for the WHOLE batch before consuming any of it: applied
+                # in halves it would publish a partial book.
+                end = self._batch_end(buf, count)
+                if end < 0:
+                    return
+                missed = self.gaps.observe(channel, seq)
+                if missed:
+                    self._on_gap(channel, missed)
+                body = bytearray(buf[wire.HEADER_SIZE:end])
+                del buf[:end]
+                self._drain_records(body)
                 continue
-            if len(buf) < 1 + n:
-                return                       # partial record: wait for more
-            handler(bytes(buf[1:1 + n]), 0)
-            del buf[:1 + n]
+            if buf[0] == wire.MAGIC and len(buf) < wire.HEADER_SIZE:
+                # A batch header split across two TCP reads. decode_header
+                # cannot tell "not a header" from "not enough bytes yet", and
+                # the legacy fallback below would eat the magic byte as a
+                # record type and resync past it - discarding a header, and
+                # with it the sequence number that proves nothing was lost.
+                # Legacy records are type 1 or 2, never 0x4F, so this cannot
+                # stall an unsequenced stream.
+                return
+            if not self._drain_one(buf):
+                return
+
+    def _batch_end(self, buf: bytearray, count: int) -> int:
+        """Offset just past `count` records, or -1 if they have not all arrived."""
+        off = wire.HEADER_SIZE
+        for _ in range(count):
+            if off >= len(buf):
+                return -1
+            t = buf[off]
+            n = L1.size if t == _L1_TYPE else L2.size if t == _L2_TYPE else -1
+            if n < 0:
+                log.warning("bad record type %d inside a framed batch; "
+                            "discarding the batch header", t)
+                return wire.HEADER_SIZE
+            if off + 1 + n > len(buf):
+                return -1
+            off += 1 + n
+        return off
+
+    def _on_gap(self, channel: int, missed: int) -> None:
+        """A batch never arrived. Drop whatever it invalidated.
+
+        Same response as a link drop, for the same reason: the book merge is
+        additive and a sweep is only published on its 'C' marker, so a hole
+        leaves half-assembled depth that would be merged into the next sweep
+        and drawn as liquidity that is not there. Clearing makes the gap an
+        honest absence instead of a phantom wall.
+        """
+        log.warning("feed gap: %d batch(es) missing on channel %d "
+                    "(%d gaps, %d batches lost this session)",
+                    missed, channel, self.gaps.gaps, self.gaps.lost)
+        if channel == wire.CH_L2:
+            self.on_disconnect()
+        else:
+            self.on_l1_disconnect()
+
+    def _drain_records(self, buf: bytearray) -> None:
+        """Drain a batch body, which contains records and no headers."""
+        while buf and self._drain_one(buf):
+            pass
+
+    def _drain_one(self, buf: bytearray) -> bool:
+        """Consume one record. False means 'need more bytes' - stop draining."""
+        t = buf[0]
+        if t == _L1_TYPE:
+            n, handler = L1.size, self._on_l1
+        elif t == _L2_TYPE:
+            n, handler = L2.size, self._on_l2
+        else:
+            # TCP does not lose or reorder bytes, so a bad type means the
+            # stream is genuinely desynchronised. Resync by scanning for the
+            # next plausible type byte rather than clearing the buffer:
+            # dropping everything buffered threw away the good records sitting
+            # behind the bad byte as well.
+            nxt = -1
+            for i in range(1, len(buf)):
+                if buf[i] in (_L1_TYPE, _L2_TYPE):
+                    nxt = i
+                    break
+            log.warning("bad frame type %d; resyncing (%d bytes dropped)",
+                        t, len(buf) if nxt < 0 else nxt)
+            if nxt < 0:
+                buf.clear()
+                return False
+            del buf[:nxt]
+            return True
+        if len(buf) < 1 + n:
+            return False                     # partial record: wait for more
+        handler(bytes(buf[1:1 + n]), 0)
+        del buf[:1 + n]
+        return True
