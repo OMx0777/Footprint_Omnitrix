@@ -34,6 +34,7 @@ That is what start() does, in that order, deliberately.
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import struct
 import threading
@@ -130,7 +131,7 @@ class MulticastFeed(TakionDecoder):
                  replay_host: str = "", replay_port: int = 9998,
                  backfill_seconds: float = 0.0,
                  symbols: list[str] | None = None, lot_multiplier: int = 1,
-                 token: str = ""):
+                 token: str | None = None):
         super().__init__(symbols=symbols, lot_multiplier=lot_multiplier)
         self.group = group
         self.port = port
@@ -138,7 +139,12 @@ class MulticastFeed(TakionDecoder):
         self.replay_host = replay_host
         self.replay_port = replay_port
         self.backfill_seconds = backfill_seconds
-        self.token = token
+        # Same default as NetworkFeed. A hardcoded "" meant the replay server
+        # rejected every client the moment the server had a token set, which
+        # costs backfill AND gap repair - the two things that make UDP safe -
+        # and the only sign was one "bad token" line in the server log.
+        self.token = token if token is not None else os.environ.get(
+            "OMNITRIX_TOKEN", "")
         self.gaps = wire.GapDetector()
         self.connected = {"multicast": False, "replay": False}
         self._sock: socket.socket | None = None

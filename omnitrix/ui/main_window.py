@@ -1068,16 +1068,43 @@ class OmnitrixWindow(QMainWindow):
         conn = getattr(self.feed, "connected", None)
         if not isinstance(conn, dict):
             return
-        if "network" in conn:
-            l1 = l2 = bool(conn.get("network"))
+        if "multicast" in conn:
+            # Multicast has TWO states worth distinguishing, because a client
+            # receiving the group without a reachable replay server is running
+            # DEGRADED: a lost datagram then discards book state instead of
+            # being repaired, and the chart opened with no history. That is
+            # exactly the condition a trader needs told, not buried in a log.
+            live = bool(conn.get("multicast"))
+            replay = bool(conn.get("replay"))
+            gaps = getattr(self.feed, "gaps", None)
+            lost = gaps.lost if gaps is not None else 0
+            unrep = getattr(self.feed, "unrepaired", 0)
+            if live and replay:
+                txt, col = f"● MULTICAST  {len(self.series)} sym", "#26A69A"
+            elif live:
+                txt, col = (f"● MULTICAST  {len(self.series)} sym  "
+                            f"⚠ no replay (gaps cannot be repaired)"), "#FFB300"
+            else:
+                txt, col = "○ waiting for the multicast group…", "#EF5350"
+            if lost:
+                repaired = getattr(self.feed, "repairs", 0)
+                txt += f"   lost {lost:,} · repaired {repaired:,}"
+                if unrep:
+                    txt += f" · UNREPAIRED {unrep:,}"
+                    col = "#EF5350"
+        elif "network" in conn:
+            live = bool(conn.get("network"))
+            txt, col = ((f"● LIVE  {len(self.series)} sym", "#26A69A") if live
+                        else ("○ waiting for the broadcaster…", "#EF5350"))
         else:
             l1, l2 = bool(conn.get("l1")), bool(conn.get("l2"))
-        if l1 and l2:
-            txt, col = f"● LIVE  {len(self.series)} sym", "#26A69A"
-        elif l1 or l2:
-            txt, col = f"● PARTIAL  L1:{'✓' if l1 else '×'} L2:{'✓' if l2 else '×'}", "#FFB300"
-        else:
-            txt, col = "○ waiting for Takion…", "#EF5350"
+            if l1 and l2:
+                txt, col = f"● LIVE  {len(self.series)} sym", "#26A69A"
+            elif l1 or l2:
+                txt, col = (f"● PARTIAL  L1:{'✓' if l1 else '×'} "
+                            f"L2:{'✓' if l2 else '×'}"), "#FFB300"
+            else:
+                txt, col = "○ waiting for Takion…", "#EF5350"
         # How much of the delta is evidence and how much is an even split.
         # Every buy/sell figure on screen rests on this, so it belongs on the
         # status line rather than in a log nobody reads: if `?` is large, the
