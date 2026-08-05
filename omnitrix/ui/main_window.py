@@ -410,12 +410,7 @@ class OmnitrixWindow(QMainWindow):
             a.setToolTip(tip)
             a.triggered.connect(slot)
 
-        self.menu_windows.addSeparator()
-        tile = self.menu_windows.addMenu("Tile bookmaps")
-        tile.setToolTip("Arrange the open Bookmap windows into a grid")
-        for label, count in (("Single", 1), ("1 × 2", 2), ("2 × 2", 4)):
-            a = tile.addAction(label)
-            a.triggered.connect(lambda _=False, c=count: self.tile_bookmaps(c))
+
 
         tb.addSeparator()
         tb.addWidget(QLabel(" Theme "))
@@ -1228,56 +1223,39 @@ class OmnitrixWindow(QMainWindow):
         self.open_bookmap_for(self.active_symbol or "QQQ")
 
     def open_bookmap_for(self, sym: str) -> None:
-        """Open (or raise) the bookmap for `sym`.
+        """Show `sym`'s book, reusing the ONE bookmap window.
 
         Public because the Bookmap window's own ticker search calls back into
         it: the per-symbol buffers and the child-window registry live here, and
         a window constructed anywhere else would bypass both.
+
+        One window, not one per symbol. The window shows up to four books in a
+        resizable grid, so a second symbol fills a free pane rather than
+        opening another window to be tiled by hand. If every visible pane is
+        already taken, the selected one is repointed - that is what asking for
+        a symbol while looking at a full grid means.
         """
         sym = (sym or "").strip().upper()
         if not sym:
             return
-        if (w := self._child(f"bookmap:{sym}")) is not None:
-            w.raise_(); w.activateWindow(); return
         if sym not in self._known_symbols:
             self._register_symbol(sym)
-        win = BookmapWindow(self._bookmap(sym), self.instruments.tick(sym), self)
-        self._register_child(f"bookmap:{sym}", win)
-
-    # ---- bookmap grid ----------------------------------------------------
-    def tile_bookmaps(self, n: int) -> None:
-        """Arrange the open Bookmap windows as a 1, 1x2 or 2x2 grid.
-
-        Bookmaps are separate top-level windows, so their "grid" is a tiling of
-        the screen rather than a layout inside one widget. Opening four and
-        dragging them into place by hand is the thing this replaces.
-
-        If more bookmaps are open than the requested grid holds, the EXTRA ones
-        are left untouched rather than stacked or hidden: silently moving a
-        window the user positioned deliberately is worse than leaving it.
-        """
-        from PyQt6.QtWidgets import QApplication
-        wins = [w for k, w in self._child_windows.items()
-                if k.startswith("bookmap:") and w.isVisible()]
-        if not wins:
+        win = self._child("bookmap")
+        if win is None:
+            win = BookmapWindow(self._bookmap(sym), self.instruments.tick(sym), self)
+            self._register_child("bookmap", win)
             return
-        n = max(1, min(4, int(n)))
-        rows, cols = {1: (1, 1), 2: (1, 2), 4: (2, 2)}[n]
-        scr = QApplication.primaryScreen()
-        if scr is None:
-            return
-        area = scr.availableGeometry()
-        # Tile only as many as the grid has cells, oldest first - that is the
-        # order they were opened in, which is the order the user expects.
-        cw = area.width() // cols
-        ch = area.height() // rows
-        for i, w in enumerate(wins[:n]):
-            if w.isMinimized():
-                w.showNormal()
-            w.setGeometry(area.x() + (i % cols) * cw,
-                          area.y() + (i // cols) * ch,
-                          cw, ch)
-            w.raise_()
+        # Already showing it? Just select that pane.
+        for pane in win._visible_panes():
+            if pane.buffer.symbol == sym:
+                win._select_pane(pane)
+                win.raise_(); win.activateWindow()
+                return
+        target = next((p for p in win._visible_panes() if not p.buffer.symbol),
+                      win._active_pane)
+        win.set_pane_symbol(target, sym)
+        win._select_pane(target)
+        win.raise_(); win.activateWindow()
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self)

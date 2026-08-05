@@ -17,10 +17,12 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, QPointF, QEvent
 from PyQt6.QtWidgets import (
     QMainWindow, QToolBar, QLabel, QComboBox, QPushButton, QCheckBox, QLineEdit,
+    QWidget, QVBoxLayout, QSplitter,
 )
 
 from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
 from ..engine import BookmapBuffer, SRTracker
+from .bookmap_pane import BookmapPane
 from ..render import (
     BookHeatmapItem, BBOItem, BubbleItem, PieItem, BarsItem, ProjectionItem,
     DomLadderItem, VolumeBarsItem, SRLinesItem,
@@ -57,6 +59,11 @@ SIZE_STEPS = {"50%": 0.5, "75%": 0.75, "100%": 1.0, "150%": 1.5,
 # at ~2.3 kB per compact ladder this is ~33 MB, against ~3 MB for the default.
 HISTORY_COLS = 14400          # 4 hours of 1-second columns
 
+# Books per window. Four is the ceiling for the same reason as the footprint
+# grid: below a quarter of a 1920x1080 screen the heat field stops resolving.
+LAYOUTS = {"1 book": 1, "2 books": 2, "4 books": 4}
+MAX_PANES = 4
+
 
 def _tf_seconds(agg: int, col_dt: float) -> float:
     return agg * col_dt
@@ -73,20 +80,11 @@ def _fmt(v: int) -> str:
 class BookmapWindow(QMainWindow):
     def __init__(self, buffer: BookmapBuffer, tick: float, parent=None):
         super().__init__(parent)
-        self.buffer = buffer
-        self.tick = tick
-        self.agg = 1
-        self.bubble_bin = 1.0
-        self.row_ticks = 1
-        # Must agree with the step combo's default item, which is the first key
-        # of PRICE_STEP: the handler is connected after addItems, so selecting
-        # the default never fires it and nothing else would sync this.
-        # The first refresh() resolves the actual grid.
-        self.auto_step = next(iter(PRICE_STEP.values())) < 0
-        self.setWindowTitle(f"Omnitrix Bookmap — {buffer.symbol}")
+        self._tick0 = tick
+        self.setWindowTitle(f"Omnitrix Bookmap \u2014 {buffer.symbol}")
         self.resize(1500, 860)
-        self._follow = True
-        self._auto_y = True
+        self._n_panes = 1
+
         # Deepen this symbol's ring so the long timeframes have data to
         # aggregate; a 1-hour view over a 23-minute ring is one column.
         if buffer.max_cols < HISTORY_COLS:
@@ -94,20 +92,483 @@ class BookmapWindow(QMainWindow):
 
         pg.setConfigOptions(useOpenGL=False, antialias=False)
         self._build_toolbar()
-        self._build_plots()
+        self._build_grid(buffer)
 
-        # Priority 1: useful, but not the window being traded from. These are
-        # what get stretched when four of them are open at once.
+        # Priority 1: useful, but not the window being traded from.
         self._timer = GovernedTimer(self, self.refresh, 80, priority=1)
-        self.glw.set_gov_key(id(self))
         self._timer.start()
         self.refresh(initial=True)
+
+    @property
+    def buffer(self):
+        return self._active_pane.buffer
+
+    @buffer.setter
+    def buffer(self, v):
+        self._active_pane.buffer = v
+
+    @property
+    def glw(self):
+        return self._active_pane.glw
+
+    @glw.setter
+    def glw(self, v):
+        self._active_pane.glw = v
+
+    @property
+    def main(self):
+        return self._active_pane.main
+
+    @main.setter
+    def main(self, v):
+        self._active_pane.main = v
+
+    @property
+    def dom(self):
+        return self._active_pane.dom
+
+    @dom.setter
+    def dom(self, v):
+        self._active_pane.dom = v
+
+    @property
+    def vol(self):
+        return self._active_pane.vol
+
+    @vol.setter
+    def vol(self, v):
+        self._active_pane.vol = v
+
+    @property
+    def vol_axis(self):
+        return self._active_pane.vol_axis
+
+    @vol_axis.setter
+    def vol_axis(self, v):
+        self._active_pane.vol_axis = v
+
+    @property
+    def heat(self):
+        return self._active_pane.heat
+
+    @heat.setter
+    def heat(self, v):
+        self._active_pane.heat = v
+
+    @property
+    def bbo(self):
+        return self._active_pane.bbo
+
+    @bbo.setter
+    def bbo(self, v):
+        self._active_pane.bbo = v
+
+    @property
+    def bubbles(self):
+        return self._active_pane.bubbles
+
+    @bubbles.setter
+    def bubbles(self, v):
+        self._active_pane.bubbles = v
+
+    @property
+    def pie(self):
+        return self._active_pane.pie
+
+    @pie.setter
+    def pie(self, v):
+        self._active_pane.pie = v
+
+    @property
+    def bars(self):
+        return self._active_pane.bars
+
+    @bars.setter
+    def bars(self, v):
+        self._active_pane.bars = v
+
+    @property
+    def dom_item(self):
+        return self._active_pane.dom_item
+
+    @dom_item.setter
+    def dom_item(self, v):
+        self._active_pane.dom_item = v
+
+    @property
+    def vol_item(self):
+        return self._active_pane.vol_item
+
+    @vol_item.setter
+    def vol_item(self, v):
+        self._active_pane.vol_item = v
+
+    @property
+    def cursor(self):
+        return self._active_pane.cursor
+
+    @cursor.setter
+    def cursor(self, v):
+        self._active_pane.cursor = v
+
+    @property
+    def price_line(self):
+        return self._active_pane.price_line
+
+    @price_line.setter
+    def price_line(self, v):
+        self._active_pane.price_line = v
+
+    @property
+    def projection(self):
+        return self._active_pane.projection
+
+    @projection.setter
+    def projection(self, v):
+        self._active_pane.projection = v
+
+    @property
+    def sr(self):
+        return self._active_pane.sr
+
+    @sr.setter
+    def sr(self, v):
+        self._active_pane.sr = v
+
+    @property
+    def sr_item(self):
+        return self._active_pane.sr_item
+
+    @sr_item.setter
+    def sr_item(self, v):
+        self._active_pane.sr_item = v
+
+    @property
+    def cx_v(self):
+        return self._active_pane.cx_v
+
+    @cx_v.setter
+    def cx_v(self, v):
+        self._active_pane.cx_v = v
+
+    @property
+    def cx_h(self):
+        return self._active_pane.cx_h
+
+    @cx_h.setter
+    def cx_h(self, v):
+        self._active_pane.cx_h = v
+
+    @property
+    def readout(self):
+        return self._active_pane.readout
+
+    @readout.setter
+    def readout(self, v):
+        self._active_pane.readout = v
+
+    @property
+    def xhair(self):
+        return self._active_pane.xhair
+
+    @xhair.setter
+    def xhair(self, v):
+        self._active_pane.xhair = v
+
+    @property
+    def agg(self):
+        return self._active_pane.agg
+
+    @agg.setter
+    def agg(self, v):
+        self._active_pane.agg = v
+
+    @property
+    def bubble_bin(self):
+        return self._active_pane.bubble_bin
+
+    @bubble_bin.setter
+    def bubble_bin(self, v):
+        self._active_pane.bubble_bin = v
+
+    @property
+    def row_ticks(self):
+        return self._active_pane.row_ticks
+
+    @row_ticks.setter
+    def row_ticks(self, v):
+        self._active_pane.row_ticks = v
+
+    @property
+    def auto_step(self):
+        return self._active_pane.auto_step
+
+    @auto_step.setter
+    def auto_step(self, v):
+        self._active_pane.auto_step = v
+
+    @property
+    def proj_width(self):
+        return self._active_pane.proj_width
+
+    @proj_width.setter
+    def proj_width(self, v):
+        self._active_pane.proj_width = v
+
+    @property
+    def style(self):
+        return self._active_pane.style
+
+    @style.setter
+    def style(self, v):
+        self._active_pane.style = v
+
+    @property
+    def _follow(self):
+        return self._active_pane._follow
+
+    @_follow.setter
+    def _follow(self, v):
+        self._active_pane._follow = v
+
+    @property
+    def _auto_y(self):
+        return self._active_pane._auto_y
+
+    @_auto_y.setter
+    def _auto_y(self, v):
+        self._active_pane._auto_y = v
+
+    @property
+    def tick(self):
+        # __init__ sets this before any pane exists, so it needs a fallback.
+        p = getattr(self, "_active_pane", None)
+        return p.tick if p is not None else self._tick0
+
+    @tick.setter
+    def tick(self, v):
+        p = getattr(self, "_active_pane", None)
+        if p is None:
+            self._tick0 = v
+        else:
+            p.tick = v
+
+    # ---- pane grid ---------------------------------------------------
+    def _build_grid(self, buffer: BookmapBuffer) -> None:
+        """Up to four books in one window, resizable, instead of four windows.
+
+        Panes are created ONCE and shown or hidden. Building and destroying
+        plots on a layout change would drop each pane's zoom, price grid and
+        accumulated S/R state, which is most of what makes a book worth
+        watching for more than a few seconds.
+
+        All panes share the WINDOW's frame-budget key, so a 2x2 grid is
+        budgeted as one window - which is what it is.
+        """
+        host = QWidget()
+        _cv = QVBoxLayout(host)
+        _cv.setContentsMargins(0, 0, 0, 0)
+        # Splitters, not a fixed grid, so the panes are draggable. The two
+        # rows' column positions are kept in step by _link_rows, so the
+        # vertical divider reads as ONE line through the whole grid.
+        self._grid_host = QSplitter(Qt.Orientation.Vertical)
+        self._grid_host.setChildrenCollapsible(False)
+        self._grid_host.setHandleWidth(6)
+        self._rows = [QSplitter(Qt.Orientation.Horizontal) for _ in range(2)]
+        for r in self._rows:
+            r.setChildrenCollapsible(False)
+            r.setHandleWidth(6)
+            self._grid_host.addWidget(r)
+        self._syncing_rows = False
+        for r in self._rows:
+            r.splitterMoved.connect(lambda _p, _i, sp=r: self._link_rows(sp))
+        _cv.addWidget(self._grid_host)
+        self.setCentralWidget(host)
+
+        self._panes = []
+        for i in range(MAX_PANES):
+            # Pane 0 gets the buffer we were opened for; the rest start empty
+            # and are filled when the user picks a symbol for them.
+            buf = buffer if i == 0 else self._empty_buffer()
+            pane = BookmapPane(self, id(self), buf, self.tick, i, TimeAxisSecs)
+            self._panes.append(pane)
+            pane.main.getViewBox().sigRangeChangedManually.connect(
+                lambda *_a, p=pane: self._on_manual(p))
+            pane.glw.scene().sigMouseClicked.connect(
+                lambda ev, p=pane: self._on_click(ev, p))
+            pane.glw.scene().sigMouseMoved.connect(
+                lambda pos, p=pane: self._on_mouse_move(pos, p))
+            pane.sym_combo.currentTextChanged.connect(
+                lambda t, p=pane: self._on_pane_symbol(p, t))
+            pane.sym_combo.lineEdit().returnPressed.connect(
+                lambda p=pane: self._on_pane_symbol(p, p.sym_combo.currentText()))
+        self._active_pane = self._panes[0]
+        self._bind_pane(self._panes[0])
+        self._apply_layout(1)
+
+        # TradingView-style ticker search: type a letter anywhere on the chart
+        # and a floating box appears. A child of the plain host, NOT of the
+        # splitter - a QLineEdit parented to a QSplitter becomes a splitter
+        # section and would occupy a band of the grid.
+        self.sym_search = QLineEdit(host)
+        self.sym_search.setPlaceholderText("Type ticker, Enter to open")
+        self.sym_search.setStyleSheet(
+            "QLineEdit{background:#12161F;color:#F0F0F0;border:2px solid #26A69A;"
+            " border-radius:8px;padding:8px 14px;font-size:15px;font-weight:700;"
+            " letter-spacing:1px;}")
+        self.sym_search.setFixedSize(240, 40)
+        self.sym_search.hide()
+        self.sym_search.returnPressed.connect(self._apply_sym_search)
+        self.sym_search.installEventFilter(self)
+
+    def _empty_buffer(self) -> BookmapBuffer:
+        """A placeholder book for a pane with no symbol yet.
+
+        Panes are built up front so a layout change never rebuilds plots, but
+        a pane without a buffer would need a None check on every access. An
+        empty buffer costs a few hundred bytes and removes that entirely.
+        """
+        b = BookmapBuffer("", self.tick)
+        if b.max_cols < HISTORY_COLS:
+            b.max_cols = HISTORY_COLS
+        return b
+
+    def _visible_panes(self) -> list:
+        return self._panes[:self._n_panes]
+
+    # Everything a pane owns is exposed here by DELEGATION, not by copying.
+    # An earlier version assigned these in _bind_pane, and the copies went
+    # stale the moment the pane changed one of them - set_row_ticks updated
+    # pane.row_ticks while the window still reported the old value, so an
+    # explicit price step silently stopped pinning the grid. Properties cannot
+    # drift.
+    def _bind_pane(self, pane) -> None:
+        """Select `pane`. The delegating properties below do the rest."""
+        self._active_pane = pane
+        multi = self._n_panes > 1
+        for p in self._panes:
+            p.set_active_look(p is pane, multi)
+        self.setWindowTitle(
+            f"Omnitrix Bookmap — {pane.buffer.symbol or 'select a symbol'}")
+
+    def _apply_layout(self, n: int) -> None:
+        n = max(1, min(MAX_PANES, int(n)))
+        rows, cols = {1: (1, 1), 2: (1, 2), 4: (2, 2)}[n]
+        self._n_panes = n
+        for pane in self._panes:
+            pane.container.setVisible(False)
+        for i in range(n):
+            row = self._rows[i // cols]
+            pane = self._panes[i]
+            if pane.container.parent() is not row:
+                row.addWidget(pane.container)
+            pane.container.setVisible(True)
+        self._rows[1].setVisible(rows > 1)
+        for r in self._rows[:rows]:
+            vis = r.count()
+            if vis:
+                r.setSizes([10_000 // vis] * vis)
+        self._grid_host.setSizes([10_000 // rows] * rows)
+        if self._active_pane not in self._visible_panes():
+            self._bind_pane(self._panes[0])
+        else:
+            self._bind_pane(self._active_pane)
+        for pane in self._visible_panes():
+            if pane.buffer.symbol and pane.sym_combo.currentText() != pane.buffer.symbol:
+                pane.sym_combo.blockSignals(True)
+                pane.sym_combo.setCurrentText(pane.buffer.symbol)
+                pane.sym_combo.blockSignals(False)
+
+    def _link_rows(self, moved) -> None:
+        """Keep both rows' column split identical, so the vertical divider is
+        one continuous line rather than two that drift apart."""
+        if self._syncing_rows or self._n_panes < 4:
+            return
+        sizes = moved.sizes()
+        if len(sizes) < 2:
+            return
+        self._syncing_rows = True
+        try:
+            for r in self._rows:
+                if r is not moved and r.count() == len(sizes):
+                    r.setSizes(sizes)
+        finally:
+            self._syncing_rows = False
+
+    def _on_layout(self, txt: str) -> None:
+        self._apply_layout(LAYOUTS.get(txt, 1))
+
+    def _select_pane(self, pane) -> None:
+        if pane is self._active_pane or pane not in self._visible_panes():
+            return
+        self._bind_pane(pane)
+        self._sync_toolbar_to(pane)
+
+    def _sync_toolbar_to(self, pane) -> None:
+        """The toolbar describes whichever book is selected, so its controls
+        are re-read from that pane - otherwise the next change would be applied
+        from the wrong starting point."""
+        for combo, value in ((self.type_combo, pane.style),):
+            if value and combo.currentText() != value:
+                combo.blockSignals(True)
+                combo.setCurrentText(value)
+                combo.blockSignals(False)
+        self.lbl_step.setText(pane.lbl_step.text())
+
+    def set_pane_symbol(self, pane, sym: str) -> None:
+        """Point one pane at a symbol, leaving the others alone."""
+        sym = (sym or "").strip().upper()
+        if not sym or sym == pane.buffer.symbol:
+            return
+        owner = self.parent()
+        buf = None
+        if owner is not None and hasattr(owner, "_bookmap"):
+            buf = owner._bookmap(sym)
+            if buf.max_cols < HISTORY_COLS:
+                buf.max_cols = HISTORY_COLS
+        if buf is None:
+            return
+        pane.buffer = buf
+        pane.tick = (owner.instruments.tick(sym)
+                     if hasattr(owner, "instruments") else self.tick)
+        # Every item caches the tick for its price->index maths.
+        for it in (pane.heat, pane.bbo, pane.bubbles, pane.pie, pane.bars,
+                   pane.dom_item, pane.vol_item, pane.projection, pane.sr_item):
+            it.tick = pane.tick
+        for it in (pane.bubbles, pane.pie, pane.bars):
+            it.buffer = buf
+        # A different instrument means the accumulated support/resistance and
+        # the fitted price range describe the WRONG book. Reset both rather
+        # than carry another symbol's levels onto this chart.
+        pane.sr = SRTracker()
+        pane._y_range = None
+        pane._follow = True
+        pane._auto_y = True
+        if pane.sym_combo.currentText() != sym:
+            pane.sym_combo.blockSignals(True)
+            pane.sym_combo.setCurrentText(sym)
+            pane.sym_combo.blockSignals(False)
+        if pane is self._active_pane:
+            self._bind_pane(pane)
+
+    def _on_pane_symbol(self, pane, sym: str) -> None:
+        self.set_pane_symbol(pane, sym)
 
     # ---- toolbar ---------------------------------------------------------
     def _build_toolbar(self) -> None:
         tb = QToolBar()
         tb.setMovable(False)
         self.addToolBar(tb)
+        tb.addWidget(QLabel("  Grid "))
+        self.layout_combo = QComboBox()
+        self.layout_combo.addItems(list(LAYOUTS))
+        self.layout_combo.setToolTip(
+            "Show one, two or four order books in THIS window. Each keeps its "
+            "own symbol, zoom and price grid; the highlighted one is what the "
+            "toolbar acts on. Drag the dividers to resize.")
+        self.layout_combo.currentTextChanged.connect(self._on_layout)
+        tb.addWidget(self.layout_combo)
+
         tb.addWidget(QLabel("  Timeframe "))
         self.tf_combo = QComboBox()
         self.tf_combo.addItems(list(TF))
@@ -242,137 +703,6 @@ class BookmapWindow(QMainWindow):
         )
 
     # ---- plots -----------------------------------------------------------
-    def _build_plots(self) -> None:
-        self.glw = GovernedPlotWidget(gov_key=id(self))
-        self.glw.setBackground(BG)
-        self.setCentralWidget(self.glw)
-
-        self.main = self.glw.addPlot(row=0, col=0)
-        self.main.showAxis("right"); self.main.hideAxis("left")
-        self.main.hideAxis("bottom")
-        # No grid on the liquidity pane: Bookmap keeps the canvas clean so the
-        # heat field is the only thing carrying colour. Gridlines over a black
-        # background read as banding in the thin-liquidity tail.
-        self.main.showGrid(x=False, y=False)
-        vb = self.main.getViewBox()
-        vb.setMouseMode(pg.ViewBox.PanMode)          # left-drag pans
-        vb.setMouseEnabled(x=True, y=True)
-
-        self.dom = self.glw.addPlot(row=0, col=1)
-        self.dom.hideAxis("left"); self.dom.showAxis("right")
-        self.dom.hideAxis("bottom")
-        self.dom.setYLink(self.main)
-        self.dom.setMouseEnabled(x=False, y=False)
-
-        self.vol_axis = TimeAxisSecs(orientation="bottom", win=self)
-        self.vol = self.glw.addPlot(row=1, col=0, axisItems={"bottom": self.vol_axis})
-        self.vol.hideAxis("left"); self.vol.showAxis("right")
-        self.vol.setXLink(self.main)
-        self.vol.setMouseEnabled(y=False)
-
-        self.glw.ci.layout.setRowStretchFactor(0, 5)
-        self.glw.ci.layout.setRowStretchFactor(1, 1)
-        self.glw.ci.layout.setColumnStretchFactor(0, 14)
-        self.glw.ci.layout.setColumnStretchFactor(1, 1)
-
-        for plot in (self.main, self.dom, self.vol):
-            for ax in ("right", "bottom"):
-                a = plot.getAxis(ax)
-                a.setPen(pg.mkPen("#243040")); a.setTextPen(pg.mkPen("#8A93A6"))
-
-        self.heat = BookHeatmapItem(self.tick)
-        self.bbo = BBOItem(self.tick)
-        self.bubbles = BubbleItem(self.tick, self.buffer)
-        self.main.addItem(self.heat)
-        self.main.addItem(self.bbo)
-        self.main.addItem(self.bubbles)
-
-        self.pie = PieItem(self.tick, self.buffer)
-        self.bars = BarsItem(self.tick, self.buffer)
-        self.main.addItem(self.pie)
-        self.main.addItem(self.bars)
-
-        self.bubbles.min_size = 100          # default noise filter (matches combo)
-        self.pie.min_size = 100
-        self.bars.min_size = 100
-        self.style = "Bubbles"               # Bookmap-style volume dots
-        self.bubbles.setVisible(True)
-        self.bars.setVisible(False)
-        self.pie.setVisible(False)
-
-        self.dom_item = DomLadderItem(self.tick)
-        self.dom.addItem(self.dom_item)
-        self.vol_item = VolumeBarsItem(self.tick)
-        self.vol.addItem(self.vol_item)
-
-        self.cursor = pg.InfiniteLine(angle=90, movable=False,
-                                      pen=pg.mkPen("#E8C13A", width=1))
-        self.main.addItem(self.cursor, ignoreBounds=True)
-        self.price_line = pg.InfiniteLine(
-            angle=0, movable=False,
-            pen=pg.mkPen("#D8DCE4", width=1, style=Qt.PenStyle.DashLine),
-            label="{value:.2f}",
-            labelOpts={"position": 0.98, "color": "#0A0E16",
-                       "fill": "#D8DCE4", "movable": False})
-        self.main.addItem(self.price_line, ignoreBounds=True)
-
-        # resting limit orders projected as fat bands just ahead of price
-        # (heatmap-coloured; strongest support GREEN, resistance RED).
-        self.projection = ProjectionItem(self.tick)
-        self.main.addItem(self.projection)
-        self.proj_width = 7
-
-        # Absolute support / resistance: the levels that have actually held,
-        # drawn full width so price can be watched approaching them.
-        self.sr = SRTracker()
-        self.sr_item = SRLinesItem(self.tick)
-        self.main.addItem(self.sr_item)
-
-        # ---- crosshair with live price / time / liquidity readout ----
-        self.cx_v = pg.InfiniteLine(angle=90, movable=False,
-                                    pen=pg.mkPen("#7E8AA0", width=1,
-                                                 style=Qt.PenStyle.DashLine))
-        self.cx_h = pg.InfiniteLine(
-            angle=0, movable=False,
-            pen=pg.mkPen("#7E8AA0", width=1, style=Qt.PenStyle.DashLine),
-            label="{value:.2f}",
-            labelOpts={"position": 0.02, "color": "#0A0E16",
-                       "fill": "#7E8AA0", "movable": False})
-        for ln in (self.cx_v, self.cx_h):
-            ln.setVisible(False)
-            self.main.addItem(ln, ignoreBounds=True)
-
-        self.readout = pg.TextItem(anchor=(0, 0), color="#D8DCE4",
-                                   fill=pg.mkBrush(12, 24, 40, 215))
-        self.readout.setZValue(50)
-        self.readout.setVisible(False)
-        self.main.addItem(self.readout, ignoreBounds=True)
-
-        # TradingView-style ticker search: type a letter anywhere on the chart
-        # and a floating box appears; Enter opens that symbol's bookmap, Escape
-        # cancels. A child of the chart widget so it floats over the plot.
-        self.sym_search = QLineEdit(self.glw)
-        self.sym_search.setPlaceholderText("Type ticker, Enter to open")
-        self.sym_search.setStyleSheet(
-            "QLineEdit{background:#12161F;color:#F0F0F0;border:2px solid #26A69A;"
-            " border-radius:8px;padding:8px 14px;font-size:15px;font-weight:700;"
-            " letter-spacing:1px;}")
-        self.sym_search.setFixedSize(240, 40)
-        self.sym_search.hide()
-        self.sym_search.returnPressed.connect(self._apply_sym_search)
-        self.sym_search.installEventFilter(self)
-
-        vb.sigRangeChangedManually.connect(self._on_manual)
-        self.glw.scene().sigMouseClicked.connect(self._on_click)
-        # Badges only: this window already owns its crosshair lines and a rich
-        # hover readout, so a second set of lines would fight the first.
-        self.xhair = Crosshair(
-            self.main,
-            x_label=lambda x: clock_label(
-                x * self.buffer.col_dt * self.agg),
-            add_lines=False, connect=False)
-        self.glw.scene().sigMouseMoved.connect(self._on_mouse_move)
-
     # ---- ticker search ---------------------------------------------------
     def keyPressEvent(self, ev) -> None:
         if not self.sym_search.isVisible():
@@ -414,31 +744,50 @@ class BookmapWindow(QMainWindow):
             opener(sym)
 
     # ---- interaction -----------------------------------------------------
-    def _on_manual(self):
-        vb = self.main.getViewBox()
+    def _on_manual(self, pane=None):
+        pane = pane or self._active_pane
+        # Touching a book is also how you select it in a grid.
+        if pane is not self._active_pane:
+            self._select_pane(pane)
+        vb = pane.main.getViewBox()
         vr = vb.viewRect()
-        cols = self.buffer.view(self.agg)
-        
+        cols = pane.buffer.view(pane.agg)
+
         # If they manually panned away from the live edge, stop following.
-        # But if they just zoomed while near the live edge, keep following the x-axis, 
-        # just disable auto_y so they keep their vertical zoom.
+        # But if they just zoomed while near the live edge, keep following the
+        # x-axis, just disable auto_y so they keep their vertical zoom.
         if cols:
             latest = cols[-1]
-            x_hi = latest.bucket + self.proj_width + 3
+            x_hi = latest.bucket + pane.proj_width + 3
             if abs(vr.right() - x_hi) < max(5.0, (vr.right() - vr.left()) * 0.1):
-                self._auto_y = False
+                pane._auto_y = False
+                if pane is self._active_pane:
+                    self._auto_y = False
                 return
 
-        self._follow = False
-        self._auto_y = False
-        self.btn_follow.setText("⏸ Live")
+        pane._follow = False
+        pane._auto_y = False
+        if pane is self._active_pane:
+            self._follow = False
+            self._auto_y = False
+            self.btn_follow.setText("⏸ Live")
 
-    def _on_click(self, ev):
+    def _on_click(self, ev, pane=None):
+        # Clicking a book selects it, before anything else acts on it.
+        if pane is not None and pane is not self._active_pane:
+            self._select_pane(pane)
+            return
         if ev.double():
-            self._auto_y = True
+            pane = pane or self._active_pane
+            pane._auto_y = self._auto_y = True
             self._reset_view()
 
-    def _on_mouse_move(self, pos) -> None:
+    def _on_mouse_move(self, pos, pane=None) -> None:
+        # Each pane owns its scene, so a move here IS a move on this pane - no
+        # hit-testing across four books, and the readout cannot land on the
+        # wrong one. Only the selected book tracks the pointer.
+        if pane is not None and pane is not self._active_pane:
+            return
         """Crosshair + readout: price, clock time, resting size at that price
         and its distance from the last trade."""
         vb = self.main.getViewBox()
@@ -538,20 +887,22 @@ class BookmapWindow(QMainWindow):
         return max(0, min(6, len(f"{t:.6f}".rstrip('0').split('.')[-1])))
 
     def _reset_view(self):
-        self._follow = True
+        p = self._active_pane
+        p._follow = self._follow = True
         # We don't force _auto_y = True here so the user keeps their vertical zoom!
         # Double-clicking the chart will re-enable _auto_y.
         self.btn_follow.setText("⏵ Follow")
         self.refresh()
 
     def _zoom(self, factor: float):
-        self._follow = False
+        self._active_pane._follow = self._follow = False
         vb = self.main.getViewBox()
         vb.scaleBy((factor, 1.0))            # zoom time axis about centre
 
     def _on_tf(self, txt: str):
-        self.agg = TF.get(txt, 1)
-        self._apply_tape()
+        p = self._active_pane
+        p.agg = self.agg = TF.get(txt, 1)
+        p.apply_tape()
         self._reset_view()
 
     def _on_minsize(self, txt: str):
@@ -566,64 +917,25 @@ class BookmapWindow(QMainWindow):
         self.heat.update()
 
     def _on_btf(self, txt: str):
-        self.bubble_bin = float(BUBBLE_TF.get(txt, 1))
-        self._apply_tape()
+        p = self._active_pane
+        p.bubble_bin = self.bubble_bin = float(BUBBLE_TF.get(txt, 1))
+        p.apply_tape()
         self.refresh()
 
     def _on_step(self, txt: str):
         dollars = PRICE_STEP.get(txt, 0.0)
         # -1 = Auto (resolved per refresh from the zoom); 0 = exactly one tick,
         # whatever the instrument's tick happens to be.
-        self.auto_step = dollars < 0
-        if not self.auto_step:
+        p = self._active_pane
+        p.auto_step = self.auto_step = dollars < 0
+        if not p.auto_step:
             self.lbl_step.setText("")          # the combo already names it
-            self._set_row_ticks(1 if dollars <= 0 else
-                                max(1, int(round(dollars / self.tick))))
+            p.lbl_step.setText("")
+            p.set_row_ticks(1 if dollars <= 0 else
+                            max(1, int(round(dollars / p.tick))))
         else:
-            self._resolve_auto_step()
+            p.resolve_auto_step()
         self.refresh()
-
-    def _set_row_ticks(self, rt: int) -> bool:
-        """Push one price grid to every consumer. Returns True if it changed.
-
-        Five items draw on this grid - the heat field, the DOM ladder and the
-        three tape overlays - and they must agree: a ladder bucketed differently
-        from the field behind it lines up with nothing, which is worse than
-        either grid alone.
-        """
-        if rt == self.row_ticks:
-            return False
-        self.row_ticks = rt
-        self.heat.row_ticks = rt
-        self.dom_item.row_ticks = rt
-        self._apply_tape()
-        return True
-
-    def _resolve_auto_step(self) -> bool:
-        """Pick the grid from the current zoom. No-op unless Auto is selected.
-
-        Resolved here rather than inside each item's paint (as the footprint
-        does) precisely because five items share this grid - letting each derive
-        its own from its own viewport would let the DOM ladder and the field
-        disagree. The DOM y-axis is linked to the main plot, so one reading
-        serves both.
-
-        Targets a band rather than a text row: the heat field only has to stay
-        a visible band, and forcing footprint-sized rows here would throw away
-        most of the depth resolution the feed provides.
-        """
-        if not self.auto_step:
-            return False
-        vb = self.main.getViewBox()
-        if vb is None:
-            return False
-        px_h = vb.viewPixelSize()[1]
-        changed = self._set_row_ticks(
-            auto_step_ticks(px_h, self.tick, TARGET_PX_BAND))
-        px = self.row_ticks * self.tick
-        self.lbl_step.setText(f"({px * 100:.0f}¢)" if px < 1.0
-                              else f"(${px:,.2f})".replace(".00", ""))
-        return changed
 
     def _on_size(self, txt: str):
         sc = SIZE_STEPS.get(txt, 1.0)
@@ -652,12 +964,11 @@ class BookmapWindow(QMainWindow):
         self.heat.update()
 
     def _apply_tape(self) -> None:
-        """Push the tape binning onto all three overlays at once."""
-        for it in (self.bubbles, self.pie, self.bars):
-            it.bin_cols = self.bubble_bin
-            it.row_ticks = self.row_ticks
-            it.xscale = 1.0 / self.agg
-            it.update()
+        """Push the tape binning onto the ACTIVE pane's three overlays."""
+        p = self._active_pane
+        p.bubble_bin = self.bubble_bin
+        p.agg = self.agg
+        p.apply_tape()
 
     def _on_wall(self, txt: str):
         mult, floor = {"Sensitive": (2.5, 2000),
@@ -668,6 +979,7 @@ class BookmapWindow(QMainWindow):
         self.projection.update()
 
     def _on_style(self, txt: str):
+        self._active_pane.style = txt
         self.style = txt
         self.bubbles.setVisible(txt == "Bubbles")
         self.pie.setVisible(txt == "Pie")
@@ -692,51 +1004,52 @@ class BookmapWindow(QMainWindow):
 
     # ---- data + view -----------------------------------------------------
     def refresh(self, initial: bool = False) -> None:
-        # A window you cannot see does not need live data. Every one of these
-        # runs its own timer and repaints regardless of whether it is on
-        # screen, so four open Bookmaps cost four full paints even when three
-        # are minimised behind the fourth. Measured: paint is 95% of the cost
-        # (98.5 ms of 104 ms at four windows), so skipping an unseen one is the
-        # cheapest frame in the app.
+        # A window you cannot see does not need live data. Measured, paint is
+        # 95% of the cost, so skipping an unseen one is the cheapest frame in
+        # the app - and returning early is not enough, because the governor
+        # would go on counting this window's cost against the shared budget
+        # and throttling the window you ARE looking at.
         if not self.isVisible() or self.isMinimized():
-            # Returning early is not enough: the governor still counts this
-            # window's measured cost against the shared budget, so three
-            # minimised bookmaps would go on throttling the one you are
-            # looking at. Hand the budget back.
             GOVERNOR.set_alive(id(self), False)
             return
         GOVERNOR.set_alive(id(self), True)
+        for pane in self._visible_panes():
+            self._refresh_pane(pane, initial)
+
+    def _refresh_pane(self, pane, initial: bool = False) -> None:
         # Before anything reads row_ticks: a zoom changes the right grid, and
         # this timer is what notices.
-        self._resolve_auto_step()
-        cols = self.buffer.view(self.agg)
+        pane.resolve_auto_step()
+        if pane is self._active_pane:
+            self.lbl_step.setText(pane.lbl_step.text())
+        cols = pane.buffer.view(pane.agg)
         if not cols:
             return
-        self.heat.set_cols(cols)
-        self.bbo.set_cols(cols)
-        # All three overlays read the tape directly now, so they only need the
+        pane.heat.set_cols(cols)
+        pane.bbo.set_cols(cols)
+        # All three overlays read the tape directly, so they only need the
         # columns for their bounding rect - and they need it whether visible or
         # not, so switching type does not show a stale extent for one frame.
-        for it in (self.bubbles, self.pie, self.bars):
-            it.xscale = 1.0 / self.agg
-            it.bin_cols = self.bubble_bin
-            it.row_ticks = self.row_ticks
+        for it in (pane.bubbles, pane.pie, pane.bars):
+            it.xscale = 1.0 / pane.agg
+            it.bin_cols = pane.bubble_bin
+            it.row_ticks = pane.row_ticks
             it.set_cols(cols)
-        self.vol_item.set_cols(cols)
+        pane.vol_item.set_cols(cols)
         latest = cols[-1]
         # The newest column may have been created by a trade and carry no book;
         # fall back to the newest one that does so the DOM/projection hold.
-        book_col = latest if latest.book else (self.buffer.latest_book() or latest)
-        self.dom_item.set_col(book_col, self.tick)
-        self.cursor.setPos(latest.bucket + 1)
+        book_col = latest if latest.book else (pane.buffer.latest_book() or latest)
+        pane.dom_item.set_col(book_col, pane.tick)
+        pane.cursor.setPos(latest.bucket + 1)
 
         mid_ti = None
         if latest.bid_ti is not None and latest.ask_ti is not None:
             mid_ti = (latest.bid_ti + latest.ask_ti) / 2
-        elif self.buffer.trades:
-            mid_ti = self.buffer.trades[-1][1]
+        elif pane.buffer.trades:
+            mid_ti = pane.buffer.trades[-1][1]
         if mid_ti is not None:
-            self.price_line.setPos(mid_ti * self.tick)
+            pane.price_line.setPos(mid_ti * pane.tick)
 
         # project the resting book as fat bands just ahead of the latest pie
         vmax = 1
@@ -745,71 +1058,26 @@ class BookmapWindow(QMainWindow):
                 m = c.book.max_size()
                 if m > vmax:
                     vmax = m
-        self.projection.set_projection(book_col, latest.bucket + 1, mid_ti, vmax)
+        pane.projection.set_projection(book_col, latest.bucket + 1, mid_ti, vmax)
 
         # Persistence-weighted S/R, shared by the projection bands and the
         # full-width lines so the two always name the same levels.
-        sup, res = self.sr.update(cols, mid_ti)
-        self.projection.set_sr(sup, res)
-        self.sr_item.set_levels(sup, res, cols[0].bucket,
-                                latest.bucket + self.proj_width + 1)
+        sup, res = pane.sr.update(cols, mid_ti)
+        pane.projection.set_sr(sup, res)
+        pane.sr_item.set_levels(sup, res, cols[0].bucket,
+                                latest.bucket + pane.proj_width + 1)
 
         if book_col.book:
-            # Exact, no margin: the ladder's bars are right-anchored at mx, so
-            # the deepest level must land flush against the price axis. Taken
-            # from the ladder item, which has already summed levels into the
-            # selected price buckets - the raw per-tick max would under-scale
-            # the axis and push aggregated bars off the edge.
-            self.dom.setXRange(0, self.dom_item.vmax or 1, padding=0)
+            # Exact, no margin: the ladder's bars are right-anchored, so the
+            # deepest level must land flush against the price axis.
+            pane.dom.setXRange(0, pane.dom_item.vmax or 1, padding=0)
 
-        if initial or self._follow:
-            width = self._view_width(cols, default=60)
-            x_hi = latest.bucket + self.proj_width + 3    # room for projection
-            self.main.setXRange(x_hi - width, x_hi, padding=0)
-        if initial or self._auto_y:
-            self._fit_price(cols)
-
-    def _view_width(self, cols, default: int) -> float:
-        try:
-            r = self.main.getViewBox().viewRange()[0]
-            w = r[1] - r[0]
-            return w if w > 2 else default
-        except Exception:
-            return default
-
-    def _fit_price(self, cols) -> None:
-        """Follow the traded price path and pad it with ~16 ticks of context
-        each side, so resting walls above/below (support/resistance) stay in
-        frame without the deep book shrinking the pies."""
-        width = int(self._view_width(cols, default=60))
-        vis = cols[-width:] if len(cols) > width else cols
-        lo = hi = None
-        for c in vis:
-            if c.bid_ti is not None and c.ask_ti is not None:
-                m = (c.bid_ti + c.ask_ti) / 2
-                lo = m if lo is None else min(lo, m)
-                hi = m if hi is None else max(hi, m)
-        if lo is None:                       # fallback: full book range
-            for c in vis:
-                for ti in (c.book or {}):
-                    lo = ti if lo is None else min(lo, ti)
-                    hi = ti if hi is None else max(hi, ti)
-            if lo is None:
-                return
-        pad = max(16.0, (hi - lo) * 0.6) * self.tick
-        y0, y1 = lo * self.tick - pad, hi * self.tick + pad
-
-        # Hysteresis: re-fitting on every 80ms refresh made the chart micro-jitter
-        # as price wobbled. Only move the view when it drifts meaningfully.
-        prev = getattr(self, "_y_range", None)
-        if prev is not None:
-            span = max(1e-9, prev[1] - prev[0])
-            if (abs(y0 - prev[0]) / span < 0.04 and
-                    abs(y1 - prev[1]) / span < 0.04):
-                return
-        self._y_range = (y0, y1)
-        self.main.setYRange(y0, y1, padding=0)
-
+        if initial or pane._follow:
+            width = pane.view_width(cols, default=60)
+            x_hi = latest.bucket + pane.proj_width + 3   # room for projection
+            pane.main.setXRange(x_hi - width, x_hi, padding=0)
+        if initial or pane._auto_y:
+            pane.fit_price(cols)
 
 class TimeAxisSecs(pg.AxisItem):
     """Formats aggregated column-bucket x values as HH:MM:SS."""
