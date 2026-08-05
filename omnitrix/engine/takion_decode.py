@@ -123,7 +123,11 @@ class TakionDecoder(Feed):
         # measure of feed quality: a high `mid`/`tick` share means the quote is
         # lagging the prints, and a high `unknown` share means the chart's
         # delta is being carried by an even split rather than by evidence.
-        self.cls = {"quote": 0, "mid": 0, "tick": 0, "unknown": 0}
+        self.cls = {"quote": 0, "mid": 0, "tick": 0, "ztick": 0,
+                    "unknown": 0}
+        # Direction of the last PRICE CHANGE per symbol, for the zero-tick
+        # rule below. +1 after an uptick, -1 after a downtick.
+        self._last_dir: dict[str, int] = {}
 
     # ---- connection lifecycle --------------------------------------------
     def on_l1_disconnect(self) -> None:  # noqa: D401
@@ -258,9 +262,16 @@ class TakionDecoder(Feed):
                  far likelier taken from the offer.
           tick   exactly at the mid, or no usable quote: compare with the last
                  DIFFERENT trade price. Uptick = buyer-initiated.
+          ztick  same price as the last print: inherit the direction of the
+                 last price CHANGE. This is the zero-tick half of Lee-Ready,
+                 and leaving it out was costing real attribution - measured on
+                 a live post-market feed, UNKNOWN climbed 3% -> 19% across a
+                 session, because both conditions for it (a print at the mid,
+                 and a price that has not moved) get commoner as a book
+                 thins. Every one of those was being split 50/50.
 
-        Only a print with no quote AND no prior price stays UNKNOWN, which the
-        rest of the app splits evenly. The previous rule had just the first
+        Only a print with no quote, no price change AND no prior direction
+        stays UNKNOWN, which the rest of the app splits evenly. The previous rule had just the first
         tier and dropped everything else into UNKNOWN, so on a feed whose quote
         refreshes after each trade the majority of prints carried no direction
         at all - and the renderers that then mis-split them are what made the
@@ -271,6 +282,10 @@ class TakionDecoder(Feed):
         function can repair.
         """
         prev = self._last_px.get(sym)
+        if last > 0 and prev is not None and last != prev:
+            # Record the direction BEFORE overwriting the price, so a later
+            # zero-tick knows which way the last real move went.
+            self._last_dir[sym] = 1 if last > prev else -1
         if last > 0:
             if prev is None or last != prev:
                 self._last_px[sym] = last
@@ -293,6 +308,14 @@ class TakionDecoder(Feed):
         if prev is not None and last > 0 and last != prev:
             self.cls["tick"] += 1
             return Aggressor.BUY if last > prev else Aggressor.SELL
+
+        # Zero tick: the price has not moved, so carry the last move's
+        # direction. Weaker than a quote and counted separately, but it is
+        # evidence - and the alternative is splitting the print in half.
+        d = self._last_dir.get(sym)
+        if d and last > 0:
+            self.cls["ztick"] += 1
+            return Aggressor.BUY if d > 0 else Aggressor.SELL
 
         self.cls["unknown"] += 1
         return Aggressor.UNKNOWN

@@ -1114,11 +1114,21 @@ class OmnitrixWindow(QMainWindow):
         if callable(q):
             try:
                 m = q()
-                known = m["quote"] + m["mid"]
-                if m["unknown"] > 0.02 or known < 0.75:
-                    txt += (f"   flow {known:.0%} known"
-                            f"  ? {m['unknown']:.0%}")
-                    if m["unknown"] > 0.15:
+                # ATTRIBUTED vs split-in-half, which is the distinction that
+                # matters: everything except `unknown` was given a side.
+                # The old line showed quote+mid as "known" against unknown as
+                # "?", leaving the tick tiers in NEITHER - so the two numbers
+                # did not sum to 100 and there was no way to read what the
+                # remainder was. The quoted share is shown in brackets because
+                # it is the part resting on direct evidence rather than
+                # inference.
+                unknown = m["unknown"]
+                attributed = 1.0 - unknown
+                quoted = m["quote"] + m["mid"]
+                if unknown > 0.02 or quoted < 0.75:
+                    txt += (f"   flow {attributed:.0%} attributed"
+                            f" ({quoted:.0%} quoted)  ? {unknown:.0%}")
+                    if unknown > 0.15:
                         col = "#FFB300"
             except Exception:
                 pass
