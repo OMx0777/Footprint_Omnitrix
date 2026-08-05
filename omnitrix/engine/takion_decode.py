@@ -128,6 +128,13 @@ class TakionDecoder(Feed):
         # Direction of the last PRICE CHANGE per symbol, for the zero-tick
         # rule below. +1 after an uptick, -1 after a downtick.
         self._last_dir: dict[str, int] = {}
+        # Per-symbol diagnostics. "(no prints yet)" is true but useless - a
+        # symbol can be silent for four different reasons and they need
+        # different fixes. Counted here so the status line can say which.
+        self.sym_l1: dict[str, int] = {}      # L1 records seen
+        self.sym_l2: dict[str, int] = {}      # book records seen
+        self.sym_trades: dict[str, int] = {}  # trades emitted
+        self.sym_zero_px: dict[str, int] = {}  # L1 arrived with no last price
 
     # ---- connection lifecycle --------------------------------------------
     def on_l1_disconnect(self) -> None:  # noqa: D401
@@ -320,6 +327,27 @@ class TakionDecoder(Feed):
         self.cls["unknown"] += 1
         return Aggressor.UNKNOWN
 
+    def symbol_health(self, sym: str) -> str:
+        """Why does this symbol have no prints? Returns a short reason.
+
+        A symbol reaches the picker as soon as ANY record mentions it, depth
+        included, so "registered" and "printing" are different things. The four
+        cases below need different responses, and "(no prints yet)" told the
+        user none of them.
+        """
+        l1 = self.sym_l1.get(sym, 0)
+        l2 = self.sym_l2.get(sym, 0)
+        zero = self.sym_zero_px.get(sym, 0)
+        if l1 == 0 and l2 == 0:
+            return "nothing received for this symbol"
+        if l1 == 0:
+            return f"depth only ({l2:,} book records, no L1) - not in the feed's basket?"
+        if zero and zero >= l1 * 0.9:
+            return f"L1 arriving but with no last price ({zero:,} records)"
+        if l1 == 1:
+            return "one L1 record so far - a trade needs a volume CHANGE"
+        return f"{l1:,} L1 records, volume unchanged - no trades since connect"
+
     def quality(self) -> dict:
         """Classification mix as fractions, for the status readout."""
         tot = sum(self.cls.values()) or 1
@@ -332,6 +360,7 @@ class TakionDecoder(Feed):
         sym = _cstr(sym_b)
         if not sym or not self._wanted(sym):
             return
+        self.sym_l1[sym] = self.sym_l1.get(sym, 0) + 1
 
         # A change in position size is a fill. Emitted before the price guard
         # below only if we have a price to attach it to.
@@ -354,6 +383,7 @@ class TakionDecoder(Feed):
         # and it poisons VWAP and the volume profile for the session. One bad
         # record used to be enough to make the chart unreadable.
         if not (last > 0.0) or last != last:          # <=0, NaN
+            self.sym_zero_px[sym] = self.sym_zero_px.get(sym, 0) + 1
             return
 
         prev = self._last_vol.get(sym)
@@ -391,6 +421,7 @@ class TakionDecoder(Feed):
         sym = _cstr(sym_b)
         if not sym or not self._wanted(sym):
             return
+        self.sym_l2[sym] = self.sym_l2.get(sym, 0) + 1
         side = side_b.decode("ascii", "ignore")
 
         if side == "C":                          # sweep complete

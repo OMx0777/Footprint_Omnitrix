@@ -122,6 +122,10 @@ RCVBUF = 8 << 20
 # burst of loss produces many small holes.
 REPAIR_DELAY_S = 0.35
 
+# Ceiling on outstanding repair ranges. Reached only when loss is sustained,
+# and at that point more queueing does not help - see _on_datagram.
+MAX_PENDING_REPAIRS = 64
+
 
 class MulticastFeed(TakionDecoder):
     """Live multicast stream + TCP backfill/recovery."""
@@ -287,15 +291,31 @@ class MulticastFeed(TakionDecoder):
             self._on_datagram(dg)
         self._catchup.clear()
 
-        last_repair = time.perf_counter()
+        # Repair runs on its OWN thread. It used to run here, inline, and
+        # that is what froze the terminal: a repair opens a TCP connection and
+        # waits for the reply, and while it waits this loop is not reading the
+        # socket. The kernel buffer then overflows, which produces more gaps,
+        # which queue more repairs, which block for longer. A feedback loop
+        # whose input is its own output - it does not recover, and the only
+        # way out was restarting the app.
+        #
+        # The receive loop must do exactly one thing: get datagrams off the
+        # socket. Anything that can block belongs somewhere else.
+        self._repair_thread = threading.Thread(target=self._repair_loop,
+                                               daemon=True)
+        self._repair_thread.start()
         while self._running:
             dg = self._recv()
             if dg is not None:
                 self._on_datagram(dg)
-            now = time.perf_counter()
-            if now - last_repair >= REPAIR_DELAY_S:
-                last_repair = now
+
+    def _repair_loop(self) -> None:
+        while self._running:
+            time.sleep(REPAIR_DELAY_S)
+            try:
                 self._repair_pending()
+            except Exception:
+                log.exception("gap repair failed (continuing)")
 
     def _recv(self):
         try:
@@ -319,7 +339,20 @@ class MulticastFeed(TakionDecoder):
             # throwing the book away first would discard state the replay is
             # going to rebuild on top of.
             with self._pending_lock:
-                self._pending.append((ch, seq - missed, seq - 1))
+                # Bounded. If loss is bad enough that repairs cannot keep up,
+                # queueing every range forever turns a bandwidth problem into
+                # an unbounded memory one, and the repairs get further behind
+                # the longer the list is. Past this point the honest move is to
+                # drop the state and let the next sweep rebuild it.
+                if len(self._pending) >= MAX_PENDING_REPAIRS:
+                    self.unrepaired += 1
+                    self._pending.clear()
+                    log.warning("gap repair is not keeping up; dropping book "
+                                "state rather than queueing more")
+                    (self.on_disconnect() if ch == wire.CH_L2
+                     else self.on_l1_disconnect())
+                else:
+                    self._pending.append((ch, seq - missed, seq - 1))
             log.warning("multicast gap: ch%d missing %d..%d (%d batches)",
                         ch, seq - missed, seq - 1, missed)
         body = bytearray(dg[wire.HEADER_SIZE:])
@@ -345,8 +378,11 @@ class MulticastFeed(TakionDecoder):
 
     # ---- backfill and repair --------------------------------------------
     def _replay_socket(self):
+        # 3 s, not 20. This is a LAN round trip to a server on the same
+        # switch; if it has not answered in 3 seconds it is not going to, and
+        # every second spent waiting is a second of gaps piling up behind it.
         s = socket.create_connection((self.replay_host, self.replay_port),
-                                     timeout=20.0)
+                                     timeout=3.0)
         if self.token:
             s.sendall(self.token.encode("utf-8") + b"\n")
         return s

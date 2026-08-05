@@ -991,7 +991,19 @@ class OmnitrixWindow(QMainWindow):
             # "no trades for this symbol yet".
             pane.clear()
             if pane is self._active_pane:
-                self.lbl_stats.setText(f"  {sym}   (no prints yet)  ")
+                # Say WHY. A symbol reaches the picker as soon as any record
+                # mentions it - depth included - so "no prints" covers four
+                # different situations that need four different responses.
+                why = ""
+                h = getattr(self.feed, "symbol_health", None)
+                if callable(h):
+                    try:
+                        why = h(sym)
+                    except Exception:
+                        why = ""
+                self.lbl_stats.setText(
+                    f"  {sym}   no prints - {why}  " if why
+                    else f"  {sym}   (no prints yet)  ")
             return
         if pane is self._active_pane:
             self._sync_step_label()
