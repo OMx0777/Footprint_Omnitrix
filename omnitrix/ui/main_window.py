@@ -497,7 +497,10 @@ class OmnitrixWindow(QMainWindow):
             ("F", "Fib", "Fibonacci retracement"),
             ("▲", "Long", "Long position — entry / TP / SL with R:R"),
             ("▼", "Short", "Short position — entry / TP / SL with R:R"),
-            ("▤", "VP", "Fixed-range volume profile"),
+            ("▤", "VP",
+             "Volume Profile — drag a box over any range. "
+             "Draws volume-at-price with POC (yellow), and VAH / VAL (blue) "
+             "bounding the 70% value area, each labelled with its price."),
             ("✎", "Pen", "Freehand pen — hold the left button and draw"),
             ("╪", "CPR", "Central Pivot Range over the boxed bars"),
             ("⟷", "Measure",

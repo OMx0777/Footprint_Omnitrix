@@ -67,8 +67,9 @@ class ChartPane:
         # does it. The header hides itself in single-chart mode, where the main
         # toolbar already says the same thing and a second copy is just noise.
         self.container = QWidget()
+        self.container.setObjectName("omnipane")
         _v = QVBoxLayout(self.container)
-        _v.setContentsMargins(0, 0, 0, 0)
+        _v.setContentsMargins(1, 1, 1, 1)
         _v.setSpacing(0)
 
         self.header = QWidget()
@@ -246,12 +247,21 @@ class ChartPane:
     def set_active_look(self, active: bool, multi: bool) -> None:
         """Mark which pane the toolbar and drawing tools are acting on.
 
-        Only meaningful in a grid: with a single pane there is nothing to
-        distinguish it from, and a border would just be noise.
+        The selector is scoped by objectName on purpose. A bare "border:..."
+        stylesheet set on the container is inherited by every child, so the
+        symbol picker, the timeframe picker and the readout in the header each
+        drew their OWN border too - which is what boxed in the buttons.
+        "#omnipane { ... }" matches this widget alone.
+
+        Thin and grey, both states. A 2 px teal frame around the selected chart
+        was louder than anything on the chart itself; the selected pane only has
+        to be identifiable, not advertised.
         """
         self.header.setVisible(multi)
         if not multi:
+            # Single chart: nothing to distinguish it from, so no border at all.
             self.container.setStyleSheet("")
             return
         self.container.setStyleSheet(
-            "border:2px solid #26A69A;" if active else "border:1px solid #232833;")
+            "#omnipane { border:1px solid %s; }"
+            % ("#6E747E" if active else "#242830"))
