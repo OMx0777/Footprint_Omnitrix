@@ -398,7 +398,6 @@ class OmnitrixWindow(QMainWindow):
         btn_windows.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         tb.addWidget(btn_windows)
         for label, slot, tip in (
-            ("Bookmap", self._open_bookmap, "Liquidity heatmap for a symbol"),
             ("Tape", self._open_tape,
              "Tape reader: every print, speed and running delta"),
             ("Profile", self._open_profile, "Session volume profile"),
@@ -441,6 +440,25 @@ class OmnitrixWindow(QMainWindow):
         # whether the DLL is actually attached to both pipes.
         self.lbl_link = QLabel("")
         tb.addWidget(self.lbl_link)
+
+        # The most-used window gets the corner, not a menu item. Placed after
+        # the expanding spacer so it stays pinned to the top-right however wide
+        # the window is, and coloured so it is findable without reading.
+        self.btn_bookmap = QPushButton("  BOOKMAP  ")
+        self.btn_bookmap.setToolTip(
+            "Open the liquidity heatmap for the selected symbol  "
+            "(shows up to four books in one window)")
+        self.btn_bookmap.setMinimumHeight(30)
+        self.btn_bookmap.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bookmap.setStyleSheet(
+            "QPushButton {"
+            " background:#1E9E76; color:#06110C; font-weight:800;"
+            " font-size:13px; letter-spacing:1px; border:none;"
+            " border-radius:5px; padding:5px 16px; margin:2px 6px 2px 10px; }"
+            "QPushButton:hover  { background:#26C08F; }"
+            "QPushButton:pressed{ background:#178A66; }")
+        self.btn_bookmap.clicked.connect(self._open_bookmap)
+        tb.addWidget(self.btn_bookmap)
 
         # ---- Drawing Toolbar (Left) ----
         dtb = QToolBar("Drawings")

@@ -31,7 +31,7 @@ from .instruments import Instruments
 
 class Column:
     __slots__ = ("bucket", "book", "buy", "sell", "bid_ti", "ask_ti", "vol",
-                 "sweeps")
+                 "sweeps", "net")
 
     def __init__(self, bucket: int):
         self.bucket = bucket
@@ -41,6 +41,12 @@ class Column:
         self.bid_ti: int | None = None
         self.ask_ti: int | None = None
         self.vol = 0
+        # Signed aggressive volume, maintained INCREMENTALLY as prints arrive.
+        # The volume-bar renderer needs it to colour each bar, and it used to
+        # recompute it there with two sum() passes over this column's whole
+        # price dict on every frame - for every visible column, every book.
+        # Kept here it is one addition per trade and it can never be stale.
+        self.net = 0
         # Book sweeps actually observed in this column. Deliberately NOT
         # inherited by forward-fill: a column carrying the previous ladder
         # because nothing arrived is a column we never measured, and 0 here is
@@ -143,6 +149,7 @@ class BookmapBuffer:
         if sell:
             c.sell[ti] = c.sell.get(ti, 0) + sell
         c.vol += tr.size
+        c.net += buy - sell
         x = (tr.ts_ms / 1000.0) / self.col_dt
         self.trades.append((x, ti, tr.size, tr.aggressor))
         self.trade_count += 1
@@ -252,6 +259,7 @@ class BookmapBuffer:
             for ti, v in c.sell.items():
                 g.sell[ti] = g.sell.get(ti, 0) + v
             g.vol += c.vol
+            g.net += c.net
             # Summed, so an aggregated column reports how many sweeps its whole
             # span was built from - 0 still means "nothing was observed here".
             g.sweeps += c.sweeps

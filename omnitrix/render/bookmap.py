@@ -11,6 +11,8 @@ x = absolute column bucket (from the buffer), y = price.
 
 from __future__ import annotations
 
+import bisect
+
 import math
 import numpy as np
 import pyqtgraph as pg
@@ -206,6 +208,22 @@ def _price_bounds(cols, tick):
     return rect
 
 
+class _BucketView:
+    """Read-only `.bucket` projection of a column list, so bisect can search it
+    without materialising a parallel list of keys every frame."""
+
+    __slots__ = ("_c",)
+
+    def __init__(self, cols):
+        self._c = cols
+
+    def __len__(self):
+        return len(self._c)
+
+    def __getitem__(self, i):
+        return self._c[i].bucket
+
+
 class _BufItem(pg.GraphicsObject):
     """Base: holds a column list + tick and a cached bounding rect."""
 
@@ -234,6 +252,27 @@ class _BufItem(pg.GraphicsObject):
             return 0, 0
         xr = vb.viewRange()[0]
         return xr[0] - 1, xr[1] + 1
+
+    def _visible(self):
+        """The columns actually on screen, found by BISECTION.
+
+        `cols` is the whole ring - up to 14,400 columns for one symbol at a
+        4-hour depth - while a normal view shows about 60 of them. Scanning the
+        list and testing each bucket cost the full 14,400 every frame, per item,
+        per book: with four books open that was ~115,000 wasted iterations a
+        frame before a single pixel was drawn, and it got worse the longer the
+        session ran, which is exactly the shape of a slow leak.
+
+        Buckets increase monotonically (they are time), so the visible span is a
+        contiguous slice and bisect finds it in ~14 comparisons.
+        """
+        x_lo, x_hi = self._xrange()
+        cols = self.cols
+        if not cols or x_hi <= x_lo:
+            return (), 0.0, 0.0
+        lo = bisect.bisect_left(_BucketView(cols), x_lo)
+        hi = bisect.bisect_right(_BucketView(cols), x_hi)
+        return cols[lo:hi], x_lo, x_hi
 
 
 class BookHeatmapItem(_BufItem):
@@ -289,9 +328,11 @@ class BookHeatmapItem(_BufItem):
         if vb is None:
             return
         tick = self.tick
-        x_lo, x_hi = self._xrange()
-
-        vis = [c for c in self.cols if x_lo <= c.bucket <= x_hi and c.book]
+        # Bisect to the on-screen span first: this list comprehension used to
+        # test every column in the ring - up to 14,400 - to keep the ~60 that
+        # are visible, on every frame, for every book.
+        span, x_lo, x_hi = self._visible()
+        vis = [c for c in span if c.book]
         if not vis:
             return
 
@@ -447,17 +488,17 @@ class BBOItem(_BufItem):
             return
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         tick = self.tick
-        x_lo, x_hi = self._xrange()
+        vis, x_lo, x_hi = self._visible()
+        if not vis:
+            return
         # Width 2: the bid/ask pair has to read as a spread *channel* over a
         # bright heatmap, and a hairline disappears against white/amber walls.
         for side, color in (("bid_ti", BID_LINE), ("ask_ti", ASK_LINE)):
             p.setPen(pg.mkPen(color, width=2))
             prev = None
-            for c in self.cols:
-                if not (x_lo <= c.bucket <= x_hi):
-                    prev = None
-                    continue
-                ti = getattr(c, side)
+            is_bid = side == "bid_ti"
+            for c in vis:
+                ti = c.bid_ti if is_bid else c.ask_ti
                 if ti is None:
                     prev = None
                     continue
@@ -1050,21 +1091,44 @@ class VolumeBarsItem(_BufItem):
         self.update()
 
     def paint(self, p: QPainter, *args) -> None:
-        if not self.cols:
+        vis, _x_lo, _x_hi = self._visible()
+        if not vis:
             return
-        x_lo, x_hi = self._xrange()
         tr = p.transform()
-        for c in self.cols:
-            if not (x_lo <= c.bucket <= x_hi) or c.vol == 0:
+
+        # 1. Colour comes from the column's own running delta (engine-side,
+        #    one addition per print) instead of two sum() passes over the
+        #    column's whole price dict on every frame, for every visible
+        #    column, of every book.
+        # 2. The label is skipped when a column is narrower than the text it
+        #    would hold: at that width the digits overlap into a grey smear, so
+        #    dropping them is both cheaper AND more readable.
+        px_per_col = abs(tr.m11())
+        show_text = px_per_col >= 26.0
+
+        bars, colours = [], []
+        for c in vis:
+            if c.vol == 0:
                 continue
-            net = sum(c.buy.values()) - sum(c.sell.values())
-            color = BID_LINE if net >= 0 else ASK_LINE
-            p.fillRect(QRectF(c.bucket + 0.28, 0, 0.44, c.vol),
-                       QColor(color.red(), color.green(), color.blue(), 225))
+            base = BID_LINE if c.net >= 0 else ASK_LINE
+            bars.append(QRectF(c.bucket + 0.28, 0, 0.44, c.vol))
+            colours.append(QColor(base.red(), base.green(), base.blue(), 225))
+        for rect, col in zip(bars, colours):
+            p.fillRect(rect, col)
+
+        if not show_text:
+            return
+        # 3. save()/resetTransform()/setFont()/setPen() ran per column; the font
+        #    and pen are identical every time, so they are hoisted out and the
+        #    painter state is pushed once for the whole label pass.
+        p.save()
+        p.resetTransform()
+        p.setFont(self.font)
+        p.setPen(pg.mkPen("#AEB4C0"))
+        for c in vis:
+            if c.vol == 0:
+                continue
             rp = tr.map(QPointF(c.bucket + 0.5, c.vol))
-            p.save(); p.resetTransform()
-            p.setFont(self.font)
-            p.setPen(pg.mkPen("#AEB4C0"))
             p.drawText(QRectF(rp.x() - 14, rp.y() - 14, 28, 12),
                        Qt.AlignmentFlag.AlignCenter, str(c.vol))
-            p.restore()
+        p.restore()
