@@ -13,6 +13,7 @@ import time
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QPointF, QRectF
 from PyQt6.QtGui import QColor, QPainter, QFont, QPainterPath
+from .crosshair import clock_label
 
 
 class EMAItem(pg.GraphicsObject):
@@ -144,7 +145,7 @@ class CPRItem(pg.GraphicsObject):
         # (day_key, first_index, last_index, high, low, close) per session
         days: list[list] = []
         for i, b in enumerate(bars):
-            key = time.strftime("%Y-%m-%d", time.localtime(b.start_ts))
+            key = clock_label(b.start_ts, "%Y-%m-%d")
             if days and days[-1][0] == key:
                 d = days[-1]
                 d[2] = i

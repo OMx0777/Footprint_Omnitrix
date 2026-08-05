@@ -283,4 +283,8 @@ class _ClockAxis(pg.AxisItem):
     """Seconds-since-epoch -> HH:MM:SS."""
 
     def tickStrings(self, values, scale, spacing):
-        return [time.strftime("%H:%M:%S", time.localtime(v)) for v in values]
+        # Tick VALUES come from the viewport, which extends past the data
+        # whenever you pan or zoom out - localtime() then raises OSError from
+        # inside paint() and aborts the render half-drawn. Same guard as every
+        # other epoch->text conversion in the app.
+        return [clock_label(v) for v in values]

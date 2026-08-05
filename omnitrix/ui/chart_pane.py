@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .framegov import GovernedPlotWidget
+from ..render.crosshair import safe_localtime
 from ..render import (
     FootprintItem, HeatmapItem, TimeAxis, PriceAxis, Crosshair,
     EMAItem, CPRItem, ExecutionMarkersItem,
@@ -221,7 +222,9 @@ class ChartPane:
         i = int(round(x))
         if not (0 <= i < len(bars)):
             return ""
-        lt = time.localtime(bars[i].start_ts)
+        lt = safe_localtime(bars[i].start_ts)
+        if lt is None:
+            return ""
         fmt = "%H:%M:%S" if self.tf_s < 60 else "%d %b  %H:%M"
         return time.strftime(fmt, lt)
 

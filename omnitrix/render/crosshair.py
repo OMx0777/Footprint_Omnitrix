@@ -37,6 +37,20 @@ def clock_label(t: float, fmt: str = "%H:%M:%S") -> str:
         return ""
 
 
+def safe_localtime(t: float):
+    """`time.localtime()` or None, never an exception.
+
+    Same guard as clock_label, for the callers that need the struct rather than
+    a formatted string (day-boundary tests, date labels).
+    """
+    if not (0.0 < t < 32503680000.0) or t != t:
+        return None
+    try:
+        return time.localtime(t)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 BADGE_BG = "#9FB0C8"
 BADGE_FG = "#0B0E14"
 LINE_PEN = pg.mkPen("#666", style=Qt.PenStyle.DashLine)

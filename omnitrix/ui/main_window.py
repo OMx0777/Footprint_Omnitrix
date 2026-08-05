@@ -688,6 +688,18 @@ class OmnitrixWindow(QMainWindow):
             f"   padding:5px 12px; border:none; font-size:11px; }}"
             f" QTabBar::tab:selected {{ background:{t.grid};"
             f"   border-bottom:2px solid {t.bull}; }}"
+            # Chrome that Qt otherwise draws from the DEFAULT palette, which is
+            # a light blue-grey however dark the rest of the app is. The
+            # separator between the central chart and the docks, and the
+            # splitter handles between panes, were being drawn in it - that is
+            # the pale blue outline that appeared to box in the chart.
+            f" QMainWindow::separator {{ background:{t.panel};"
+            f"   width:3px; height:3px; }}"
+            f" QMainWindow::separator:hover {{ background:{t.axis}; }}"
+            f" QSplitter {{ background:{t.bg}; }}"
+            f" QSplitter::handle {{ background:{t.panel}; }}"
+            f" QSplitter::handle:hover {{ background:{t.axis}; }}"
+            f" QDockWidget > QWidget {{ background:{t.bg}; }}"
         )
         for pane in self._panes:
             for plot in (pane.price_plot, pane.cvd_plot):
@@ -1387,7 +1399,9 @@ class OmnitrixWindow(QMainWindow):
         i = int(round(x))
         if not (0 <= i < len(bars)):
             return ""
-        lt = time.localtime(bars[i].start_ts)
+        lt = safe_localtime(bars[i].start_ts)
+        if lt is None:
+            return ""
         fmt = "%H:%M:%S" if self.tf_s < 60 else "%d %b  %H:%M"
         return time.strftime(fmt, lt)
 

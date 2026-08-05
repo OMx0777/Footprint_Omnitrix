@@ -12,6 +12,7 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, QRectF
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtGui import QPainter, QColor, QFont
+from ..render.crosshair import clock_label
 
 BUY = QColor(38, 166, 154)
 SELL = QColor(239, 83, 80)
@@ -74,7 +75,7 @@ class TapeWidget(QWidget):
                 p.fillRect(QRectF(0, y, w, self.ROW_H), c)
             p.setPen(pg.mkPen(TEXT))
             p.drawText(col_time, y + 13,
-                       time.strftime("%H:%M:%S", time.localtime(x * dt)))
+                       clock_label(x * dt))
             p.setPen(pg.mkPen(base))
             p.drawText(col_price, y + 13, f"{ti * tick:.2f}")
             p.drawText(col_size, y + 13, f"{size:,}")

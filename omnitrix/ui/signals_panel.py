@@ -92,8 +92,7 @@ class SignalsPanel(QWidget):
             p.setPen(DIM)
             p.drawText(QRectF(0, y, w - 8, self.ROW_H),
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                       time.strftime("%H:%M:%S",
-                                     time.localtime(ev["bucket"] * dt)))
+                       clock_label(ev["bucket"] * dt))
             y += self.ROW_H
             if y > self.height():
                 break

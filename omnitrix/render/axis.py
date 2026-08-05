@@ -26,6 +26,8 @@ import time
 import pyqtgraph as pg
 from PyQt6.QtGui import QFontMetrics
 
+from .crosshair import safe_localtime
+
 # Round wall-clock spacings, in seconds. A tick lands on a multiple of one of
 # these, so labels read 09:30, 09:35, 09:40 rather than drifting with the pan.
 _NICE_S = (1, 2, 5, 10, 15, 30,
@@ -169,14 +171,23 @@ class TimeAxis(pg.AxisItem):
         secs = self._show_seconds()
         out = []
         for v in values:
+            # int(round(v)) raises OverflowError on the infinities a zoomed-out
+            # viewport can hand us, BEFORE any range test can reject them - so
+            # the value is screened while it is still a float.
+            if not (-1e9 < v < 1e9) or v != v:
+                out.append("")
+                continue
             i = int(round(v))
             if not (0 <= i < n):
                 out.append("")
                 continue
-            lt = time.localtime(bars[i].start_ts)
+            lt = safe_localtime(bars[i].start_ts)
+            if lt is None:
+                out.append("")
+                continue
             prev = self._ts(i - 1)
-            new_day = (prev is None
-                       or time.localtime(prev).tm_yday != lt.tm_yday)
+            prev_lt = safe_localtime(prev) if prev is not None else None
+            new_day = prev_lt is None or prev_lt.tm_yday != lt.tm_yday
             if new_day:
                 # Session boundary: name the day instead of repeating 00:00.
                 out.append(time.strftime("%d %b", lt))

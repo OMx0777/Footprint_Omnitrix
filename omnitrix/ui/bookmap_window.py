@@ -829,7 +829,7 @@ class BookmapWindow(QMainWindow):
         latest = cols[-1] if cols else None
 
         secs = x * self.buffer.col_dt * self.agg
-        when = time.strftime("%H:%M:%S", time.localtime(secs))
+        when = clock_label(secs)
 
         size = latest.book.get(ti, 0) if latest and latest.book else 0
         lines = [f"{price:,.{self._dp()}f}   {when}"]
@@ -1119,11 +1119,7 @@ class TimeAxisSecs(pg.AxisItem):
         smears on screen. Out-of-range ticks get an empty label instead.
         """
         dt = (self.win.buffer.col_dt * self.win.agg) if self.win else 1.0
-        out = []
-        for v in values:
-            t = v * dt
-            if 0.0 < t < 32503680000.0:          # 1970 .. year 3000
-                out.append(time.strftime("%H:%M:%S", time.localtime(t)))
-            else:
-                out.append("")
-        return out
+        # One shared guard rather than a hand-rolled range test per axis: this
+        # bug has now surfaced in four separate places, each with its own
+        # slightly different check.
+        return [clock_label(v * dt) for v in values]
