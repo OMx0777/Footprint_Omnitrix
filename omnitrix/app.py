@@ -18,7 +18,8 @@ import traceback
 
 from PyQt6.QtWidgets import QApplication
 
-from .engine.multicast_feed import MulticastFeed, check_interface
+from .engine.multicast_feed import (MulticastFeed, check_interface,
+                                    pick_interface)
 from .engine import (Instruments, SyntheticFeed, PipeFeed, NetworkFeed,
                      Recorder, ReplayFeed)
 from .ui import OmnitrixWindow
@@ -83,7 +84,7 @@ def main() -> int:
                     default=os.environ.get("OMNITRIX_REPLAY", ""),
                     help="replay server for history and gap recovery "
                          "(default: the multicast server, port 9998)")
-    ap.add_argument("--iface", default=os.environ.get("OMNITRIX_MCAST_IF", "0.0.0.0"),
+    ap.add_argument("--iface", default=os.environ.get("OMNITRIX_MCAST_IF", ""),
                     help="LAN address to join the group on. REQUIRED on a "
                          "machine with virtual adapters (Hyper-V/WSL/VMware), "
                          "where the OS may otherwise pick one no desk is on")
@@ -117,14 +118,18 @@ def main() -> int:
             print("[omnitrix] WARNING: no --replay-host; a lost datagram will "
                   "discard book state instead of being repaired, and the "
                   "chart will open with no history")
-        feed = MulticastFeed(group=group, port=gport, iface=args.iface,
+        iface = args.iface or pick_interface(rhost)
+        if not args.iface and iface != "0.0.0.0":
+            print(f"[omnitrix] interface {iface} chosen automatically "
+                  f"(same subnet as {rhost}); override with --iface")
+        feed = MulticastFeed(group=group, port=gport, iface=iface,
                              replay_host=rhost, replay_port=rport,
                              symbols=syms or None)
-        warn = check_interface(args.iface)
+        warn = check_interface(iface)
         if warn:
             print(f"[omnitrix] WARNING: {warn}")
         print(f"[omnitrix] MULTICAST mode — group {group}:{gport} via "
-              f"{args.iface}" + (f", replay {rhost}:{rport}" if rhost else ""))
+              f"{iface}" + (f", replay {rhost}:{rport}" if rhost else ""))
     elif args.network:
         host, _, port_s = args.network.partition(":")
         port = int(port_s) if port_s else 9999

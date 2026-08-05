@@ -56,6 +56,32 @@ def local_interfaces() -> list[str]:
     return sorted(ips)
 
 
+def pick_interface(peer_ip: str) -> str:
+    """The local address on the same subnet as `peer_ip`, or 0.0.0.0.
+
+    Rolling out to 100 desks by hand-editing an interface address on each one
+    is a hundred chances to get it wrong, and getting it wrong produces a chart
+    that silently never updates. The server's address is already known, and the
+    right interface is simply the local one that can reach it - so derive it.
+
+    Matching on the first three octets is a /24 test, which is narrower than
+    this site's actual /23. That is deliberate: a wrong match here sends the
+    join out the wrong adapter, so the test errs toward returning 0.0.0.0 and
+    letting the OS decide rather than confidently choosing something bogus.
+    Virtual adapters (172.x from Hyper-V and WSL) never match a 192.168.x
+    server, which is exactly the case this exists to disarm.
+    """
+    if not peer_ip:
+        return "0.0.0.0"
+    want = peer_ip.rsplit(".", 1)[0]
+    for ip in local_interfaces():
+        if ip.startswith("127."):
+            continue
+        if ip.rsplit(".", 1)[0] == want:
+            return ip
+    return "0.0.0.0"
+
+
 def check_interface(iface: str) -> str:
     """Warn about the two interface mistakes that produce a silent dead feed.
 
