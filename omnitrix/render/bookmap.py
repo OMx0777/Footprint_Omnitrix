@@ -12,6 +12,7 @@ x = absolute column bucket (from the buffer), y = price.
 from __future__ import annotations
 
 import bisect
+from itertools import chain
 
 import math
 import numpy as np
@@ -524,6 +525,85 @@ _TRADE_SCAN_SLACK = 8.0
 # _TapeItem._cells for the measurement behind it.
 REBUILD_MARGIN_FRAC = 0.02
 
+_EMPTY_I64 = np.zeros(0, dtype=np.int64)
+_NO_CELLS = (_EMPTY_I64, _EMPTY_I64, _EMPTY_I64)
+
+
+def _unpack(keys):
+    """Packed key array -> (time bin, price bucket), both int64.
+
+    The bucket occupies the low 32 bits as two's complement, so the cast to
+    int32 is what restores a negative bucket - masking alone would read one as
+    a large positive number and draw the bubble four billion ticks away.
+    """
+    return (keys >> 32).astype(np.int64), (keys & 0xFFFFFFFF).astype(np.int32)
+
+
+def _left_edge(tx, base, cap, n, target):
+    """First logical index k with tx[k] >= target, over the wrapped ring.
+
+    Replaces a newest-first Python scan that walked up to the whole tape to
+    find the same index - measured at the 60,000 cap, 13.31 ms of a 24.19 ms
+    rebuild, spent entirely on locating a boundary.
+
+    It rests on the same assumption the scan did: the tape is in arrival
+    order, so x is non-decreasing, which is why stopping at the first entry
+    below the edge was correct in the first place. Two searches because the
+    ring wraps - the logical sequence is tx[base:cap] then tx[0:base] - and
+    numpy will not search across that seam for us.
+    """
+    if n <= 0:
+        return 0
+    tail = cap - base                    # entries before the wrap
+    if n <= tail:
+        return int(np.searchsorted(tx[base:base + n], target, "left"))
+    i = int(np.searchsorted(tx[base:cap], target, "left"))
+    if i < tail:
+        return i
+    return tail + int(np.searchsorted(tx[0:n - tail], target, "left"))
+
+
+def _merge_pending(keys, buys, sells, pending, lo_bin, hi_bin):
+    """Fold the small live-trade dict into the sorted rebuild arrays.
+
+    NEVER MUTATES ITS INPUTS. They are the cache; a frame that added its
+    pending volume into them in place would add it again on the next frame,
+    which is the doubling bug this file has already been bitten by once.
+    """
+    n = len(pending)
+    pk = np.fromiter(pending.keys(), dtype=np.int64, count=n)
+    flat = np.fromiter(chain.from_iterable(pending.values()),
+                       dtype=np.int64, count=2 * n)
+    pb, ps = flat[0::2], flat[1::2]
+    if lo_bin is not None:
+        xb = pk >> 32
+        m = (xb >= lo_bin) & (xb <= hi_bin)
+        if not m.all():
+            pk, pb, ps = pk[m], pb[m], ps[m]
+    if pk.size == 0:
+        return keys, buys, sells
+
+    miss = np.ones(pk.size, dtype=bool)
+    if keys.size:
+        # The rebuild arrays are sorted, so locating every pending bin is one
+        # binary search rather than a scan. A pending key is unique (it came
+        # out of a dict), so the scatter-add below cannot collide with itself.
+        pos = np.minimum(np.searchsorted(keys, pk), keys.size - 1)
+        hit = keys[pos] == pk
+        if hit.any():
+            buys, sells = buys.copy(), sells.copy()
+            at = pos[hit]
+            buys[at] += pb[hit]
+            sells[at] += ps[hit]
+            miss = ~hit
+    if miss.any():
+        keys = np.concatenate((keys, pk[miss]))
+        buys = np.concatenate((buys, pb[miss]))
+        sells = np.concatenate((sells, ps[miss]))
+        o = np.argsort(keys, kind="stable")
+        keys, buys, sells = keys[o], buys[o], sells[o]
+    return keys, buys, sells
+
 
 class _TapeItem(_BufItem):
     """Shared base for the three trade overlays (bubbles / pies / split bars).
@@ -556,8 +636,33 @@ class _TapeItem(_BufItem):
         self.drawn: list[tuple] = []
         self.setZValue(0)
 
-    def _cells(self) -> dict:
-        """(x_bin, price_bucket) -> [buy, sell] over the VISIBLE tape.
+    # Pending folds are absorbed into the sorted arrays once there are this
+    # many. It bounds the per-frame merge, which is O(P log N) in the pending
+    # count - and P only grows between rebuilds, so left alone it would grow
+    # until the next one.
+    MERGE_PENDING = 2048
+
+    def _grouped(self):
+        """(keys, buys, sells) as sorted int64 arrays over the VISIBLE tape.
+
+        `keys` packs (time bin << 32 | price bucket), so sorting by key sorts
+        by time bin first and a time range is therefore one contiguous slice.
+
+        WHY ARRAYS AND NOT A DICT. This used to return
+        {(x_bin, bucket): [buy, sell]}, and measured on a full 60,000-print
+        tape zoomed out - 45,315 bins:
+
+            building the dict after the vectorised grouping   29.1 ms
+            _binned walking it, on EVERY frame                54.2 ms
+
+        The second number is the one that mattered. The rebuild is periodic,
+        but _binned runs on every paint, and 54 ms against an 80 ms timer is
+        two thirds of the budget spent iterating 45,000 Python tuples to throw
+        away 99% of them - `max_cells` is 320.
+
+        Arrays make both stages vectorised: the filter is a mask, the top-320
+        is an argpartition, and a Python-level tuple exists only for the 320
+        bubbles that are actually drawn.
 
         INCREMENTAL. Re-binning every visible print on every frame was ~49% of
         the bubble overlay's cost and the single largest item on a busy desk:
@@ -592,10 +697,10 @@ class _TapeItem(_BufItem):
         buf = self.buffer
         if buf is None or buf.trade_count == 0:
             self._cache = None
-            return {}
+            return _NO_CELLS
         x_lo, x_hi = self._xrange()
         if x_hi <= x_lo:
-            return {}
+            return _NO_CELLS
         xs = self.xscale
         # BIN AT THE RESOLUTION THE SCREEN CAN SHOW, not finer.
         #
@@ -657,18 +762,11 @@ class _TapeItem(_BufItem):
         )
 
         if reusable:
-            cells = c["cells"]
             start = c["consumed"] - first_abs
         else:
-            cells = {}
-            # Rebuild scans newest-first and stops at the left edge, so a cold
-            # cache costs exactly what the old unconditional pass did - never
-            # the whole 60k tape.
-            start = n
-            for k in range(n - 1, -1, -1):
-                if tx[(base + k) % cap] * xs < fold_lo:
-                    break
-                start = k
+            # Rebuild starts at the left edge, so a cold cache folds the view
+            # and not the whole 60k tape.
+            start = _left_edge(tx, base, cap, n, fold_lo / xs) if xs > 0 else 0
             # NEVER FOLD THE OLDEST SLIVER OF THE TAPE. This is what actually
             # fixes the two-hour freeze, and it is a scheduling fix rather than
             # a speed one.
@@ -722,16 +820,18 @@ class _TapeItem(_BufItem):
                 uniq, inv_idx = np.unique(keys, return_inverse=True)
                 bs = np.bincount(inv_idx, weights=b_arr).astype(np.int64)
                 ss = np.bincount(inv_idx, weights=s_arr).astype(np.int64)
-                u_xb = (uniq >> 32).astype(np.int64)
-                u_tb = (uniq & 0xFFFFFFFF).astype(np.int32).astype(np.int64)
-                # .tolist() once, then build the dict in C. Indexing numpy
-                # scalars in a Python loop and calling int() on each - four per
-                # bin - was 31.5 ms for 46,000 bins against 18.1 ms this way,
-                # and the loop is the 97% of the rebuild that the vectorised
-                # grouping does not touch.
-                cells = dict(zip(zip(u_xb.tolist(), u_tb.tolist()),
-                                 map(list, zip(bs.tolist(), ss.tolist()))))
-            c = self._cache = {"sig": sig, "cells": cells, "lo_x": fold_lo,
+                # np.unique returns `uniq` sorted, which _grouped's callers
+                # rely on for both the visible-range slice and the pending
+                # merge. Nothing below may reorder it.
+            else:
+                uniq, bs, ss = _EMPTY_I64, _EMPTY_I64, _EMPTY_I64
+            # `pending` carries the prints folded one at a time since this
+            # rebuild. Keeping them separate is what lets the rebuild output
+            # stay a sorted array: a scalar insert into a sorted array is O(N),
+            # while a dict of a few hundred live trades merges back in one
+            # searchsorted.
+            c = self._cache = {"sig": sig, "keys": uniq, "buys": bs,
+                               "sells": ss, "pending": {}, "lo_x": fold_lo,
                                "fold_start": first_abs + start,
                                "consumed": first_abs + n}
             # The vectorised pass has already folded start..n. The incremental
@@ -740,16 +840,17 @@ class _TapeItem(_BufItem):
             # exactly double, which the exactness oracle caught immediately.
             start = n
 
+        pending = c["pending"]
         for k in range(start, n):
             p = (base + k) % cap
             x = tx[p]
             ti = int(tti[p])
             size = int(tsz[p])
             aggr = _AG_FROM[tag[p]]
-            key = (int(math.floor(x * inv)), ti // rt)
-            e = cells.get(key)
+            key = (int(math.floor(x * inv)) << 32) | ((ti // rt) & 0xFFFFFFFF)
+            e = pending.get(key)
             if e is None:
-                e = cells[key] = [0, 0]
+                e = pending[key] = [0, 0]
             # THE one split (model.split_size). This used to be
             # `if sell: ... else: buy`, which counted every UNKNOWN print as
             # 100% buying - so a bubble was green whenever the print could not
@@ -761,45 +862,81 @@ class _TapeItem(_BufItem):
             e[1] += sl
         c["consumed"] = total
 
+        if len(pending) >= self.MERGE_PENDING:
+            c["keys"], c["buys"], c["sells"] = _merge_pending(
+                c["keys"], c["buys"], c["sells"], pending, None, None)
+            pending = c["pending"] = {}
+
+        keys, buys, sells = c["keys"], c["buys"], c["sells"]
         # The fold covers [lo_x, live edge]; the caller may be looking at less
         # than that, so the visible subset is selected here. Bin -> x is exact
         # (the key IS floor(x / bin_cols)), so this filter is the same one the
-        # old per-trade scan applied.
-        span = self.bin_cols * xs
-        lo_bin = math.floor((x_lo / xs) * inv) - 1
-        hi_bin = math.floor((x_hi / xs) * inv) + 1
-        if span <= 0:
-            return dict(cells)
-        return {k: v for k, v in cells.items() if lo_bin <= k[0] <= hi_bin}
+        # old per-trade scan applied - but on sorted keys it is a slice rather
+        # than a test per bin, because the time bin is in the HIGH bits.
+        lo_bin = hi_bin = None
+        if self.bin_cols * xs > 0:
+            lo_bin = math.floor((x_lo / xs) * inv) - 1
+            hi_bin = math.floor((x_hi / xs) * inv) + 1
+            i0 = int(np.searchsorted(keys, lo_bin << 32, "left"))
+            i1 = int(np.searchsorted(keys, (hi_bin + 1) << 32, "left"))
+            keys, buys, sells = keys[i0:i1], buys[i0:i1], sells[i0:i1]
+        if not pending:
+            return keys, buys, sells
+        return _merge_pending(keys, buys, sells, pending, lo_bin, hi_bin)
+
+    def _cells(self) -> dict:
+        """_grouped as {(x_bin, price_bucket): [buy, sell]}.
+
+        The old shape of the hot path, kept because the exactness tests compare
+        against it bin by bin (tests/tape_ring.py, tests/tape_cache.py,
+        tests/freeze_2h.py) and a dict is what an oracle built from a plain
+        Python loop can be compared to directly. Nothing that paints calls it -
+        materialising 45,000 entries is the cost the refactor removed.
+        """
+        keys, buys, sells = self._grouped()
+        if not keys.size:
+            return {}
+        xb, tb = _unpack(keys)
+        return dict(zip(zip(xb.tolist(), tb.tolist()),
+                        map(list, zip(buys.tolist(), sells.tolist()))))
 
     def _binned(self) -> list[tuple]:
         """[(x_display, price, buy, sell, total)] largest last, capped."""
-        cells = self._cells()
-        if not cells:
+        keys, buys, sells = self._grouped()
+        if not keys.size:
             return []
-        rt = max(1, int(self.row_ticks))
-        # The SAME effective bin _cells used, or every bubble is drawn at the
-        # wrong x - the key is floor(x / bin), so the inverse needs the same
-        # divisor.
-        bc, xs, tick = self._eff_bin, self.xscale, self.tick
-        out = []
-        for (xb, tb), (b, s) in cells.items():
-            tot = b + s
-            if tot < self.min_size or tot <= 0:
-                continue
-            x = (xb + 0.5) * bc * xs                 # centre of the time bin
-            price = (tb + 0.5) * rt * tick           # centre of the price bucket
-            out.append((x, price, b, s, tot))
-        if not out:
+        tot = buys + sells
+        keep = (tot >= self.min_size) & (tot > 0)
+        if not keep.all():
+            keys, buys, sells, tot = keys[keep], buys[keep], sells[keep], tot[keep]
+        n = tot.size
+        if n == 0:
             return []
-        out.sort(key=lambda t: t[4])                 # big drawn last / on top
-        if len(out) > self.max_cells:
+        if n > self.max_cells:
             # A dense tape yields well over a thousand cells in view. Drawing
             # them all is both the frame cost and a wall of tiny circles that
             # buries the prints worth seeing - keep the largest. The size scale
             # comes from what survives, so those still read against each other.
-            out = out[-self.max_cells:]
-        return out
+            #
+            # argpartition, not a sort: selecting the top 320 of 45,000 is
+            # O(n), and only those 320 are then ordered. Where several bins tie
+            # exactly on the cut, which one survives is arbitrary but
+            # deterministic - it was arbitrary before too, decided by dict
+            # insertion order.
+            sel = np.argpartition(tot, n - self.max_cells)[n - self.max_cells:]
+            keys, buys, sells, tot = keys[sel], buys[sel], sells[sel], tot[sel]
+        o = np.argsort(tot, kind="stable")           # big drawn last / on top
+        keys, buys, sells, tot = keys[o], buys[o], sells[o], tot[o]
+        rt = max(1, int(self.row_ticks))
+        # The SAME effective bin _grouped used, or every bubble is drawn at the
+        # wrong x - the key is floor(x / bin), so the inverse needs the same
+        # divisor.
+        bc, xs, tick = self._eff_bin, self.xscale, self.tick
+        xb, tb = _unpack(keys)
+        xv = (xb + 0.5) * (bc * xs)                  # centre of the time bin
+        pv = (tb + 0.5) * (rt * tick)                # centre of the price bucket
+        return list(zip(xv.tolist(), pv.tolist(),
+                        buys.tolist(), sells.tolist(), tot.tolist()))
 
 
 class BubbleItem(_TapeItem):
@@ -1090,28 +1227,32 @@ class PieItem(_TapeItem):
 
     def _by_bin(self) -> list[tuple]:
         """Collapse the price dimension: one entry per time bin, at its VWAP."""
-        cells = self._cells()
-        if not cells:
+        keys, buys, sells = self._grouped()
+        if not keys.size:
             return []
         rt = max(1, int(self.row_ticks))
-        bins: dict[int, list] = {}          # xb -> [buy, sell, price*vol]
-        for (xb, tb), (b, s) in cells.items():
-            price = (tb + 0.5) * rt * self.tick
-            e = bins.get(xb)
-            if e is None:
-                e = bins[xb] = [0, 0, 0.0]
-            e[0] += b; e[1] += s; e[2] += price * (b + s)
-        out = []
-        for xb, (b, s, pv) in bins.items():
-            tot = b + s
-            if tot < self.min_size or tot <= 0:
-                continue
-            x = (xb + 0.5) * self.bin_cols * self.xscale
-            out.append((x, pv / tot, b, s, tot))
-        out.sort(key=lambda t: t[4])
-        if len(out) > self.max_cells:
-            out = out[-self.max_cells:]
-        return out
+        xb, tb = _unpack(keys)
+        price = (tb + 0.5) * (rt * self.tick)
+        u, iv = np.unique(xb, return_inverse=True)
+        m = u.size
+        b = np.bincount(iv, weights=buys, minlength=m).astype(np.int64)
+        s = np.bincount(iv, weights=sells, minlength=m).astype(np.int64)
+        pv = np.bincount(iv, weights=price * (buys + sells), minlength=m)
+        tot = b + s
+        keep = (tot >= self.min_size) & (tot > 0)
+        if not keep.all():
+            u, b, s, pv, tot = u[keep], b[keep], s[keep], pv[keep], tot[keep]
+        n = tot.size
+        if n == 0:
+            return []
+        if n > self.max_cells:
+            sel = np.argpartition(tot, n - self.max_cells)[n - self.max_cells:]
+            u, b, s, pv, tot = u[sel], b[sel], s[sel], pv[sel], tot[sel]
+        o = np.argsort(tot, kind="stable")
+        u, b, s, pv, tot = u[o], b[o], s[o], pv[o], tot[o]
+        x = (u + 0.5) * (self.bin_cols * self.xscale)
+        return list(zip(x.tolist(), (pv / tot).tolist(),
+                        b.tolist(), s.tolist(), tot.tolist()))
 
     def paint(self, p: QPainter, *args) -> None:
         data = self._by_bin()

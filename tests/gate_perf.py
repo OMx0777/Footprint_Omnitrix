@@ -49,7 +49,27 @@ MAX_GROWTH = 1.6
 # Below this a measurement is timer noise, not a cost. Ratios there are
 # meaningless - three attribute reads "grew 2.2x" from 0.0001 to 0.0002 ms -
 # and a consumer this cheap cannot cause lag whatever its ratio does.
-NOISE_FLOOR_MS = 0.05
+#
+# It was 0.05 ms, which was too low for its own argument and made this gate cry
+# wolf. Measured on an idle machine, back to back, with NO code change between
+# runs:
+#
+#     BarSeries.view(1m)   0.11 -> 0.19 (1.7x)   0.06 -> 0.05 (0.8x)
+#                          0.09 -> 0.15 (1.6x)   0.05 -> 0.04 (0.8x)
+#     profile.analytics    0.43 -> 0.56 (1.3x)   0.37 -> 0.74 (2.0x)
+#                          0.33 -> 0.67 (2.0x)
+#
+# so a sub-millisecond consumer crosses MAX_GROWTH on scheduler jitter about
+# half the time, and the gate prints DO NOT SHIP over 0.4 ms. A gate that fails
+# at random teaches people to re-run it until it is green, which is the same as
+# not having it.
+#
+# 1 ms is where the ratio starts meaning something: every consumer here runs on
+# a timer of 250 ms or slower, so 1 ms is under 0.4% of a core and cannot be
+# felt. Nothing is weakened by this - a consumer that genuinely runs away
+# crosses the floor and is caught by the ratio test on the way past, and
+# total_cpu below still bounds all of them together whatever their ratios do.
+NOISE_FLOOR_MS = 1.0
 
 def _machine_factor() -> float:
     """How much slower this machine is RIGHT NOW than the reference.
@@ -165,8 +185,8 @@ for name, by_h in sorted(rows.items()):
     cpu = long / (periods[name] * 1000) * 100
     total_cpu += cpu
     if max(short, long) < NOISE_FLOOR_MS:
-        g.check(True, f"{name:<20} {long:7.3f} ms - below the noise floor, "
-                      f"ratio not meaningful")
+        g.check(True, f"{name:<20} {long:7.3f} ms ({cpu:4.1f}% of a core) - "
+                      f"below the noise floor, ratio not meaningful")
         continue
     g.check(ratio <= MAX_GROWTH,
             f"{name:<20} {short:7.2f} -> {long:7.2f} ms  ({ratio:4.1f}x, "

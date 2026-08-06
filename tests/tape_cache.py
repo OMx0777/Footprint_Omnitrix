@@ -272,6 +272,18 @@ check("a bin reports the same volume from every scroll position",
       len(readings) == 1, f"{len(readings)} different readings: {list(readings)[:3]}")
 
 # ---- 11. the cache cannot grow with uptime --------------------------------
+def _bins(it):
+    """Bins held by the cache: the sorted arrays plus the unmerged live folds.
+
+    Counts them separately because they ARE separate - the rebuild produces
+    sorted arrays and live prints land in a small dict until there are enough
+    to be worth merging. A bin can be in both, so this over-counts slightly,
+    which is the safe direction for a bound.
+    """
+    c = it._cache
+    return (c["keys"].size + len(c["pending"])) if c else 0
+
+
 item.buffer = buf
 sizes = []
 for i in range(120):
@@ -280,7 +292,7 @@ for i in range(120):
     vb.rng = (hi - 60, hi)
     item.cols = buf.view(1)
     item._cells()
-    sizes.append(len(item._cache["cells"]) if item._cache else 0)
+    sizes.append(_bins(item))
 check("the cache stays bounded as the session runs",
       max(sizes) < 20000 and sizes[-1] <= max(sizes),
       f"peak {max(sizes)} bins, final {sizes[-1]}")

@@ -52,7 +52,12 @@ item = BubbleItem(0.01, buf)
 def frame(view):
     item.cols = buf.view(1)
     item.getViewBox = lambda: VB(view)
-    t=time.perf_counter(); item._cells(); return (time.perf_counter()-t)*1000
+    # _binned, not _cells. _binned is what paint() calls, so it is the whole
+    # per-frame cost - the incremental fold, the cache decision AND turning
+    # the result into bubbles. _cells still exists as the dict oracle the
+    # exactness checks below compare against, but nothing paints through it,
+    # and timing it would be measuring a path the user never waits on.
+    t=time.perf_counter(); item._binned(); return (time.perf_counter()-t)*1000
 
 print(f"tape cap {CAP:,} at ~8 trades/s = {CAP/8/3600:.2f} hours to fill")
 for phase, target in (("HALF full", CAP//2), ("FULL", CAP), ("wrapped +2000", CAP+2000)):
@@ -67,11 +72,11 @@ for phase, target in (("HALF full", CAP//2), ("FULL", CAP), ("wrapped +2000", CA
         rebuilds = 0
         for _ in range(8):
             add(80)                                  # ~10 s of trades
-            prev = id(item._cache["cells"]) if item._cache else 0
+            prev = id(item._cache["keys"]) if item._cache else 0
             hi2 = buf.trades[-1][0]
             v = (view[0], hi2 + 2) if view[1] > 1e9 else view
             ts.append(frame(v))
-            if item._cache and id(item._cache["cells"]) != prev:
+            if item._cache and id(item._cache["keys"]) != prev:
                 rebuilds += 1
         print(f"  {phase:14s} {label:28s} {sum(ts)/len(ts):7.2f} ms/frame   "
               f"rebuilt {rebuilds}/8 frames")
@@ -88,11 +93,11 @@ rebuilds = 0
 times = []
 for _ in range(24):
     add(80)
-    prev = id(item._cache["cells"]) if item._cache else 0
+    prev = id(item._cache["keys"]) if item._cache else 0
     t = frame((view[0], buf.trades[-1][0] + 2))
     times.append(t)
     worst = max(worst, t)
-    if item._cache and id(item._cache["cells"]) != prev:
+    if item._cache and id(item._cache["keys"]) != prev:
         rebuilds += 1
 
 times.sort()
@@ -111,16 +116,25 @@ else:
 
 # The steady state is what the user feels; a rebuild is one hitch every
 # REBUILD_MARGIN_FRAC of a tape, roughly every 2.5 minutes at 8 prints/sec.
-if median > 20.0:
+if median > 12.0:
     print(f"  FAIL  median frame {median:.1f} ms - the steady state is slow")
     ok = False
 else:
     print(f"  PASS  median frame {median:.1f} ms against an 80 ms timer")
 
-print(f"  INFO  worst frame {worst:.1f} ms - that is the rare full rebuild, "
-      f"one dropped frame per ~{int(60000*0.02)} prints. Making the rebuild "
-      f"itself cheaper is a separate job: it folds ~46,000 bins of which "
-      f"_binned draws 320.")
+# The worst frame is the rare full rebuild - one per ~1200 prints, about every
+# 2.5 minutes at 8 prints/sec. It used to be 54.9 ms, so it dropped a frame
+# every time; a bisected left edge and a rebuild that stops at sorted arrays
+# instead of building a 46,000-entry dict put it under the timer, which means
+# there is no longer a visible hitch at all. Asserted, not merely reported:
+# regressing it back over the timer is exactly the stutter that was fixed.
+if worst > 80.0:
+    print(f"  FAIL  worst frame {worst:.1f} ms exceeds the 80 ms timer - the "
+          f"rebuild drops a frame again")
+    ok = False
+else:
+    print(f"  PASS  worst frame {worst:.1f} ms - the periodic rebuild fits "
+          f"inside the 80 ms timer, so it costs no dropped frame")
 print()
 print("FREEZE REGRESSION OK" if ok else "FREEZE REGRESSION FAILED")
 sys.exit(0 if ok else 1)
