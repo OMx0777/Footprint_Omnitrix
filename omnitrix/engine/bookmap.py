@@ -44,6 +44,20 @@ TAPE_SEED = 2048
 # symbol shows immediate context rather than an empty chart, at about a ninth
 # of the full 1400-column retention.
 COLD_COLS = 150
+# Tape ceiling for a symbol nothing is drawing.
+#
+# Growing on demand fixed the symbol that never prints; it does nothing for the
+# symbol that prints constantly and is simply not on screen, which grows to the
+# full 60,000 and 1.02 MB. Across a thousand active symbols that is the last
+# unbounded gigabyte.
+#
+# 8,192 is chosen to match what a cold symbol keeps elsewhere rather than
+# picked round: COLD_COLS is 150 seconds of columns, and at the ~50 prints a
+# second a busy name sustains, 8,192 prints is about the same 150 seconds. The
+# two cold windows therefore describe the same span of history, which is what
+# makes "select a cold symbol and see two and a half minutes" true of the tape
+# and the heat field alike.
+TAPE_COLD = 8192
 _AG_FROM = (Aggressor.BUY, Aggressor.SELL, Aggressor.UNKNOWN)
 
 
@@ -178,7 +192,12 @@ class BookmapBuffer:
         # Eviction is unchanged: growth happens only while below the ceiling
         # and strictly before the ring would wrap, so the retention seen by a
         # caller is still exactly deque(maxlen=tape_cap).
-        self.tape_cap = int(max_trades)
+        # tape_hot is the ceiling for a symbol on screen, tape_cold for one
+        # that is not, and tape_cap is whichever applies right now. Starts hot
+        # for the same reason the column retention does - see set_hot.
+        self.tape_hot = int(max_trades)
+        self.tape_cold = min(TAPE_COLD, self.tape_hot)
+        self.tape_cap = self.tape_hot
         self.max_trades = min(TAPE_SEED, self.tape_cap)
         self.trade_x = np.empty(self.max_trades, dtype=np.float64)
         self.trade_ti = np.empty(self.max_trades, dtype=np.int32)
@@ -276,6 +295,64 @@ class BookmapBuffer:
         self.max_trades = new
         self._tape_first = 0
 
+    def _set_tape_cap(self, cap: int) -> None:
+        """Move the tape ceiling, shrinking the ring if it is already past it."""
+        cap = max(TAPE_SEED, min(int(cap), self.tape_hot))
+        if cap == self.tape_cap:
+            return
+        self.tape_cap = cap
+        if self.max_trades > cap:
+            self._shrink_tape(cap)
+
+    def _shrink_tape(self, new_cap: int) -> None:
+        """Drop the oldest prints and rehouse the rest in a smaller ring.
+
+        THE RING INVARIANTS HAVE TO SURVIVE THIS, and getting them wrong is
+        not a crash - it is bubbles drawn at the wrong prices, which is the
+        failure this file cares about most. Two of them:
+
+          * logical index 0 is the OLDEST retained print, and TapeView reads
+            it at (_tape_first + i) % max_trades;
+          * add_trade writes at trade_count % max_trades, and once the ring is
+            full that slot must be exactly where the oldest print sits, so the
+            next write evicts it.
+
+        The second is why the survivors cannot simply be packed at slot 0.
+        trade_count keeps counting across the shrink - it is a session total
+        and deliberately does not reset - so the head lands wherever
+        trade_count % new_cap falls, and the data must be laid out around THAT
+        rather than the other way round.
+
+        Allocating once per demotion, not per print: a demotion follows a user
+        action, so this is rare, and doing it in place would leave the old
+        arrays alive anyway.
+        """
+        old_cap = self.max_trades
+        n_have = self.trade_count if self.trade_count < old_cap else old_cap
+        keep = min(n_have, new_cap)
+        if self.trade_count >= new_cap:
+            first = self.trade_count % new_cap     # == the write head: full ring
+        else:
+            first = 0
+        src = (self._tape_first
+               + np.arange(n_have - keep, n_have, dtype=np.int64)) % old_cap
+        dst = (first + np.arange(keep, dtype=np.int64)) % new_cap
+
+        def _move(a, dtype):
+            b = np.empty(new_cap, dtype=dtype)
+            if keep:
+                b[dst] = a[src]
+            return b
+
+        self.trade_x = _move(self.trade_x, np.float64)
+        self.trade_ti = _move(self.trade_ti, np.int32)
+        self.trade_sz = _move(self.trade_sz, np.int32)
+        self.trade_ag = _move(self.trade_ag, np.uint8)
+        self.max_trades = new_cap
+        self._tape_first = first
+        # Every renderer cache keyed on the tape describes prints that are gone.
+        self._all_cache = None
+
     def set_hot(self, hot: bool) -> None:
         """How much per-column history this symbol is worth keeping.
 
@@ -296,6 +373,7 @@ class BookmapBuffer:
         demotion evicts on the spot rather than waiting for the next column,
         because the point is to release the memory.
         """
+        self._set_tape_cap(self.tape_hot if hot else self.tape_cold)
         want = self.hot_cols if hot else min(self.cold_cols, self.hot_cols)
         if want == self.max_cols:
             return

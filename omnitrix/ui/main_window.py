@@ -78,6 +78,13 @@ DRAIN_BUDGET_S = 0.008
 DRAIN_BUDGET_BUSY_S = 0.022
 DRAIN_BUSY_AT = 2_000            # backlog that switches to the busy budget
 
+# How many symbols may be demoted to reduced retention in one pass. Each costs
+# a tape reallocation and a column eviction - measured at 626 us, so a
+# unbounded pass over a large universe would itself drop the frame it exists to
+# protect. The queue drains over the following seconds and a symbol waiting its
+# turn is only holding memory it already held.
+MAX_DEMOTIONS_PER_SYNC = 6
+
 TF_CHOICES = {
     "5s": 5, "10s": 10, "15s": 15, "30s": 30,
     "1m": 60, "2m": 120, "3m": 180, "5m": 300,
@@ -851,12 +858,48 @@ class OmnitrixWindow(QMainWindow):
     def _sync_hot(self) -> None:
         """Apply the hot set. Cheap: set_hot returns at once when unchanged."""
         hot = self._hot_symbols()
-        for sym, buf in self.bookmaps.items():
-            buf.set_hot(sym in hot)
-        # BarSeries too, and it is the larger of the two: a sealed bar costs
-        # 3,501 B against a column's 3.2 kB, and there are 12,000 of them.
-        for sym, ser in self.series.items():
-            ser.set_hot(sym in hot)
+        # PROMOTIONS FIRST AND ALWAYS. A symbol the user just selected must be
+        # at full retention before the next frame draws it; there is no budget
+        # worth trading against that.
+        for sym in hot:
+            b = self.bookmaps.get(sym)
+            if b is not None:
+                b.set_hot(True)
+            s = self.series.get(sym)
+            if s is not None:
+                s.set_hot(True)
+
+        # DEMOTIONS ARE RATE-LIMITED. Each one reallocates a tape ring and
+        # evicts columns - measured at 626 us, which is nothing for the two or
+        # three symbols a layout change actually releases, but 120 ms if two
+        # hundred are released at once. That would be a dropped frame caused by
+        # the very work meant to prevent dropped frames.
+        #
+        # Nothing is lost by spreading them: a symbol waiting its turn is
+        # holding memory it was already holding, and the queue drains within a
+        # few seconds. This is deliberately not a full scan either - it
+        # resumes where it stopped, so the cost per call is bounded by
+        # MAX_DEMOTIONS and not by the size of the universe.
+        done = 0
+        syms = self._demote_cursor = getattr(self, "_demote_cursor", 0)
+        keys = list(self.bookmaps)
+        n = len(keys)
+        for k in range(n):
+            if done >= MAX_DEMOTIONS_PER_SYNC:
+                break
+            sym = keys[(syms + k) % n]
+            if sym in hot:
+                continue
+            buf = self.bookmaps[sym]
+            ser = self.series.get(sym)
+            changed = (buf.max_cols != buf.cold_cols
+                       or (ser is not None and ser._hot))
+            buf.set_hot(False)
+            if ser is not None:
+                ser.set_hot(False)
+            if changed:
+                done += 1
+                self._demote_cursor = (syms + k + 1) % n
 
     def _bind_pane(self, pane) -> None:
         """Point the window's chart attributes at `pane`.

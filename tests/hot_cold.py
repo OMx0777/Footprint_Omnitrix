@@ -135,6 +135,80 @@ check("the column cache is rebuilt after a demotion",
 check("aggregation still works on a demoted buffer", len(h.view(1)) > 0,
       f"{len(h.view(1))} aggregated columns")
 
+# ---- 2a. the tape CEILING follows hot/cold too -----------------------------
+# Growing on demand fixed the symbol that never prints. It does nothing for the
+# symbol that prints constantly and is simply off screen, which still grows to
+# the full 60,000 and 1.02 MB - a gigabyte across a thousand active symbols.
+#
+# Shrinking a ring is where this can go silently wrong. trade_count keeps
+# counting across the shrink, so the write head lands at trade_count % new_cap
+# and the survivors have to be laid out around THAT. Pack them at slot 0
+# instead and the next write evicts the wrong print - no crash, just a tape
+# that quietly disagrees with itself. So the check is against a deque at every
+# head alignment, not at one.
+from collections import deque
+from omnitrix.engine.bookmap import TAPE_COLD
+
+bad_align = []
+for extra in range(0, 9):                    # every residue of head % new_cap
+    t = BookmapBuffer("A", inst, max_trades=60000)
+    mirror = deque(maxlen=60000)
+    ts = 1_700_000_000_000
+    for i in range(TAPE_COLD * 2 + extra):
+        ts += 50
+        tr = Trade("A", round(400 + (i % 53) * 0.01, 2), 1 + (i % 601),
+                   (Aggressor.BUY, Aggressor.SELL, Aggressor.UNKNOWN)[i % 3], ts)
+        t.add_trade(tr)
+        mirror.append((round((tr.ts_ms / 1000.0) / t.col_dt, 9),
+                       inst.to_index("A", tr.price), tr.size, tr.aggressor))
+    t.set_hot(False)                          # <- the shrink
+    want = list(mirror)[-min(len(mirror), t.max_trades):]
+    got = list(t.trades)
+    if got != want:
+        first_bad = next((k for k in range(min(len(got), len(want)))
+                          if got[k] != want[k]), None)
+        bad_align.append((extra, len(got), len(want), first_bad))
+check("a shrunk tape reads exactly like a deque, at every head alignment",
+      not bad_align, f"{len(bad_align)} of 9 wrong: {bad_align[:2]}")
+
+t = BookmapBuffer("A2", inst, max_trades=60000)
+ts = 1_700_000_000_000
+for i in range(TAPE_COLD * 3):
+    ts += 50
+    t.add_trade(Trade("A2", 400.0 + (i % 17) * 0.01, 100, Aggressor.BUY, ts))
+big = t.trade_x.nbytes + t.trade_ti.nbytes + t.trade_sz.nbytes + t.trade_ag.nbytes
+count_before, vol_before, max_before = t.trade_count, t.trade_vol, t.trade_max
+t.set_hot(False)
+small = t.trade_x.nbytes + t.trade_ti.nbytes + t.trade_sz.nbytes + t.trade_ag.nbytes
+check("an ACTIVE but off-screen symbol releases its tape", small < big,
+      f"{big/1e3:.0f} kB -> {small/1e3:.0f} kB ({big/max(small,1):.1f}x)")
+check("session totals are NOT reset by the shrink - they cover every print "
+      "ever ingested",
+      (t.trade_count, t.trade_vol, t.trade_max) == (count_before, vol_before, max_before),
+      f"{t.trade_count:,} prints, {t.trade_vol:,} volume")
+
+# writes after a shrink must continue to evict the OLDEST, not something else
+after = deque(list(t.trades), maxlen=t.max_trades)
+for i in range(500):
+    ts += 50
+    tr = Trade("A2", 401.0 + (i % 7) * 0.01, 50, Aggressor.SELL, ts)
+    t.add_trade(tr)
+    after.append((round((tr.ts_ms / 1000.0) / t.col_dt, 9),
+                  inst.to_index("A2", tr.price), tr.size, tr.aggressor))
+check("...and it keeps evicting correctly once writing resumes",
+      list(t.trades) == list(after),
+      f"{len(list(t.trades))} vs {len(after)}")
+
+# promotion lets it grow again
+t.set_hot(True)
+check("promotion restores the full ceiling", t.tape_cap == t.tape_hot,
+      f"cap {t.tape_cap:,}")
+for i in range(TAPE_COLD + 200):
+    ts += 50
+    t.add_trade(Trade("A2", 402.0, 10, Aggressor.BUY, ts))
+check("...and the ring grows past the cold ceiling again",
+      t.max_trades > TAPE_COLD, f"{t.max_trades:,}")
+
 # ---- 2b. BarSeries: the bigger half ---------------------------------------
 # Measured per SEALED bar at 100 depth a side: 3,501 B, of which the L2 book is
 # 53.7% (1,880 B, and no two bars share one) and the footprint arrays 36.3%.
@@ -223,6 +297,12 @@ nv = win.bookmaps.get("NVDA")
 check("...and its buffer really is at full retention",
       nv is not None and nv.max_cols == nv.hot_cols,
       f"max_cols={getattr(nv, 'max_cols', None)} of {getattr(nv, 'hot_cols', None)}")
+# Demotion is rate-limited (MAX_DEMOTIONS_PER_SYNC) so a large universe cannot
+# stall a frame - drain the queue explicitly rather than relying on how many
+# ticks happened to elapse.
+from omnitrix.ui.main_window import MAX_DEMOTIONS_PER_SYNC
+for _ in range(len(SYMS) // MAX_DEMOTIONS_PER_SYNC + 3):
+    win._sync_hot()
 cold = [s for s in SYMS if s not in hot and s in win.bookmaps]
 check("symbols nothing is drawing are cold", bool(cold)
       and all(win.bookmaps[s].max_cols == COLD_COLS for s in cold),
@@ -248,6 +328,36 @@ check("selecting a symbol promotes it", win.bookmaps["Z03"].max_cols
 check("...and it still has the history it accumulated while cold",
       len(win.bookmaps["Z03"].order) > 0,
       f"{len(win.bookmaps['Z03'].order)} columns")
+
+# ---- 4. demotion must not stall a frame -----------------------------------
+# Each demotion reallocates a tape ring and evicts columns - 626 us measured -
+# so an unbounded pass over a thousand symbols would itself drop the frame it
+# exists to protect. Promotions are never deferred; only demotions are.
+for p_ in win._panes:
+    p_.symbol = ""
+win.active_symbol = "NVDA"
+for s_ in win.bookmaps.values():
+    s_.set_hot(True)
+for s_ in win.series.values():
+    s_.set_hot(True)
+win._demote_cursor = 0
+hot2 = win._hot_symbols()
+n_cold = sum(1 for x in win.bookmaps if x not in hot2)
+win._sync_hot()
+now_cold = sum(1 for x, b in win.bookmaps.items()
+               if x not in hot2 and b.max_cols == b.cold_cols)
+check("one pass demotes at most MAX_DEMOTIONS_PER_SYNC symbols",
+      now_cold <= MAX_DEMOTIONS_PER_SYNC,
+      f"{now_cold} demoted of {n_cold} eligible, limit {MAX_DEMOTIONS_PER_SYNC}")
+for _ in range(n_cold // MAX_DEMOTIONS_PER_SYNC + 3):
+    win._sync_hot()
+drained = sum(1 for x, b in win.bookmaps.items()
+              if x not in hot2 and b.max_cols == b.cold_cols)
+check("...and repeated passes drain the whole queue", drained == n_cold,
+      f"{drained} of {n_cold}")
+check("a hot symbol is never deferred - it is promoted on the same pass",
+      all(win.bookmaps[x].max_cols == win.bookmaps[x].hot_cols
+          for x in hot2 if x in win.bookmaps), f"hot={sorted(hot2)}")
 
 feed.stop()
 print()
