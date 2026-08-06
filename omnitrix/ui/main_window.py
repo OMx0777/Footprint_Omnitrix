@@ -853,6 +853,10 @@ class OmnitrixWindow(QMainWindow):
         hot = self._hot_symbols()
         for sym, buf in self.bookmaps.items():
             buf.set_hot(sym in hot)
+        # BarSeries too, and it is the larger of the two: a sealed bar costs
+        # 3,501 B against a column's 3.2 kB, and there are 12,000 of them.
+        for sym, ser in self.series.items():
+            ser.set_hot(sym in hot)
 
     def _bind_pane(self, pane) -> None:
         """Point the window's chart attributes at `pane`.

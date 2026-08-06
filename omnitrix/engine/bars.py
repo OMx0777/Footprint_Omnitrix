@@ -29,6 +29,19 @@ from .model import (Trade, Aggressor, PriceLadder, EMPTY_LADDER,
 from .instruments import Instruments
 
 
+# How far back per-bar detail is kept.
+#
+# BOOK_BARS: the L2 snapshot is only ever drawn by the footprint chart's
+# heatmap overlay, for bars ON SCREEN. 1,500 base bars is ~4 hours at the 10 s
+# base, so scrolling back stays fully painted while the other 10,500 bars stop
+# costing 1,880 B each.
+#
+# COLD_BARS: what a symbol nothing is drawing keeps. 150 bars is 25 minutes at
+# the base timeframe - enough that selecting one shows immediate context.
+BOOK_BARS = 1500
+COLD_BARS = 150
+
+
 class Bar:
     """One footprint candle over a fixed market-time window."""
 
@@ -147,6 +160,43 @@ class Bar:
                            dtype=np.int64, count=n * 2).reshape(n, 2)
         return (ti[order], vals[order, 0].astype(np.int32),
                 vals[order, 1].astype(np.int32))
+
+    def drop_book(self) -> None:
+        """Release this bar's L2 snapshot, keeping everything else.
+
+        MEASURED THE BIGGEST SINGLE ITEM IN A SEALED BAR: 1,880 B of 3,501 B,
+        53.7%, and no two bars share one - 288 distinct ladders across 288
+        sealed bars. At the 12,000-bar cap that is 22.6 GB across a thousand
+        symbols for data whose only consumer is the footprint chart's heatmap
+        overlay, which draws the bars ON SCREEN.
+
+        Nothing else in a bar depends on it: OHLC, volume, delta, the
+        footprint arrays and the cached POC/value-area are all independent.
+        """
+        self.book = EMPTY_LADDER
+
+    def drop_dense(self) -> None:
+        """Release the per-price footprint too. OHLCV and delta survive.
+
+        This is the one that loses information a user could otherwise see -
+        the bar keeps its candle, its volume and its delta, but its per-price
+        cells are gone and cannot come back. It is therefore applied ONLY to
+        bars far behind the screen on symbols nothing is drawing, and it is
+        NOT undone by promotion: a symbol brought back to the foreground has
+        full detail from that moment on and stripped bars behind it.
+
+        arrays() already returns empty arrays when both forms are absent, and
+        _analytics() was computed and cached at seal(), so a stripped bar
+        answers every question it could answer before except "what traded at
+        each price".
+        """
+        self.drop_book()
+        self.cells = None
+        self._ti = None
+        self._sell = None
+        self._buy = None
+        self._imb = None
+        self._agg = None
 
     def n_levels(self) -> int:
         return int(self._ti.size) if self._ti is not None else len(self.cells or ())
@@ -324,6 +374,10 @@ class BarSeries:
                  base_tf_s: int = 10, max_bars: int = 12000):
         self.symbol = symbol
         self.instruments = instruments
+        # Starts HOT and the window demotes - see set_hot. The data-truth gate
+        # rejected the other way round for BookmapBuffer and the reasoning is
+        # identical: a bare series must retain what every consumer expects.
+        self._hot = True
         self.base_tf_s = base_tf_s
         self.max_bars = max_bars
         self.bars: list[Bar] = []
@@ -401,10 +455,58 @@ class BarSeries:
                 old = self.bars.pop(0)
                 self._bar_by_ts.pop(old.start_ts, None)
                 self._evicted += 1        # invalidates every cached prefix
+            self._prune_dense()
 
         self.bars[-1].add(tr.price, ti, tr.size, tr.aggressor)
         self._stat_trade(tr)
         self._touch(bucket)
+        self._version += 1
+
+    def _prune_dense(self) -> None:
+        """Release detail from the bar that just fell out of the keep window.
+
+        O(1) per sealed bar, deliberately. Sweeping the list would be O(bars)
+        on every bar close, which at the 12,000-bar cap is exactly the kind of
+        work-that-grows-with-uptime this codebase keeps removing.
+        """
+        bars = self.bars
+        n = len(bars)
+        i = n - 1 - (BOOK_BARS if self._hot else COLD_BARS)
+        if i >= 0:
+            bars[i].drop_book()
+        if not self._hot:
+            j = n - 1 - COLD_BARS
+            if j >= 0:
+                bars[j].drop_dense()
+
+    def set_hot(self, hot: bool) -> None:
+        """How much per-BAR detail this symbol is worth keeping.
+
+        The counterpart to BookmapBuffer.set_hot, and the larger of the two.
+        Measured per sealed bar at 100 depth a side: 3,501 B, of which the L2
+        book is 53.7% and the footprint arrays 36.3%. At the 12,000-bar cap
+        that is 42 MB a symbol - 4.2 GB across a hundred, 42 GB across a
+        thousand, which is the wall that stops the universe growing.
+
+        Demotion strips bars behind the cold window and IS NOT UNDONE by
+        promotion. A symbol brought back to the foreground has full detail
+        from that moment forward and stripped bars behind it: OHLC, volume and
+        delta intact, per-price cells gone. That is a real loss and the reason
+        the default is hot and only the window demotes - the same discipline
+        the data-truth gate forced on BookmapBuffer.
+        """
+        if hot == self._hot:
+            return
+        self._hot = hot
+        if hot:
+            return                      # nothing to restore; detail accrues again
+        bars = self.bars
+        cut = len(bars) - COLD_BARS
+        for k in range(max(0, cut)):
+            bars[k].drop_dense()
+        # Folded aggregations describe bars that no longer carry cells.
+        self._agg_cache.clear()
+        self._tf_dirty.clear()
         self._version += 1
 
     def add_book(self, bk) -> None:

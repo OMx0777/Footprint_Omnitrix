@@ -135,6 +135,65 @@ check("the column cache is rebuilt after a demotion",
 check("aggregation still works on a demoted buffer", len(h.view(1)) > 0,
       f"{len(h.view(1))} aggregated columns")
 
+# ---- 2b. BarSeries: the bigger half ---------------------------------------
+# Measured per SEALED bar at 100 depth a side: 3,501 B, of which the L2 book is
+# 53.7% (1,880 B, and no two bars share one) and the footprint arrays 36.3%.
+# At the 12,000-bar cap that is 42 MB a symbol - 4.2 GB across a hundred and
+# 42 GB across a thousand.
+#
+# What must NOT be lost is the candle. A stripped bar keeps OHLC, volume and
+# delta; it loses only its per-price detail, which is why it is applied to bars
+# far behind the screen on symbols nothing is drawing.
+from omnitrix.engine import BarSeries
+from omnitrix.engine.bars import BOOK_BARS, COLD_BARS as BAR_COLD
+
+
+def build_bars(n_bars, t0):
+    s = BarSeries("BS", inst)
+    for b in range(n_bars):
+        for k in range(40):
+            t0 += 200
+            s.add_trade(Trade("BS", round(220.0 + (k % 31) * 0.01, 2),
+                              10 + k, (Aggressor.BUY, Aggressor.SELL,
+                                       Aggressor.UNKNOWN)[k % 3], t0))
+        s.add_book(BookSnapshot("BS",
+                                {round(220.0 - i * 0.01, 2): 500 for i in range(1, 51)},
+                                {round(220.0 + i * 0.01, 2): 500 for i in range(1, 51)},
+                                t0))
+    return s, t0
+
+
+bs, T3 = build_bars(300, 1_700_000_000_000)
+check("a bare BarSeries keeps full detail", bs._hot is True)
+ohlcv_before = [(b.start_ts, b.open, b.high, b.low, b.close, b.volume, b.delta)
+                for b in bs.bars]
+lv_before = sum(b.n_levels() for b in bs.bars)
+
+bs.set_hot(False)
+ohlcv_after = [(b.start_ts, b.open, b.high, b.low, b.close, b.volume, b.delta)
+               for b in bs.bars]
+check("going cold does not touch OHLCV, volume or delta on ANY bar",
+      ohlcv_before == ohlcv_after,
+      f"{sum(1 for a, b in zip(ohlcv_before, ohlcv_after) if a != b)} bars differ")
+lv_after = sum(b.n_levels() for b in bs.bars)
+check("...but the per-price detail behind the cold window is released",
+      lv_after < lv_before, f"{lv_before:,} levels -> {lv_after:,}")
+kept = [b for b in bs.bars if b.n_levels() > 0]
+check("...and the newest bars keep theirs", len(kept) <= BAR_COLD + 2
+      and len(kept) > 0, f"{len(kept)} bars still carry cells")
+check("a stripped bar still answers arrays() instead of raising",
+      all(len(b.arrays()) == 3 for b in bs.bars))
+check("a stripped bar still answers its cached analytics",
+      all(isinstance(b._analytics(), dict) for b in bs.bars))
+check("aggregation still works after a demotion", len(bs.view(60)) > 0,
+      f"{len(bs.view(60))} bars at 1m")
+
+# the book window applies even while HOT - the heatmap only draws what is visible
+hot_bs, _ = build_bars(60, 1_700_000_500_000)
+check("a hot series keeps its recent books",
+      sum(1 for b in hot_bs.bars if b.book is not None and len(b.book)) > 0,
+      f"{sum(1 for b in hot_bs.bars if b.book is not None and len(b.book))} bars with a book")
+
 # ---- 3. the app marks the right symbols hot --------------------------------
 app = QApplication.instance() or QApplication([])
 SYMS = [f"Z{i:02d}" for i in range(12)] + ["NVDA"]
@@ -176,6 +235,13 @@ for _ in range(60):
     win._tick()
     time.sleep(0.006)
 win._sync_hot()
+check("the BarSeries of an off-screen symbol is cold too",
+      any(not win.series[x]._hot for x in cold if x in win.series),
+      f"{sum(1 for x in cold if x in win.series and not win.series[x]._hot)} "
+      f"of {len(cold)} cold series")
+check("...and the watched symbol's BarSeries stays hot",
+      win.series["NVDA"]._hot is True)
+
 check("selecting a symbol promotes it", win.bookmaps["Z03"].max_cols
       == win.bookmaps["Z03"].hot_cols,
       f"Z03 max_cols={win.bookmaps['Z03'].max_cols}")
