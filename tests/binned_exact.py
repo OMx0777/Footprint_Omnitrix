@@ -251,6 +251,70 @@ check("the bisected left edge is where the linear scan stopped",
       not bad, f"{len(bad)} mismatches, e.g. {bad[:2]}" if bad
       else "across unwrapped, exactly-full and twice-wrapped rings")
 
+# ---- a hostile viewport must not take out the frame -----------------------
+# math.floor() raises OverflowError on inf and ValueError on nan, and both
+# reach it from a panned or zoomed chart - this is the same class of value
+# that has bitten the time axes four times (tests/clock_guard.py). Out of
+# paint() it is not cosmetic: PyQt6 routes it to qFatal unless the excepthook
+# catches it, and even caught it raises again on every frame, so the chart
+# stops updating and the terminal looks hung with the process still alive.
+#
+# This predates the array refactor - the dict version raised on the identical
+# line - but it is fixed here because this is where the viewport is read.
+hv = BookmapBuffer("HV", inst, max_trades=2000)
+feed(hv, 2500)
+h_lo, h_hi = hv.trades[0][0], hv.trades[-1][0]
+HOSTILE = {
+    "normal": (h_lo - 5, h_hi + 2),
+    "inf right": (h_lo, float("inf")),
+    "-inf left": (float("-inf"), h_hi),
+    "both inf": (float("-inf"), float("inf")),
+    "nan lo": (float("nan"), h_hi),
+    "nan hi": (h_lo, float("nan")),
+    "1e300": (1e300, 1e301),
+    "-1e300": (-1e301, -1e300),
+    "huge span": (-1e12, 1e12),
+    "past epoch": (1e17, 1e17 + 100),
+    "zero width": (h_lo, h_lo),
+    "reversed": (h_hi, h_lo),
+}
+crashed, drew_normal = [], {}
+for cls, tag in ((BubbleItem, "bubble"), (PieItem, "pie")):
+    it = cls(0.01, hv)
+    it.cols = hv.view(1)
+    for cname, v in HOSTILE.items():
+        it._cache = None
+        it.getViewBox = lambda v=v: VB(v)
+        try:
+            n = len(it._by_bin() if cls is PieItem else it._binned())
+            if cname == "normal":
+                drew_normal[tag] = n
+        except Exception as e:
+            crashed.append(f"{tag}/{cname}: {type(e).__name__}")
+check("no viewport value can take out a bookmap frame", not crashed,
+      "; ".join(crashed) if crashed else f"{len(HOSTILE)} viewports x 2 items")
+# The guard must not be a blanket "draw nothing" - clamping too hard is how the
+# first attempt at it made every bubble disappear on a NORMAL chart.
+check("...and a normal viewport still draws everything it did",
+      drew_normal.get("bubble", 0) > 0 and drew_normal.get("pie", 0) > 0,
+      f"bubble {drew_normal.get('bubble')} cells, pie {drew_normal.get('pie')}")
+
+# ---- the packing's real headroom, stated out loud -------------------------
+# The key puts the time bin in the high 32 bits, so the largest bin that
+# survives is 2**31 - 2. x is epoch seconds over the column width, which is
+# why the clamp cannot simply be made "comfortably large": a live bin today is
+# already 1.79e9. Two assumptions hold it up and both are pinned here.
+from omnitrix.render.bookmap import _BIN_LIMIT
+
+check("the bin clamp is larger than a live time bin, not smaller",
+      _BIN_LIMIT > h_hi, f"clamp {_BIN_LIMIT:,} vs a live bin {h_hi:,.0f}")
+check("...and small enough that (bin+1) << 32 stays inside int64",
+      ((_BIN_LIMIT + 1) << 32) < (1 << 63),
+      f"{(_BIN_LIMIT + 1) << 32:,} vs {(1 << 63) - 1:,}")
+check("the default bookmap column is 1s - a sub-second one would overflow it",
+      BookmapBuffer("X", inst).col_dt >= 1.0,
+      f"col_dt={BookmapBuffer('X', inst).col_dt}")
+
 print()
 if FAILS:
     print(f"FAILED: {len(FAILS)}")

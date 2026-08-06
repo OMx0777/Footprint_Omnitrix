@@ -260,11 +260,34 @@ class _BufItem(pg.GraphicsObject):
         return self._bounds
 
     def _xrange(self):
+        """The visible x span, GUARANTEED FINITE.
+
+        A panned or zoomed viewport hands back inf and nan - this is the same
+        class of value that has bitten the time axes four times over (see
+        tests/clock_guard.py). Here it reached math.floor(), which raises
+        OverflowError on inf and ValueError on nan, from inside paint().
+
+        That is not a cosmetic failure. PyQt6 routes an exception out of
+        paint() to qFatal unless the excepthook in app.py catches it, and even
+        caught, it raises on every subsequent frame - so the chart stops
+        updating and the terminal looks hung while the process is alive.
+
+        Clamped rather than dropped: a broken viewport should still draw the
+        data that exists, and the caller's own `x_hi <= x_lo` test handles the
+        genuinely empty case.
+        """
         vb = self.getViewBox()
         if vb is None or not self.cols:
             return 0, 0
         xr = vb.viewRange()[0]
-        return xr[0] - 1, xr[1] + 1
+        lo, hi = xr[0] - 1, xr[1] + 1
+        if lo != lo or hi != hi:              # nan: no meaningful clamp
+            return 0, 0
+        if not (-_X_LIMIT <= lo <= _X_LIMIT):
+            lo = -_X_LIMIT if lo < 0 else _X_LIMIT
+        if not (-_X_LIMIT <= hi <= _X_LIMIT):
+            hi = -_X_LIMIT if hi < 0 else _X_LIMIT
+        return lo, hi
 
     def _visible(self):
         """The columns actually on screen, found by BISECTION.
@@ -535,6 +558,27 @@ _TRADE_SCAN_SLACK = 8.0
 # margin would have skipped 30% of a 4,000-print tape. See the rebuild path in
 # _TapeItem._cells for the measurement behind it.
 REBUILD_MARGIN_FRAC = 0.02
+
+# Clamp for viewport x values. Generous next to real data - x is epoch seconds
+# over the column width, so a live chart sits near 1.7e9 - while leaving the
+# packed key (time_bin << 32) far inside int64 once the bin is also clamped to
+# the data's own span in _grouped.
+_X_LIMIT = 1e12
+# Clamp for the derived time bin, which divides x by the scale and so is not
+# bounded by _X_LIMIT alone.
+#
+# THE VALUE IS FORCED, not chosen for comfort. The key packs the time bin into
+# the high 32 bits, and _grouped shifts `hi_bin + 1`, so the largest bin that
+# survives the shift inside a signed 64-bit int is 2**31 - 2. A first attempt
+# at 2**30 looked generously large and was in fact SMALLER THAN A REAL BIN: x
+# is epoch seconds over the column width, so a live chart today sits at
+# 1.79e9 and every bubble vanished.
+#
+# Headroom against real data is therefore only 1.20x, and it is a date, not a
+# size: bins reach 2**31 at epoch second 2147483648, in January 2038. The
+# packing also assumes col_dt >= 1 - a sub-second column would multiply x and
+# overflow immediately - which is why tests/binned_exact.py pins both.
+_BIN_LIMIT = (1 << 31) - 2
 
 _EMPTY_I64 = np.zeros(0, dtype=np.int64)
 _NO_CELLS = (_EMPTY_I64, _EMPTY_I64, _EMPTY_I64)
@@ -886,8 +930,18 @@ class _TapeItem(_BufItem):
         # than a test per bin, because the time bin is in the HIGH bits.
         lo_bin = hi_bin = None
         if self.bin_cols * xs > 0:
-            lo_bin = math.floor((x_lo / xs) * inv) - 1
-            hi_bin = math.floor((x_hi / xs) * inv) + 1
+            # CLAMPED BEFORE ANY USE. `lo_bin << 32` is a Python int of
+            # unbounded width and numpy raises converting one past int64, so a
+            # viewport far outside the data would take out the frame rather
+            # than simply showing nothing. _X_LIMIT bounds x, but the bin also
+            # divides by the scale, which can be small - so the bin is bounded
+            # here in its own right. 2^30 is far beyond any real time bin
+            # (a live chart sits near 1.7e9 seconds / bin width) while leaving
+            # the shifted key inside int64 with room to spare.
+            lo_bin = max(-_BIN_LIMIT, min(_BIN_LIMIT,
+                                          math.floor((x_lo / xs) * inv) - 1))
+            hi_bin = max(-_BIN_LIMIT, min(_BIN_LIMIT,
+                                          math.floor((x_hi / xs) * inv) + 1))
             i0 = int(np.searchsorted(keys, lo_bin << 32, "left"))
             i1 = int(np.searchsorted(keys, (hi_bin + 1) << 32, "left"))
             keys, buys, sells = keys[i0:i1], buys[i0:i1], sells[i0:i1]

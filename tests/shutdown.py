@@ -50,4 +50,51 @@ for i in range(6):
         print(f"  run {i}: exit={r.returncode}  {r.stderr.strip()[-160:]}")
 print(f"\nclean shutdowns: {6-bad}/6")
 os.unlink(path)
-sys.exit(1 if bad else 0)
+
+# ---- a failing session must leave an artifact behind ----------------------
+# The shipped terminal is a WINDOWED PyInstaller exe: it has no stderr, so
+# logging.basicConfig with no filename sent every log line, every survived
+# exception and every reason the app stopped drawing to nowhere. A session
+# died and left not one byte to say why, and the diagnosis was guesswork.
+#
+# Run in a child process because the interesting case is the one that cannot
+# be caught in-process: a hard crash, where Python raises nothing at all.
+CRASH_CHILD = textwrap.dedent(r'''
+    import os, sys, logging, ctypes
+    os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
+    sys.path.insert(0, r"C:\Users\ADMIN\Desktop\Footprint_Omnitrix")
+    logging.basicConfig(level=logging.INFO)
+    from omnitrix import app as A
+    p = A._install_file_log()
+    A._install_faulthandler(p)
+    A._install_thread_excepthook()
+    A._install_excepthook()
+    print("LOGPATH:" + p, flush=True)
+    logging.getLogger("omnitrix").info("session started")
+    for h in logging.getLogger().handlers: h.flush()
+    ctypes.string_at(0)                 # access violation, not an exception
+''')
+fd, cpath = tempfile.mkstemp(suffix=".py")
+os.write(fd, CRASH_CHILD.encode()); os.close(fd)
+r = subprocess.run([sys.executable, cpath], capture_output=True, text=True,
+                   cwd=HERE, timeout=120)
+logp = ""
+for line in r.stdout.splitlines():
+    if line.startswith("LOGPATH:"):
+        logp = line[len("LOGPATH:"):].strip()
+os.unlink(cpath)
+
+ok_log = bool(logp) and os.path.exists(logp) \
+    and "session started" in open(logp, encoding="utf-8").read()
+print(f"  {'PASS' if ok_log else 'FAIL'}  the session writes a log FILE, not a "
+      f"stderr the exe does not have   {logp or '(none)'}")
+
+fatal = (logp + ".fatal") if logp else ""
+ftxt = open(fatal, encoding="utf-8").read() if fatal and os.path.exists(fatal) else ""
+ok_fatal = "fatal exception" in ftxt.lower() or "Traceback" in ftxt or "File \"" in ftxt
+print(f"  {'PASS' if ok_fatal else 'FAIL'}  a HARD crash still leaves a stack   "
+      f"{ftxt.splitlines()[0] if ftxt else '(empty)'}")
+print(f"        (the process died with exit {r.returncode}, and Python raised "
+      f"nothing - this is the case the excepthook cannot see)")
+
+sys.exit(1 if (bad or not ok_log or not ok_fatal) else 0)

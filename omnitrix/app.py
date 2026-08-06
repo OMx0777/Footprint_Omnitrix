@@ -26,6 +26,92 @@ from .ui import OmnitrixWindow
 
 log = logging.getLogger("omnitrix")
 
+# Where the terminal writes its log. Beside the workspace, so one folder holds
+# everything the app owns and a user can find it without being told a path.
+LOG_DIR = os.path.join(os.path.expanduser("~"), ".omnitrix_logs")
+LOG_KEEP = 5
+
+
+def _install_file_log() -> str:
+    """Write the log to a FILE, not just to a stderr that does not exist.
+
+    This is why a crash could not be diagnosed. logging.basicConfig with no
+    filename writes to stderr; the shipped terminal is a windowed PyInstaller
+    exe, which has no stderr - so every log line, every survived exception and
+    every reason the app stopped drawing went nowhere. The app reported "it
+    crashed" and left not one byte behind to say why.
+
+    A new file per run, five kept. Per-run rather than one rolling file
+    because the question is always "what happened in the session that broke",
+    and interleaving five sessions makes that harder to read, not easier.
+
+    Never fatal: if the directory cannot be created - a locked-down profile, a
+    full disk, a roaming folder that is not there yet - the app must still
+    start. A terminal that refuses to open because it could not open its log
+    is worse than one with no log.
+    """
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        import time as _t
+        path = os.path.join(LOG_DIR, f"omnitrix-{_t.strftime('%Y%m%d-%H%M%S')}.log")
+        h = logging.FileHandler(path, encoding="utf-8")
+        h.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.getLogger().addHandler(h)
+        old = sorted(f for f in os.listdir(LOG_DIR)
+                     if f.startswith("omnitrix-") and f.endswith(".log"))
+        for f in old[:-LOG_KEEP]:
+            try:
+                os.remove(os.path.join(LOG_DIR, f))
+            except OSError:
+                pass
+        return path
+    except Exception:
+        return ""
+
+
+def _install_faulthandler(log_path: str) -> None:
+    """Catch the crashes Python cannot catch.
+
+    The excepthook below only sees PYTHON exceptions. It cannot see a
+    segfault, a numpy abort, or a Qt qFatal - and those kill the process with
+    no traceback at all, which is exactly the shape of "it just disappeared".
+
+    faulthandler writes a C-level stack for every thread straight to a file
+    descriptor when the process dies that way, so a hard crash leaves the one
+    artifact needed to place it.
+    """
+    if not log_path:
+        return
+    try:
+        import faulthandler
+        # Kept open deliberately for the process lifetime: faulthandler writes
+        # from a signal/abort context, where reopening a file is not safe.
+        fh = open(log_path + ".fatal", "a", encoding="utf-8")
+        faulthandler.enable(file=fh, all_threads=True)
+    except Exception:
+        log.debug("faulthandler unavailable", exc_info=True)
+
+
+def _install_thread_excepthook() -> None:
+    """The GUI excepthook does not cover worker threads.
+
+    The feed reader, the gap-repair thread and the alert sounder all run off
+    the GUI thread. An exception on one of those prints to a stderr that is
+    not there and the thread simply stops - the feed goes quiet with the app
+    still drawing, which reads as "the data stopped" rather than as a fault.
+    """
+    def hook(args):
+        log.error("unhandled exception in thread %s (that thread has stopped):\n%s",
+                  getattr(args.thread, "name", "?"),
+                  "".join(traceback.format_exception(
+                      args.exc_type, args.exc_value, args.exc_traceback)))
+    try:
+        import threading
+        threading.excepthook = hook
+    except Exception:
+        pass
+
 
 def _install_excepthook() -> None:
     """Stop one bad frame from killing the whole terminal.
@@ -129,7 +215,15 @@ def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _log_path = _install_file_log()
+    _install_faulthandler(_log_path)
+    _install_thread_excepthook()
     _install_excepthook()
+    if _log_path:
+        log.info("log file: %s", _log_path)
+    else:
+        log.warning("could not open a log file in %s - this session will leave "
+                    "no record if it fails", LOG_DIR)
     _tune_gc()
 
     app = QApplication(sys.argv)
