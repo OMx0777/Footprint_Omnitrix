@@ -799,6 +799,14 @@ class OmnitrixWindow(QMainWindow):
         self._link_tick = getattr(self, "_link_tick", 0) + 1
         if self._link_tick % 15 == 0:
             self._update_link()
+        # Retention follows what is on screen. Re-checked on a timer rather
+        # than hooked to every place a symbol can change - there are a dozen
+        # of those (pane combo, toolbar, bookmap search, workspace restore,
+        # grid layout) and one missed hook is a symbol that silently keeps or
+        # loses history. A second's lag costs nothing; a missed hook is a bug
+        # nobody would find.
+        if self._link_tick % 25 == 0:
+            self._sync_hot()
 
         if self._dirty and self.active_symbol:
             self._redraw()
@@ -808,6 +816,43 @@ class OmnitrixWindow(QMainWindow):
     def _shows(self, sym: str) -> bool:
         """Is this symbol on screen in any visible pane?"""
         return any(p.symbol == sym for p in self._panes[:self._n_panes])
+
+    def _hot_symbols(self) -> set[str]:
+        """Symbols something is actually DRAWING, anywhere in the app.
+
+        Everything else keeps a reduced history - see BookmapBuffer.set_hot.
+        The set is deliberately generous: a symbol in any chart pane, any
+        bookmap pane, or any child window counts, and so does the toolbar's
+        selection even before a pane has caught up with it. Getting this wrong
+        in the cheap direction means dropping history the user can see, which
+        is much worse than holding a few extra megabytes.
+        """
+        hot = {p.symbol for p in self._panes[:self._n_panes] if p.symbol}
+        if self.active_symbol:
+            hot.add(self.active_symbol)
+        for key in self._child_windows:
+            # Child windows are registered as "profile:NVDA", "analytics:QQQ".
+            if ":" in key:
+                hot.add(key.split(":", 1)[1].strip().upper())
+        bm = self._child("bookmap")
+        if bm is not None:
+            try:
+                for pane in bm._visible_panes():
+                    s = getattr(getattr(pane, "buffer", None), "symbol", "")
+                    if s:
+                        hot.add(s)
+            except Exception:
+                # A half-built or closing bookmap must not cost the app its
+                # retention policy; erring hot is the safe direction.
+                log.debug("could not read bookmap panes for hot set",
+                          exc_info=True)
+        return hot
+
+    def _sync_hot(self) -> None:
+        """Apply the hot set. Cheap: set_hot returns at once when unchanged."""
+        hot = self._hot_symbols()
+        for sym, buf in self.bookmaps.items():
+            buf.set_hot(sym in hot)
 
     def _bind_pane(self, pane) -> None:
         """Point the window's chart attributes at `pane`.

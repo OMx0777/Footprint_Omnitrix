@@ -31,6 +31,19 @@ from .instruments import Instruments
 
 # Aggressor <-> uint8, because storing the enum boxes a pointer per trade.
 _AG_CODE = {Aggressor.BUY: 0, Aggressor.SELL: 1, Aggressor.UNKNOWN: 2}
+
+# Tape ring: initial allocation, and how much per-column history a symbol
+# nobody is watching keeps. Both exist for the same reason - the process has to
+# hold thousands of symbols, and almost none of them are on screen.
+#
+# 2,048 prints is a few seconds of a busy name and 8 kB of the 1.02 MB a full
+# ring costs, so a thin symbol - most of a thousand-symbol universe - never
+# pays for depth it does not use.
+TAPE_SEED = 2048
+# 150 one-second columns is two and a half minutes: enough that selecting a
+# symbol shows immediate context rather than an empty chart, at about a ninth
+# of the full 1400-column retention.
+COLD_COLS = 150
 _AG_FROM = (Aggressor.BUY, Aggressor.SELL, Aggressor.UNKNOWN)
 
 
@@ -126,6 +139,20 @@ class BookmapBuffer:
         self.symbol = symbol
         self.instruments = instruments
         self.col_dt = col_dt
+        # Column retention depends on whether anything is DRAWING this symbol -
+        # see set_hot.
+        #
+        # STARTS HOT, and the window demotes. Starting cold was tried and the
+        # data-truth gate caught it immediately: a bare buffer retained less
+        # than the BarSeries beside it, so the bookmap and the footprint
+        # disagreed about the same session's volume. Every consumer that
+        # constructs a buffer directly - the gates, the tests, any future
+        # tool - is entitled to the full retention it has always had, and
+        # only the window knows which symbols are on screen. So the default
+        # is the safe one and the saving is applied by whoever has the
+        # knowledge to apply it.
+        self.hot_cols = max_cols
+        self.cold_cols = min(COLD_COLS, max_cols)
         self.max_cols = max_cols
         self.cols: dict[int, Column] = {}
         # Kept sorted by bucket, not insertion order: two feeds (trades on L1,
@@ -135,11 +162,28 @@ class BookmapBuffer:
         self.order: list[int] = []
         # The tape, as four parallel ring arrays rather than a deque of
         # tuples - see TapeView for the measurement that motivated it.
-        self.max_trades = max_trades
-        self.trade_x = np.empty(max_trades, dtype=np.float64)
-        self.trade_ti = np.empty(max_trades, dtype=np.int32)
-        self.trade_sz = np.empty(max_trades, dtype=np.int32)
-        self.trade_ag = np.empty(max_trades, dtype=np.uint8)
+        #
+        # GROWN ON DEMAND, not allocated up front. A full ring is 1.02 MB, and
+        # allocating it per symbol cost 102 MB across 100 symbols whether those
+        # symbols ever printed or not - measured, it was the single largest
+        # fixed cost in the process and none of it varied with activity. At the
+        # thousands of symbols this has to reach, that alone is a gigabyte of
+        # untouched memory.
+        #
+        # `max_trades` is the CURRENT allocation and `tape_cap` the ceiling.
+        # That way every consumer's modular arithmetic - add_trade, TapeView,
+        # the renderer's ring walk - keeps using the one attribute it always
+        # used and needs no knowledge that the array can grow.
+        #
+        # Eviction is unchanged: growth happens only while below the ceiling
+        # and strictly before the ring would wrap, so the retention seen by a
+        # caller is still exactly deque(maxlen=tape_cap).
+        self.tape_cap = int(max_trades)
+        self.max_trades = min(TAPE_SEED, self.tape_cap)
+        self.trade_x = np.empty(self.max_trades, dtype=np.float64)
+        self.trade_ti = np.empty(self.max_trades, dtype=np.int32)
+        self.trade_sz = np.empty(self.max_trades, dtype=np.int32)
+        self.trade_ag = np.empty(self.max_trades, dtype=np.uint8)
         # Physical slot of the OLDEST retained trade. Stays 0 until the ring
         # wraps, then tracks the write head.
         self._tape_first = 0
@@ -202,6 +246,71 @@ class BookmapBuffer:
         self._touch(b)
         return c
 
+    def _grow_tape(self) -> None:
+        """Enlarge the tape ring, preserving every retained print.
+
+        Called only when the ring is exactly full and still under its ceiling,
+        which is before it has ever wrapped - so `_tape_first` is 0 and the
+        arrays are already in logical order. That makes the move a plain
+        resize rather than an unwrap, and it is the reason growth is checked
+        BEFORE the write rather than after.
+
+        Quadrupling, not doubling: reaching a 60,000 ceiling from the 2,048
+        seed is five copies instead of nine, and a copy of an array this size
+        is memcpy - the cost is the allocation, so fewer and larger wins.
+        """
+        old = self.max_trades
+        new = min(old * 4, self.tape_cap)
+        if new <= old:
+            return
+
+        def _ext(a, dtype):
+            b = np.empty(new, dtype=dtype)
+            b[:old] = a
+            return b
+
+        self.trade_x = _ext(self.trade_x, np.float64)
+        self.trade_ti = _ext(self.trade_ti, np.int32)
+        self.trade_sz = _ext(self.trade_sz, np.int32)
+        self.trade_ag = _ext(self.trade_ag, np.uint8)
+        self.max_trades = new
+        self._tape_first = 0
+
+    def set_hot(self, hot: bool) -> None:
+        """How much per-column history this symbol is worth keeping.
+
+        A symbol nobody is looking at still needs its bars, its latest book
+        and its tape - alerts fire on it, the monitor lists it, and selecting
+        it must not start from nothing. What it does NOT need is a full
+        screen-width of heat history that no window is drawing.
+
+        Measured at 100 symbols and 100 depth per side, the per-column state -
+        ladders plus the aggressive buy/sell dicts - reached 116 MB in six
+        minutes and was still climbing linearly toward roughly 440 MB at the
+        1400-column cap. That is the cost that makes thousands of symbols
+        impossible, and almost all of it belongs to symbols off screen.
+
+        Cold symbols keep COLD_COLS instead, which is still a couple of
+        minutes of context so that selecting one shows history immediately
+        rather than an empty chart that fills in. Promotion is instant;
+        demotion evicts on the spot rather than waiting for the next column,
+        because the point is to release the memory.
+        """
+        want = self.hot_cols if hot else min(self.cold_cols, self.hot_cols)
+        if want == self.max_cols:
+            return
+        self.max_cols = want
+        if len(self.order) > want:
+            while len(self.order) > want:
+                self.cols.pop(self.order.pop(0), None)
+                self._evicted += 1
+            # Every cached fold now describes columns that are gone.
+            self._all_cache = None
+            self._agg_cache.clear()
+            for agg in self._dirty:
+                self._dirty[agg] = None
+            self._version += 1
+
     def _touch(self, bucket: int) -> None:
         """Record that `bucket` changed, for every cached aggregation."""
         self._version += 1
@@ -224,6 +333,8 @@ class BookmapBuffer:
         c.vol += tr.size
         c.net += buy - sell
         x = (tr.ts_ms / 1000.0) / self.col_dt
+        if self.trade_count >= self.max_trades > 0 and self.max_trades < self.tape_cap:
+            self._grow_tape()
         slot = self.trade_count % self.max_trades
         self.trade_x[slot] = x
         self.trade_ti[slot] = ti
