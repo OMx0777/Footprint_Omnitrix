@@ -17,7 +17,7 @@ import math
 import numpy as np
 import pyqtgraph as pg
 
-from ..engine.model import split_size
+from ..engine.model import split_size, split_sizes
 from ..engine.bookmap import _AG_FROM
 from PyQt6.QtCore import QRectF, QPointF, Qt
 from PyQt6.QtGui import (QColor, QPainter, QFont, QPen, QBrush, QRadialGradient,
@@ -516,6 +516,14 @@ class BBOItem(_BufItem):
 # Columns of tolerance for out-of-order prints when scanning the tape backwards.
 _TRADE_SCAN_SLACK = 8.0
 
+# Fraction of a FULL tape that the fold deliberately skips at the back, so that
+# eviction does not invalidate the cache on every single print. Proportional,
+# not absolute: 2% of a 60,000 print tape is 1,200 prints and buys 1,200
+# frames between rebuilds, while 2% of a small tape is a handful. An absolute
+# margin would have skipped 30% of a 4,000-print tape. See the rebuild path in
+# _TapeItem._cells for the measurement behind it.
+REBUILD_MARGIN_FRAC = 0.02
+
 
 class _TapeItem(_BufItem):
     """Shared base for the three trade overlays (bubbles / pies / split bars).
@@ -541,6 +549,7 @@ class _TapeItem(_BufItem):
         self.min_size = 0        # noise filter on the binned total
         self.size_scale = 1.0    # user size multiplier
         self.max_cells = 320
+        self._eff_bin = 1.0
         # (x_display, price, buy, sell) of everything drawn last frame, for the
         # window's hover readout. Without this a bubble can be seen but not
         # interrogated, and "how much of that was buying?" is the whole question.
@@ -588,7 +597,42 @@ class _TapeItem(_BufItem):
         if x_hi <= x_lo:
             return {}
         xs = self.xscale
-        inv = 1.0 / max(1e-9, self.bin_cols)
+        # BIN AT THE RESOLUTION THE SCREEN CAN SHOW, not finer.
+        #
+        # Zoomed out over a full tape the view spans ~7,200 columns across
+        # ~1,400 pixels - five columns per pixel - so a one-column bin is
+        # sub-pixel. Measured there: 60,000 prints folded into 58,160 distinct
+        # bins, a compression of 1.03x, of which _binned then draws the 320
+        # largest and discards 99%. All that work produced detail no monitor
+        # can resolve, and the prints in the discarded 99% were not drawn at
+        # all - their volume simply vanished.
+        #
+        # Widening the bin to one pixel bounds the fold by the WINDOW rather
+        # than by the tape, so it costs the same whether the tape holds a
+        # minute or a full day. It is also more honest: neighbouring prints now
+        # merge into one bubble carrying their combined volume instead of
+        # 99 of every 100 being dropped for not being in the top 320.
+        #
+        # It never makes the bin FINER than asked for - max() - so the zoomed-in
+        # case, which is the one people trade from, is bit-for-bit unchanged.
+        bin_cols = self.bin_cols
+        vb_ = self.getViewBox()
+        if vb_ is not None:
+            try:
+                px = vb_.viewPixelSize()[0] / max(xs, 1e-9)
+                if px > bin_cols:
+                    # QUANTISED to a power-of-two multiple. The effective bin
+                    # is part of the cache signature, so if it tracked the
+                    # viewport continuously it would change on every frame that
+                    # follows live price - and the cache would rebuild every
+                    # frame, which is the failure this is here to fix. Snapping
+                    # means it only moves on a real zoom.
+                    steps = math.ceil(math.log2(px / bin_cols))
+                    bin_cols = bin_cols * (2.0 ** max(0, steps))
+            except Exception:
+                pass
+        inv = 1.0 / max(1e-9, bin_cols)
+        self._eff_bin = bin_cols
         rt = max(1, int(self.row_ticks))
         # Read the RING ARRAYS, not the TapeView. The view builds a tuple
         # per access, which is exactly the allocation the ring was introduced
@@ -603,7 +647,7 @@ class _TapeItem(_BufItem):
         fold_lo = x_lo - _TRADE_SCAN_SLACK
 
         c = getattr(self, "_cache", None)
-        sig = (id(buf), xs, inv, rt)
+        sig = (id(buf), xs, round(inv, 9), rt)
         reusable = (
             c is not None
             and c["sig"] == sig
@@ -625,9 +669,76 @@ class _TapeItem(_BufItem):
                 if tx[(base + k) % cap] * xs < fold_lo:
                     break
                 start = k
+            # NEVER FOLD THE OLDEST SLIVER OF THE TAPE. This is what actually
+            # fixes the two-hour freeze, and it is a scheduling fix rather than
+            # a speed one.
+            #
+            # The cache is dropped when a print it folded has been evicted.
+            # Once the ring is at its cap EVERY new print evicts one, so if the
+            # fold reaches the oldest print - which it does the moment you zoom
+            # out to the whole tape - the cache is invalid again one print
+            # later. Measured: rebuilt on 8 frames out of 8, ~120 ms each,
+            # against an 80 ms timer. 60,000 prints at ~8/sec is 2.08 hours to
+            # fill the ring, and a restart cleared it because the ring began
+            # empty.
+            #
+            # Holding the fold back by a margin means eviction only invalidates
+            # once that margin is consumed - one rebuild per REBUILD_MARGIN
+            # prints instead of one per print.
+            #
+            # What it costs: the oldest ~2% of the tape is not drawn when you
+            # are zoomed out far enough to see the whole thing. That is an
+            # omission at the extreme left edge, not an invention - and it sits
+            # next to _binned already keeping only the largest `max_cells` of
+            # ~46,000 bins, which discards 99% of them.
+            if n >= cap:
+                margin = int(cap * REBUILD_MARGIN_FRAC)
+                if start < margin:
+                    start = margin
+            # VECTORISED, because this path is not as rare as it looks. The
+            # reuse test rejects the cache when a print it folded has been
+            # evicted - and once the tape is at its cap, EVERY new print evicts
+            # one. Zoomed out far enough that the fold reaches the oldest
+            # print, that is a full rebuild on every single frame.
+            #
+            # Measured at the 60,000 cap: 108 ms per frame, rebuilt 8 frames
+            # out of 8, against an 80 ms timer. That is the two-hour freeze -
+            # 60,000 prints at ~8/sec is 2.08 hours to fill the ring, and it
+            # cleared on restart because the ring started empty again.
+            #
+            # The invalidation rule is NOT relaxed: a bin holding prints the
+            # tape no longer has would draw volume that exists nowhere else.
+            # The rebuild is simply made cheap enough that doing it every frame
+            # does not matter.
+            if start < n:
+                idx = np.arange(start, n, dtype=np.int64)
+                ps = (base + idx) % cap
+                xb = np.floor(tx[ps] * inv).astype(np.int64)
+                tb = tti[ps].astype(np.int64) // rt
+                b_arr, s_arr = split_sizes(tsz[ps], tag[ps], tti[ps])
+                # One 64-bit key per (time bin, price bucket) so the grouping
+                # is a single sort rather than a dict insert per print.
+                keys = (xb << 32) | (tb & 0xFFFFFFFF)
+                uniq, inv_idx = np.unique(keys, return_inverse=True)
+                bs = np.bincount(inv_idx, weights=b_arr).astype(np.int64)
+                ss = np.bincount(inv_idx, weights=s_arr).astype(np.int64)
+                u_xb = (uniq >> 32).astype(np.int64)
+                u_tb = (uniq & 0xFFFFFFFF).astype(np.int32).astype(np.int64)
+                # .tolist() once, then build the dict in C. Indexing numpy
+                # scalars in a Python loop and calling int() on each - four per
+                # bin - was 31.5 ms for 46,000 bins against 18.1 ms this way,
+                # and the loop is the 97% of the rebuild that the vectorised
+                # grouping does not touch.
+                cells = dict(zip(zip(u_xb.tolist(), u_tb.tolist()),
+                                 map(list, zip(bs.tolist(), ss.tolist()))))
             c = self._cache = {"sig": sig, "cells": cells, "lo_x": fold_lo,
                                "fold_start": first_abs + start,
-                               "consumed": first_abs + start}
+                               "consumed": first_abs + n}
+            # The vectorised pass has already folded start..n. The incremental
+            # loop below folds `start` onwards, so leaving `start` where it was
+            # would fold every one of them a SECOND time - the cache read
+            # exactly double, which the exactness oracle caught immediately.
+            start = n
 
         for k in range(start, n):
             p = (base + k) % cap
@@ -667,7 +778,10 @@ class _TapeItem(_BufItem):
         if not cells:
             return []
         rt = max(1, int(self.row_ticks))
-        bc, xs, tick = self.bin_cols, self.xscale, self.tick
+        # The SAME effective bin _cells used, or every bubble is drawn at the
+        # wrong x - the key is floor(x / bin), so the inverse needs the same
+        # divisor.
+        bc, xs, tick = self._eff_bin, self.xscale, self.tick
         out = []
         for (xb, tb), (b, s) in cells.items():
             tot = b + s

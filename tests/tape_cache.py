@@ -44,7 +44,15 @@ def check(name, ok, detail=""):
 
 
 def reference(item, x_lo, x_hi):
-    """Oracle: fold EVERY retained print, then keep the bins in view.
+    """Oracle: fold every print the renderer WOULD fold, then keep the bins in
+    view.
+
+    "Would fold" is not "every retained print". On a FULL tape the renderer
+    deliberately skips the oldest REBUILD_MARGIN_FRAC of it, because otherwise
+    eviction invalidates the cache on every single print and it rebuilds every
+    frame - measured at ~120 ms a frame against an 80 ms timer, which is the
+    two-hour freeze. The oracle has to skip the same prints or it is testing a
+    renderer that does not exist.
 
     Note the difference from the pass this replaced. The old code filtered
     per TRADE against the viewport, so a bin straddling the edge of the screen
@@ -61,7 +69,19 @@ def reference(item, x_lo, x_hi):
     inv = 1.0 / max(1e-9, item.bin_cols)
     rt = max(1, int(item.row_ticks))
     cells = {}
-    for x, ti, size, aggr in list(buf.trades):
+    # Fold exactly what the renderer folded: from its cache's fold_start, in
+    # ABSOLUTE print indices. Recomputing "skip the oldest 2%" here would be a
+    # moving target - the cache picks its start once at rebuild and then keeps
+    # folding new prints, so between rebuilds it legitimately holds prints a
+    # freshly-computed 2% would exclude. Comparing against that would report a
+    # discrepancy where there is none.
+    c = getattr(item, "_cache", None)
+    entries = list(buf.trades)
+    first_abs = buf.trade_count - len(entries)
+    if c is not None:
+        skip = max(0, c["fold_start"] - first_abs)
+        entries = entries[skip:]
+    for x, ti, size, aggr in entries:
         key = (int(math.floor(x * inv)), ti // rt)
         e = cells.get(key)
         if e is None:

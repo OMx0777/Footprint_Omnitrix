@@ -61,6 +61,48 @@ def split_size(size: int, aggressor: Aggressor, tick_index: int) -> tuple[int, i
     return buy, size - buy
 
 
+def split_sizes(sizes, aggr_codes, tick_indices):
+    """Vectorised split_size over numpy arrays. Returns (buys, sells).
+
+    `aggr_codes` are the uint8 codes the tape stores: 0 BUY, 1 SELL, 2 UNKNOWN.
+
+    THIS LIVES HERE, DIRECTLY BELOW split_size, ON PURPOSE. The single worst
+    bug this codebase has had was a second, disagreeing implementation of the
+    buy/sell split - the renderer counted every UNKNOWN print as 100% buying
+    while the footprint halved it, and the chart read green on a balanced tape.
+    Two definitions in two files is how that happens. Keeping them adjacent
+    means a change to the rule is visibly a change to BOTH, and
+    tests/split_vec.py asserts they agree across the whole input space.
+
+    It exists because the bookmap's cache rebuild folds up to 60,000 prints in
+    one go, and doing that a print at a time in Python took 110 ms - long
+    enough to freeze the UI once the tape filled.
+    """
+    import numpy as np
+    sizes = np.asarray(sizes, dtype=np.int64)
+    codes = np.asarray(aggr_codes, dtype=np.uint8)
+    tis = np.asarray(tick_indices, dtype=np.int64)
+
+    buys = np.zeros(sizes.shape, dtype=np.int64)
+    sells = np.zeros(sizes.shape, dtype=np.int64)
+
+    is_buy = codes == 0
+    buys[is_buy] = sizes[is_buy]
+    is_sell = codes == 1
+    sells[is_sell] = sizes[is_sell]
+
+    unk = ~(is_buy | is_sell)
+    u_sz = sizes[unk]
+    # The scalar rule: buy = size // 2, plus one when BOTH the size and the
+    # tick index are odd. `& 1` on each is the same parity test the scalar
+    # `(size & 1) and (tick_index & 1)` performs.
+    u_buy = u_sz // 2
+    u_buy += (u_sz & 1) & (tis[unk] & 1)
+    buys[unk] = u_buy
+    sells[unk] = u_sz - u_buy
+    return buys, sells
+
+
 @dataclass(slots=True, frozen=True)
 class Trade:
     """A single time-and-sales print."""

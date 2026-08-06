@@ -136,9 +136,19 @@ got = item._cells()
 import math
 from omnitrix.engine.model import split_size
 want = {}
-inv = 1.0 / max(1e-9, item.bin_cols)
+# The renderer holds its fold back from the eviction boundary (see
+# REBUILD_MARGIN_FRAC) so that eviction does not invalidate the cache on every
+# print - that was the two-hour freeze. It also bins at the effective width it
+# chose. The oracle has to do BOTH, or it is describing a renderer that does
+# not exist.
+inv = 1.0 / max(1e-9, item._eff_bin)
 rt = max(1, int(item.row_ticks))
-for x, ti, size, aggr in mirror2:
+_c = item._cache
+_entries = list(mirror2)
+_first_abs = big.trade_count - len(_entries)
+if _c is not None:
+    _entries = _entries[max(0, _c["fold_start"] - _first_abs):]
+for x, ti, size, aggr in _entries:
     key = (int(math.floor(x * inv)), ti // rt)
     c = want.setdefault(key, [0, 0])
     b, sl = split_size(size, aggr, ti)
