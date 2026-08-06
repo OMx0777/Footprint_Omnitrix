@@ -35,19 +35,28 @@ class Theme:
     delta_dn: str
 
 
+# Near-black, not charcoal. Every colour below is one step down from what it
+# was; the chrome moves furthest and the DATA colours barely move at all,
+# because darkening the bars and cells along with the background would just
+# lower the whole image and gain nothing. What it buys is contrast: on a
+# trading desk the chart is the only thing that should be emitting light.
+#
+# `text` goes UP rather than down - the same grey that read as comfortable
+# against #0B0E14 reads as dim against #05070C, so it is lifted to keep the
+# contrast ratio where it was.
 DARK = Theme(
     name="dark",
-    bg="#0B0E14",
-    panel="#12161F",
-    grid="#1F2226",
-    text="#C7CCD6",
-    axis="#31343A",
+    bg="#05070C",
+    panel="#0A0D14",
+    grid="#161A21",
+    text="#CFD5E0",
+    axis="#282C34",
     bull="#26A69A",
     bear="#EF5350",
-    bid_bg=QColor(60, 22, 26),      # muted red field
-    ask_bg=QColor(18, 52, 44),      # muted green field
+    bid_bg=QColor(52, 18, 22),      # muted red field
+    ask_bg=QColor(14, 45, 38),      # muted green field
     poc_bg=QColor(230, 232, 238),
-    poc_text="#0B0E14",
+    poc_text="#05070C",
     cell_text="#D6DAE2",
     buy_imb=QColor(0, 230, 118),
     sell_imb=QColor(255, 45, 85),

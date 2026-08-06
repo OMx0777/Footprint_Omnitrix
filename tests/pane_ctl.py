@@ -6,7 +6,17 @@ NVDA heatmap - four charts, four independent configurations, at the same time.
 import os, sys, time, logging
 sys.path.insert(0, r"C:\Users\ADMIN\Desktop\Footprint_Omnitrix")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# The window RESTORES ~/.omnitrix_workspace.json on construction and SAVES it
+# on close, so without this the test both reads the operator's live desk (which
+# makes its preconditions depend on whatever they last had open) and can
+# overwrite it. Enforced by tests/clock_guard.py.
+from omnitrix.ui import workspace
+workspace.save = lambda *a, **k: None
+workspace.restore = lambda *a, **k: None
+
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QApplication, QSplitter
 from omnitrix.engine import Instruments, SyntheticFeed
 from omnitrix.ui.main_window import OmnitrixWindow, MODES
@@ -127,6 +137,49 @@ after = [(p.symbol, p.mode_combo.currentText()) for p in win._panes]
 check("changing one pane leaves the other three untouched",
       after[0] == snap[0] and after[1] == snap[1] and after[3] == snap[3]
       and after[2] == ("AAPL", "Profile"), f"{after}")
+
+# ---- 7. the live-price tag on every pane ---------------------------------
+# The footprint charts had a live price LINE but no value on it, so you could
+# see where price was and had to read the number off the axis gradations.
+pump(win, app, 60)
+tagged = []
+for p in win._panes:
+    lbl = getattr(p.price_line, "label", None)
+    if lbl is None:
+        continue
+    txt = lbl.textItem.toPlainText().replace(",", "")
+    try:
+        shown = float(txt)
+    except ValueError:
+        shown = None
+    tagged.append((p.index, shown, round(p.price_line.value(), 4)))
+check("every chart pane carries a live-price tag",
+      len(tagged) == len(win._panes), f"{len(tagged)} of {len(win._panes)}")
+wrong = [t for t in tagged if t[1] is None or abs(t[1] - t[2]) > 0.011]
+check("...showing the price the line is actually at", not wrong,
+      f"{wrong}" if wrong else f"{[t[1] for t in tagged]}")
+
+# Decimals follow the instrument, not a hardcoded 2. A sub-penny name shown at
+# 2 dp prints every level as the same rounded number.
+pane0 = win._panes[0]
+pane0.instruments.set_tick(pane0.symbol or "QQQ", 0.0001)
+pane0._tag_tick = -1.0
+pane0.sync_price_tag()
+check("the tag's decimals follow the instrument's tick",
+      pane0.price_line.label.format == "{value:,.4f}",
+      f"{pane0.price_line.label.format}")
+
+# ---- 8. the bookmap background and its LUT zero stop must be equal --------
+# The heat field is an image drawn over the background. If its zero-liquidity
+# colour differs at all, the field's extent shows as a rectangle sitting on
+# the chart - which is what darkening one without the other would have done.
+from omnitrix.render.bookmap import BOOKMAP_BG, _build_bookmap_lut
+_zero = _build_bookmap_lut()[0]
+_bg = QColor(BOOKMAP_BG)
+check("the bookmap's empty book matches its background exactly",
+      (_zero.red(), _zero.green(), _zero.blue())
+      == (_bg.red(), _bg.green(), _bg.blue()),
+      f"LUT {_zero.name()} vs BG {_bg.name()}")
 
 feed.stop()
 print()

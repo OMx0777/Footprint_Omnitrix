@@ -16,8 +16,8 @@ from ..render.crosshair import clock_label
 
 BUY = QColor(38, 166, 154)
 SELL = QColor(239, 83, 80)
-BG = QColor(18, 22, 31)
-GRID = QColor(34, 40, 52)
+BG = QColor(10, 13, 20)
+GRID = QColor(26, 32, 42)
 TEXT = QColor(200, 205, 214)
 
 

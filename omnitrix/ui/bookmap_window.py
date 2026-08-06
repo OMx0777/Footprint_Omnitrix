@@ -414,7 +414,7 @@ class BookmapWindow(QMainWindow):
         self.sym_search = QLineEdit(host)
         self.sym_search.setPlaceholderText("Type ticker, Enter to open")
         self.sym_search.setStyleSheet(
-            "QLineEdit{background:#12161F;color:#F0F0F0;border:2px solid #26A69A;"
+            "QLineEdit{background:#0A0D14;color:#F0F0F0;border:2px solid #26A69A;"
             " border-radius:8px;padding:8px 14px;font-size:15px;font-weight:700;"
             " letter-spacing:1px;}")
         self.sym_search.setFixedSize(240, 40)
@@ -712,16 +712,16 @@ class BookmapWindow(QMainWindow):
         tb.addWidget(self.btn_in)
 
         self.setStyleSheet(
-            "QMainWindow{background:#1A2226;}"
-            "QToolBar{background:#0C111A;border:none;padding:4px;spacing:4px;}"
+            "QMainWindow{background:#0A0D14;}"
+            "QToolBar{background:#05070C;border:none;padding:4px;spacing:4px;}"
             "QLabel{color:#C7CCD6;font-size:13px;font-weight:600;}"
             "QCheckBox{color:#C7CCD6;font-size:13px;font-weight:600;"
             " padding:0 6px;}"
-            "QComboBox{background:#1C2230;color:#EFEFEF;border:1px solid #2A3140;"
+            "QComboBox{background:#161A21;color:#EFEFEF;border:1px solid #282C34;"
             " border-radius:4px;padding:3px 8px;font-size:13px;}"
-            "QPushButton{background:#1C2230;color:#EFEFEF;border:1px solid #2A3140;"
+            "QPushButton{background:#161A21;color:#EFEFEF;border:1px solid #282C34;"
             " border-radius:4px;padding:4px 10px;font-weight:600;}"
-            "QPushButton:hover{background:#263042;}"
+            "QPushButton:hover{background:#282C34;}"
         )
 
     # ---- plots -----------------------------------------------------------

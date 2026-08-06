@@ -151,4 +151,4 @@ class DomLadderWindow(QMainWindow):
         self.setWindowTitle(f"Omnitrix DOM Ladder — {sym}")
         self.resize(520, 820)
         self.setCentralWidget(DomLadderWidget(app_window, self))
-        self.setStyleSheet("QMainWindow{background:#0B0E14;}")
+        self.setStyleSheet("QMainWindow{background:#05070C;}")

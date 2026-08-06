@@ -32,12 +32,34 @@ TOAST_SECONDS = 12.0
 
 
 class _Sounder(QObject):
-    """Beeps off the GUI thread, and refuses to queue them up."""
+    """Beeps off the GUI thread, and refuses to queue them up.
+
+    THE FALLBACK GOES BACK THROUGH A SIGNAL. QApplication.beep() is a GUI
+    call, and Qt's rule is that GUI classes are touched only from the thread
+    that owns them. The worker therefore emits, and Qt delivers the beep to
+    the GUI thread through the event loop.
+
+    Being straight about what this does and does not fix: it was proposed as
+    the cause of a freeze, and that does not hold up - called directly from a
+    worker on the real windows platform, with winsound forced to fail so the
+    fallback is the path taken, QApplication.beep() returns and the event loop
+    keeps running (60 timer ticks in 600 ms). It is still wrong to call it
+    there. Undefined behaviour that happens to work on one Qt build and one
+    audio stack is not a guarantee, and routing it correctly costs nothing.
+
+    The freeze that DID happen when an alert was armed was AlertBook.__bool__
+    - see the measurement there.
+    """
+
+    _fallback = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
         self._last = 0.0
         self._lock = threading.Lock()
+        # AutoConnection: emitted from the worker it queues to this object's
+        # thread, which is the one that imported the module - the GUI thread.
+        self._fallback.connect(self._system_beep)
 
     def play(self) -> None:
         now = time.monotonic()
@@ -47,8 +69,7 @@ class _Sounder(QObject):
             self._last = now
         threading.Thread(target=self._beep, daemon=True).start()
 
-    @staticmethod
-    def _beep() -> None:
+    def _beep(self) -> None:
         try:
             import winsound
             # Two short rising tones. Distinct from every Windows system
@@ -59,11 +80,15 @@ class _Sounder(QObject):
         except Exception:
             # No winsound, no audio device, or a locked-down session. An alert
             # that cannot beep must still show its toast rather than raise.
-            try:
-                from PyQt6.QtWidgets import QApplication
-                QApplication.beep()
-            except Exception:
-                log.debug("no audible alert available", exc_info=True)
+            self._fallback.emit()
+
+    @staticmethod
+    def _system_beep() -> None:
+        try:
+            from PyQt6.QtWidgets import QApplication
+            QApplication.beep()
+        except Exception:
+            log.debug("no audible alert available", exc_info=True)
 
 
 SOUNDER = _Sounder()

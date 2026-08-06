@@ -595,7 +595,7 @@ class OmnitrixWindow(QMainWindow):
         self.sym_search = QLineEdit(self._chart_host)
         self.sym_search.setPlaceholderText("Type ticker, Enter to open")
         self.sym_search.setStyleSheet(
-            "QLineEdit { background:#12161F; color:#F0F0F0; border:2px solid #26A69A;"
+            "QLineEdit { background:#0A0D14; color:#F0F0F0; border:2px solid #26A69A;"
             " border-radius:8px; padding:8px 14px; font-size:15px; font-weight:700;"
             " letter-spacing:1px; }")
         self.sym_search.setFixedSize(240, 40)
@@ -666,6 +666,14 @@ class OmnitrixWindow(QMainWindow):
                                              else Qt.PenStyle.DotLine)))
             pane.price_line.setPen(pg.mkPen(t.cvd, width=1,
                                             style=Qt.PenStyle.DashLine))
+            # The tag is filled, so its text colour is the BACKGROUND colour -
+            # left alone on a theme switch it stays dark-on-dark or
+            # light-on-light and the live price becomes unreadable.
+            _lbl = getattr(pane.price_line, "label", None)
+            if _lbl is not None:
+                _lbl.setColor(t.bg)
+                _lbl.fill = pg.mkBrush(t.cvd)
+                _lbl.update()
             pane.glw.setBackground(t.bg)
             pane.container.setStyleSheet(pane.container.styleSheet())
         # Restrained, terminal-like chrome. Painting every QPushButton in the
@@ -760,7 +768,7 @@ class OmnitrixWindow(QMainWindow):
                 # Alerts run HERE, not in a chart's paint, so a level on a
                 # symbol nobody is watching still fires. Costs one dict lookup
                 # per print when no alert exists for that symbol.
-                if self._alert_book_active:
+                if self.alerts:
                     hit = self.alerts.check(ev.symbol, ev.price)
                     if hit:
                         self._alert_pending.extend(hit)
@@ -968,11 +976,6 @@ class OmnitrixWindow(QMainWindow):
         self._apply_layout(LAYOUTS.get(txt, (1, 1, 1))[0])
 
     # ---- price alerts ----------------------------------------------------
-    @property
-    def _alert_book_active(self) -> bool:
-        """Skip the per-print check entirely when nothing is armed."""
-        return self.alerts.active_count() > 0
-
     def _fire_alerts(self, fired) -> None:
         """Beep once and show one toast, however many triggered together."""
         try:
@@ -1086,6 +1089,7 @@ class OmnitrixWindow(QMainWindow):
                 self._center(pane)
             elif pane.auto_scroll and pane.auto_y:
                 self._follow_price(bars, pane)
+            pane.sync_price_tag()
             pane.price_line.setPos(bars[-1].close)
             if pane.auto_scroll:
                 n = len(bars)

@@ -11,6 +11,15 @@ import os, sys, time, logging
 sys.path.insert(0, r"C:\Users\ADMIN\Desktop\Footprint_Omnitrix")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# The window RESTORES ~/.omnitrix_workspace.json on construction and SAVES it
+# on close, so without this the test both reads the operator's live desk (which
+# makes its preconditions depend on whatever they last had open) and can
+# overwrite it. Enforced by tests/clock_guard.py.
+from omnitrix.ui import workspace
+workspace.save = lambda *a, **k: None
+workspace.restore = lambda *a, **k: None
+
+
 from PyQt6.QtWidgets import QApplication
 from omnitrix.engine import Instruments, SyntheticFeed
 from omnitrix.ui.main_window import OmnitrixWindow, LAYOUTS, MAX_PANES

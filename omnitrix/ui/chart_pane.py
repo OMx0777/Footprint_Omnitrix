@@ -21,6 +21,7 @@ charts in a grid are budgeted as one window, which is what they are.
 
 from __future__ import annotations
 
+import math
 import time
 
 import pyqtgraph as pg
@@ -49,6 +50,9 @@ class ChartPane:
         # Empty means "follow the toolbar's symbol". Only panes 1..3 in a grid
         # carry their own, so a single-pane layout behaves exactly as before.
         self.symbol = ""
+        # Tick the live-price tag is currently formatted for. -1 so the first
+        # sync always runs.
+        self._tag_tick = -1.0
         # Timeframe is PER PANE: the point of a grid is comparing the same or
         # different names on different horizons at once - a 10s footprint next
         # to a 5m one - so a single window-wide timeframe would defeat it.
@@ -163,9 +167,19 @@ class ChartPane:
             pen=pg.mkPen("#666", style=Qt.PenStyle.DashLine))
         self.cvd_plot.addItem(self.cvd_zero, ignoreBounds=True)
 
+        # The live price, with the value in a tag against the right axis - the
+        # bookmap has had one and the footprint charts did not, so on the
+        # footprint you could see WHERE price was but had to read it off the
+        # axis gradations. Anchored at the right edge so it sits where the
+        # axis labels are and reads as one of them, but filled, so the live
+        # price is the one number on the axis that stands out.
         self.price_line = pg.InfiniteLine(
             angle=0, movable=False,
-            pen=pg.mkPen(theme.cvd, width=1, style=Qt.PenStyle.DashLine))
+            pen=pg.mkPen(theme.cvd, width=1, style=Qt.PenStyle.DashLine),
+            label="{value:,.2f}",
+            labelOpts={"position": 0.985, "color": theme.bg, "fill": theme.cvd,
+                       "movable": False,
+                       "anchors": [(1.0, 0.5), (1.0, 0.5)]})
         self.price_plot.addItem(self.price_line, ignoreBounds=True)
         self.vline = pg.InfiniteLine(
             angle=90, movable=False,
@@ -198,6 +212,27 @@ class ChartPane:
         self.set_cvd_visible(False)
 
     # ---- per-chart settings ---------------------------------------------
+    def sync_price_tag(self) -> None:
+        """Match the live-price tag's decimals to this instrument's tick.
+
+        Two decimals is right for most names and wrong for the ones that are
+        not - a sub-penny instrument would show every price as the same
+        rounded number, and a whole-dollar future would show a trailing ".00"
+        that never changes. Called from the redraw, so it early-outs on the
+        tick it already formatted for rather than rebuilding a format string
+        several times a second.
+        """
+        tick = self.instruments.tick(self.symbol or "QQQ")
+        if tick == self._tag_tick:
+            return
+        self._tag_tick = tick
+        d = 2
+        if tick > 0:
+            d = max(0, min(8, -int(math.floor(math.log10(tick)))))
+        lbl = getattr(self.price_line, "label", None)
+        if lbl is not None:
+            lbl.setFormat("{value:,.%df}" % d)
+
     def set_cvd_visible(self, on: bool) -> None:
         self.cvd_plot.setVisible(on)
         # The time axis lives on the bottom-most pane, so hiding CVD took the

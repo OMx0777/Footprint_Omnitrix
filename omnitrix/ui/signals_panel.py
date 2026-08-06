@@ -12,9 +12,9 @@ from PyQt6.QtWidgets import QWidget
 
 from ..engine import signals
 
-BG = QColor(15, 19, 28)
+BG = QColor(8, 11, 17)
 HEAD = QColor(143, 160, 182)
-RULE = QColor(35, 42, 54)
+RULE = QColor(28, 34, 44)
 TEXT = QColor(206, 212, 222)
 DIM = QColor(140, 148, 162)
 

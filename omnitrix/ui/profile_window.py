@@ -15,7 +15,7 @@ from ..render import TPOItem, VolumeProfileItem
 from ..render.crosshair import Crosshair
 from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
 
-BG = "#0B0E14"
+BG = "#05070C"
 
 
 class ProfileWindow(QMainWindow):
@@ -57,11 +57,11 @@ class ProfileWindow(QMainWindow):
         tb.addWidget(self.lbl)
         self.setStyleSheet(
             f"QMainWindow{{background:{BG};}}"
-            "QToolBar{background:#12161F;border:none;padding:4px;spacing:6px;}"
+            "QToolBar{background:#0A0D14;border:none;padding:4px;spacing:6px;}"
             "QLabel{color:#C7CCD6;font-size:13px;font-weight:600;}"
-            "QComboBox{background:#1C2230;color:#EFEFEF;border:1px solid #2A3140;"
+            "QComboBox{background:#161A21;color:#EFEFEF;border:1px solid #282C34;"
             " border-radius:4px;padding:3px 8px;}"
-            "QPushButton{background:#1C2230;color:#EFEFEF;border:1px solid #2A3140;"
+            "QPushButton{background:#161A21;color:#EFEFEF;border:1px solid #282C34;"
             " border-radius:4px;padding:4px 10px;font-weight:600;}")
 
     def _build_plots(self) -> None:
@@ -87,7 +87,7 @@ class ProfileWindow(QMainWindow):
         for plot in (self.tpo_plot, self.vp_plot):
             for ax in ("right", "bottom"):
                 a = plot.getAxis(ax)
-                a.setPen(pg.mkPen("#2A3140")); a.setTextPen(pg.mkPen("#8A93A6"))
+                a.setPen(pg.mkPen("#282C34")); a.setTextPen(pg.mkPen("#8A93A6"))
 
         # x is a TPO bracket / a volume ratio, not a time, so no time badge -
         # inventing one would label the axis with something it does not mean.

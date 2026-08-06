@@ -107,11 +107,11 @@ class TapeWindow(QMainWindow):
             "QToolBar{background:#0A0E14;border:none;padding:4px;spacing:4px;}"
             "QLabel{color:#C7CCD6;font-size:13px;font-weight:600;}"
             "QCheckBox{color:#C7CCD6;font-size:13px;font-weight:600;padding:0 6px;}"
-            "QComboBox{background:#1C2230;color:#EFEFEF;border:1px solid #2A3140;"
+            "QComboBox{background:#161A21;color:#EFEFEF;border:1px solid #282C34;"
             " border-radius:4px;padding:3px 8px;font-size:13px;}"
-            "QPushButton{background:#1C2230;color:#EFEFEF;border:1px solid #2A3140;"
+            "QPushButton{background:#161A21;color:#EFEFEF;border:1px solid #282C34;"
             " border-radius:4px;padding:4px 10px;font-weight:600;}"
-            "QPushButton:hover{background:#263042;}" % TAPE_BG
+            "QPushButton:hover{background:#282C34;}" % TAPE_BG
         )
 
     # ---- plots -----------------------------------------------------------

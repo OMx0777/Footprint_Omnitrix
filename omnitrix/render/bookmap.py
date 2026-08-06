@@ -37,11 +37,22 @@ SELL_BUBBLE = QColor(242, 82, 66)      # #F25242 — hit the bid
 BID_LINE = QColor(47, 168, 95)
 ASK_LINE = QColor(224, 74, 60)
 
-# The empty book is #1A2226 — a very dark blue-grey, not pure black. Sampled
-# from several genuinely empty regions of the capture; the quantised mode of the
-# whole field agrees at #181824. Pure black made the uncovered area read as a
-# hole punched in the chart.
-BOOKMAP_BG = "#1A2226"
+# The empty book, DARKENED from the sampled value on request.
+#
+# The capture's own empty book is #1A2226 — a very dark blue-grey, sampled from
+# several genuinely empty regions, with the quantised mode of the whole field
+# agreeing at #181824. That is recorded here because it is measured and the
+# measurement should not be lost; what is drawn is one step darker so the
+# bookmap sits at the same black as the rest of the terminal instead of
+# floating a paler panel inside it.
+#
+# It is still not pure black: that made the uncovered area read as a hole
+# punched in the chart, which was the original finding and has not changed.
+#
+# THIS AND THE LUT'S 0.00 STOP MUST STAY EQUAL. The heat field is drawn as an
+# image over the background, so if its zero-liquidity colour differs from the
+# background by even a little, the field's extent shows up as a rectangle.
+BOOKMAP_BG = "#0A0D14"
 
 
 def _build_bookmap_lut() -> list[QColor]:
@@ -62,7 +73,7 @@ def _build_bookmap_lut() -> list[QColor]:
     actually lives (measured mode: rgb(0,96,132)..rgb(0,120,180)).
     """
     stops = [
-        (0.00, (26, 34, 38)),      # #1A2226 — empty book (== background)
+        (0.00, (10, 13, 20)),      # #0A0D14 — empty book (== BOOKMAP_BG)
         (0.08, (12, 36, 48)),      # faintest resting size
         (0.18, (12, 48, 60)),
         (0.28, (12, 60, 84)),

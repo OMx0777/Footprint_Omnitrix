@@ -330,7 +330,7 @@ class PriceLevel(pg.InfiniteLine):
             hoverPen=pg.mkPen(colour, width=2),
             label="{value:,.2f}",
             labelOpts={"position": 0.02, "color": colour,
-                       "fill": (18, 22, 31, 210), "movable": False},
+                       "fill": (10, 13, 20, 215), "movable": False},
             **kw)
         self.colour = colour
         self.selected = False

@@ -52,7 +52,7 @@ def safe_localtime(t: float):
 
 
 BADGE_BG = "#9FB0C8"
-BADGE_FG = "#0B0E14"
+BADGE_FG = "#05070C"
 LINE_PEN = pg.mkPen("#666", style=Qt.PenStyle.DashLine)
 
 

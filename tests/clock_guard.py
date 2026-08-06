@@ -66,6 +66,45 @@ for f in root.rglob("*.py"):
             offenders.append(f"{f.relative_to(root)}:{i}")
 check("no unguarded time.localtime() left outside the helper",
       not offenders, str(offenders))
+
+# ---- no test may write the operator's real workspace ----------------------
+# This has now cost two separate incidents. OmnitrixWindow.__init__ RESTORES
+# ~/.omnitrix_workspace.json and closeEvent SAVES it, so any test that builds
+# one is reading the operator's live layout, and any test that closes one
+# overwrites it with four throwaway windows. tests/link_status.py did exactly
+# that, silently, every run.
+#
+# It is checked by scanning rather than by fixing it once, because the trap is
+# invisible at the call site: `win.close()` looks like tidy-up.
+#
+# The ordering rule is against the CONSTRUCTION, not the import. main_window
+# does `from . import workspace` and then `workspace.save(self)`, so the
+# attribute is looked up when it is called - replacing it any time before a
+# window exists is enough. (Reassigning workspace.PATH instead would NOT be:
+# `def save(win, path=PATH)` binds that default at import time.)
+tests_dir = pathlib.Path(__file__).resolve().parent
+bad = []
+for f in sorted(tests_dir.glob("*.py")):
+    # This file is the scanner: it contains the search literal itself and
+    # would otherwise report itself as a window it never builds.
+    if f.name.startswith("_") or f.name == pathlib.Path(__file__).name:
+        continue
+    src = f.read_text(encoding="utf-8")
+    if "OmnitrixWindow(" not in src:
+        continue
+    lines = src.splitlines()
+    save_at = next((i for i, l in enumerate(lines)
+                    if "workspace.save" in l and "lambda" in l), None)
+    built_at = next((i for i, l in enumerate(lines)
+                     if "OmnitrixWindow(" in l and not l.lstrip().startswith("#")
+                     and "import" not in l), None)
+    if save_at is None:
+        bad.append(f"{f.name}: builds a window without neutering workspace.save")
+    elif built_at is not None and save_at > built_at:
+        bad.append(f"{f.name}: neuters workspace.save only AFTER building a window")
+check("no test can write the operator's real workspace", not bad,
+      "; ".join(bad) if bad else f"{len(list(tests_dir.glob('*.py')))} test files scanned")
+
 print()
 if FAILS:
     print(f"FAILED: {len(FAILS)}"); sys.exit(1)

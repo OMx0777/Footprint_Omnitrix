@@ -11,6 +11,20 @@ sys.path.insert(0, __file__.rsplit("tests", 1)[0])
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication
 from omnitrix.engine import Instruments, SyntheticFeed
+from omnitrix.ui import workspace
+
+# NEUTER THE WORKSPACE BEFORE THE WINDOW IS EVER BUILT.
+#
+# OmnitrixWindow.__init__ restores ~/.omnitrix_workspace.json, which is the
+# REAL one - this test was reading the operator's saved alerts and asserting
+# an empty book against it, and closeEvent would have written its own back.
+#
+# It has to be done by replacing the functions, not by pointing
+# workspace.PATH somewhere else: `def save(win, path=PATH)` binds the default
+# at import time, so reassigning PATH afterwards changes nothing at all.
+workspace.save = lambda *a, **k: None
+workspace.restore = lambda *a, **k: None
+
 from omnitrix.ui.main_window import OmnitrixWindow
 from omnitrix.ui import alert_ui
 logging.basicConfig(level=logging.CRITICAL)
@@ -31,8 +45,7 @@ t0 = time.time()
 while time.time() - t0 < 4.0:
     app.processEvents(); win._tick(); time.sleep(0.01)
 
-check("no alerts armed means no per-print work",
-      win._alert_book_active is False)
+check("no alerts armed means no per-print work", bool(win.alerts) is False)
 
 # Arm on the symbol that is NOT displayed - the whole point of the feature.
 win.sym_combo.setCurrentText("QQQ")
@@ -41,8 +54,16 @@ spy = win.series.get("SPY")
 last_spy = spy.view(win.tf_s)[-1].close if spy and spy.view(win.tf_s) else 0.0
 check("the un-watched symbol has prints", last_spy > 0, f"SPY {last_spy:.2f}")
 
-a = win.alerts.add("SPY", last_spy + 0.05)
-check("arming makes the check active", win._alert_book_active is True)
+# A HALF-CENT away, not five cents.
+#
+# This asked a random walk to travel a fixed distance inside a fixed wall-clock
+# window. Run on its own it passed every time; run after the other 32 tests, on
+# a machine still busy, the walk did not get there and the next four checks all
+# failed - a flake that reports the feature as broken when it is not, which is
+# worse than no test. Half a cent is one tick, so the very next print on the
+# other side fires it whatever the walk does.
+a = win.alerts.add("SPY", last_spy + 0.005)
+check("arming makes the check active", bool(win.alerts) is True)
 
 fired_at = None
 t0 = time.time()
@@ -50,6 +71,15 @@ while time.time() - t0 < 12.0 and a.armed:
     app.processEvents(); win._tick(); time.sleep(0.005)
     if not a.armed and fired_at is None:
         fired_at = time.time()
+if a.armed:
+    # Still nothing: drive one print through the drain directly rather than
+    # waiting on the generator's mood. The property under test is "an alert on
+    # a symbol nobody is watching fires", not "SPY happens to move".
+    from omnitrix.engine.model import Trade, Aggressor
+    win._event_q.append(Trade("SPY", last_spy + 0.05, 100, Aggressor.BUY,
+                              int(time.time() * 1000)))
+    for _ in range(40):
+        app.processEvents(); win._tick(); time.sleep(0.005)
 check("an alert on a symbol NOT on screen still fires", not a.armed,
       f"{a.describe()} -> fired at {a.fired_price:.2f}" if not a.armed
       else "never fired")
@@ -73,6 +103,52 @@ real = alert_ui._Sounder()
 t = time.perf_counter(); real.play(); dt = (time.perf_counter() - t) * 1000
 check("play() returns immediately - it does NOT beep on this thread",
       dt < 20.0, f"{dt:.1f} ms")
+
+# ---- and the fallback must not touch Qt from that worker ------------------
+# winsound fails on a machine with no audio device, in a locked-down session,
+# and over some RDP configurations - none of which are exotic. The fallback
+# taken there used to call QApplication.beep() directly on the worker, which
+# breaks Qt's rule that GUI classes belong to one thread. It did not in fact
+# deadlock when measured, but "undefined behaviour that happened to work" is
+# not a property worth relying on, so the beep is routed back through a
+# signal. This asserts the worker only ever emits.
+import builtins
+
+seen = {"thread": None, "count": 0}
+main_thread = threading.get_ident()
+_real_import = builtins.__import__
+
+
+def _no_winsound(name, *a, **k):
+    if name == "winsound":
+        raise RuntimeError("simulated: no audio device")
+    return _real_import(name, *a, **k)
+
+
+snd = alert_ui._Sounder()
+snd._system_beep = None                     # unbound; the slot below replaces it
+snd._fallback.disconnect()
+snd._fallback.connect(lambda: seen.update(thread=threading.get_ident(),
+                                          count=seen["count"] + 1))
+builtins.__import__ = _no_winsound
+try:
+    snd.play()
+    for _ in range(200):                    # let the worker run and Qt deliver
+        app.processEvents()
+        time.sleep(0.005)
+        if seen["count"]:
+            break
+finally:
+    builtins.__import__ = _real_import
+
+check("a failing winsound still reaches the fallback", seen["count"] == 1,
+      f"{seen['count']} emissions")
+check("...delivered on the GUI thread, not the worker",
+      seen["thread"] == main_thread,
+      f"ran on {seen['thread']}, GUI is {main_thread}")
+
+qt_in_worker = "QApplication" in alert_ui._Sounder._beep.__code__.co_names
+check("the worker body contains no Qt call at all", not qt_in_worker)
 
 # Alt+A path
 win.sym_combo.setCurrentText("QQQ")

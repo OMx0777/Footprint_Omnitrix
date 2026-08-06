@@ -23,7 +23,7 @@ COLS = ["Symbol", "Last", "Chg", "Chg %", "Volume", "Delta", "CVD",
 UP = QColor(38, 190, 160)
 DOWN = QColor(239, 96, 96)
 NEUTRAL = QColor(200, 205, 214)
-BG = "#0B0E14"
+BG = "#05070C"
 
 
 def _fmt(v: float, dp: int = 0) -> str:
@@ -55,9 +55,9 @@ class MarketMonitorWindow(QMainWindow):
 
         self.setStyleSheet(
             f"QMainWindow{{background:{BG};}}"
-            "QTableWidget{background:#0F131C;alternate-background-color:#12161F;"
-            " color:#C8CDD6;gridline-color:#232A36;border:none;}"
-            "QHeaderView::section{background:#1A2130;color:#8FA0B6;"
+            "QTableWidget{background:#080B11;alternate-background-color:#0A0D14;"
+            " color:#C8CDD6;gridline-color:#1C222C;border:none;}"
+            "QHeaderView::section{background:#12161E;color:#8FA0B6;"
             " padding:6px;border:none;font-weight:700;}")
 
         self._rows: dict[str, int] = {}

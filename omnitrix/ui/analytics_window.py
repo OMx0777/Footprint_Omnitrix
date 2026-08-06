@@ -20,7 +20,7 @@ from ..engine import metrics
 from ..render.crosshair import Crosshair, clock_label
 from .bookmap_window import TF
 
-BG = "#0B0E14"
+BG = "#05070C"
 
 
 class AnalyticsWindow(QMainWindow):
@@ -52,9 +52,9 @@ class AnalyticsWindow(QMainWindow):
         tb.addWidget(self.lbl)
         self.setStyleSheet(
             f"QMainWindow{{background:{BG};}}"
-            "QToolBar{background:#12161F;border:none;padding:4px;spacing:6px;}"
+            "QToolBar{background:#0A0D14;border:none;padding:4px;spacing:6px;}"
             "QLabel{color:#C7CCD6;font-size:13px;font-weight:600;}"
-            "QComboBox{background:#1C2230;color:#EFEFEF;border:1px solid #2A3140;"
+            "QComboBox{background:#161A21;color:#EFEFEF;border:1px solid #282C34;"
             " border-radius:4px;padding:3px 8px;}")
 
     def _build_plots(self) -> None:
@@ -76,7 +76,7 @@ class AnalyticsWindow(QMainWindow):
                 pl.hideAxis("bottom")
             for ax in ("right", "bottom"):
                 a = pl.getAxis(ax)
-                a.setPen(pg.mkPen("#2A3140")); a.setTextPen(pg.mkPen("#8A93A6"))
+                a.setPen(pg.mkPen("#282C34")); a.setTextPen(pg.mkPen("#8A93A6"))
             self.plots.append(pl)
 
         # Every pane shares the x axis, so each gets its own readout: the y

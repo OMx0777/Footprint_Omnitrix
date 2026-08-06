@@ -24,6 +24,18 @@ import logging
 sys.path.insert(0, __file__.rsplit("tests", 1)[0])
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# status_for() below calls win.close(), and closeEvent saves the workspace -
+# so this test was overwriting the operator's REAL ~/.omnitrix_workspace.json
+# with whatever four throwaway windows happened to be showing.
+#
+# Pointing workspace.PATH elsewhere does NOT work: `def save(win, path=PATH)`
+# binds the default at import time, so the function keeps the old path however
+# the module attribute is changed afterwards. The functions themselves have to
+# go, and before OmnitrixWindow is imported.
+from omnitrix.ui import workspace
+workspace.save = lambda *a, **k: None
+workspace.restore = lambda *a, **k: None
+
 from PyQt6.QtWidgets import QApplication
 
 from omnitrix.engine import Instruments, SyntheticFeed

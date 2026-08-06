@@ -91,8 +91,37 @@ check("alerts survive save/restore",
 b9.load([{"symbol": "X"}, None, {"price": 1.0}])
 check("a corrupt saved alert is skipped, not fatal", len(b9.all()) == 0)
 
-# ---- cost: this runs on EVERY print of EVERY symbol -----------------------
+# ---- cost: the GATE, which runs on every print before the check does ------
+# This is the hole the first version of the feature fell through. The check
+# below was measured and cheap; the thing GUARDING it was not, and nothing
+# looked at it. active_count() > 0 goes through all() - a list build and a
+# sort - so arming a single alert made every print of every symbol slower for
+# the rest of the session, and a FIRED alert stayed in the book still being
+# sorted. Measured per print: 0.586 us with the book empty, 5.347 us with 21
+# alerts, against 0.141 us for the check it was protecting.
 import time
+b_gate = AlertBook()
+for i in range(30):
+    b_gate.add(f"G{i:02d}", 100.0 + i)
+for a in b_gate.all():
+    a.armed = False                       # all spent: the state it ends up in
+t = time.perf_counter()
+for _ in range(200000):
+    bool(b_gate)
+gate_ns = (time.perf_counter() - t) / 200000 * 1e9
+check("the per-print gate is O(1), not a sort of the whole book",
+      gate_ns < 300, f"{gate_ns:.0f} ns per print with 30 spent alerts")
+
+b_empty = AlertBook()
+t = time.perf_counter()
+for _ in range(200000):
+    bool(b_empty)
+check("...and costs the same when nothing is armed",
+      (time.perf_counter() - t) / 200000 * 1e9 < 300)
+
+b_gate.clear()
+check("clearing the book turns the gate off", bool(b_gate) is False)
+
 b10 = AlertBook()
 for i in range(50):
     b10.add(f"S{i:02d}", 100.0 + i)
