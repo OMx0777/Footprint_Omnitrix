@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..engine.model import split_size
+from ..engine.bookmap import _AG_FROM
 from ..render.tape import TapePrintsItem, TapeSpeedItem, TapeCvdItem, TAPE_BG
 from ..render.crosshair import Crosshair, clock_label
 from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
@@ -191,20 +192,31 @@ class TapeWindow(QMainWindow):
         The buffer stores x already divided by col_dt, so it is multiplied back
         into real seconds here: the tape's axis is wall clock, not column index.
         """
-        trades = self.buffer.trades
-        if not trades:
+        buf = self.buffer
+        n = len(buf.trades)
+        if not n:
             return [], 0.0, 0.0, (0, 0, 0)
-        dt = self.buffer.col_dt
+        dt = buf.col_dt
         tick = self.tick
-        hi = trades[-1][0] * dt
+        # Read the RING ARRAYS. Walking buffer.trades in reverse goes through
+        # the sequence view, which builds a tuple per entry - fine for the ~40
+        # rows a widget shows, but this walks every print in the visible span
+        # and it pushed the tape frame from 60 to 99 ms.
+        tx, tti, tsz, tag = buf.trade_x, buf.trade_ti, buf.trade_sz, buf.trade_ag
+        cap = buf.max_trades
+        base = buf._tape_first
+        hi = tx[(base + n - 1) % cap] * dt
         lo = hi - self.span
         out = []
         vol = buy = 0
-        for x, ti, size, aggr in reversed(trades):
-            t = x * dt
+        for k in range(n - 1, -1, -1):
+            pidx = (base + k) % cap
+            t = tx[pidx] * dt
             if t < lo:
                 break
-            b, _s = split_size(size, aggr, ti)
+            ti = int(tti[pidx])
+            size = int(tsz[pidx])
+            b, _s = split_size(size, _AG_FROM[tag[pidx]], ti)
             out.append((t, ti * tick, size, b))
             vol += size
             buy += b

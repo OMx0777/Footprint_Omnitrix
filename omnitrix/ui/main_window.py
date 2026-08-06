@@ -19,6 +19,8 @@ from PyQt6.QtWidgets import (
 )
 
 from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
+from .alert_ui import AlertToast, SOUNDER
+from ..engine.alerts import AlertBook, CROSS, ABOVE, BELOW
 from .chart_pane import ChartPane
 from ..engine import (
     Instruments, BarSeries, BookmapBuffer, SessionProfile, Feed,
@@ -133,6 +135,11 @@ class OmnitrixWindow(QMainWindow):
         # properties below) - each chart follows its own symbol independently.
         self._dirty = False
         self._known_symbols: set[str] = set()
+        # Price alerts. Checked in the drain, for EVERY symbol - the point of
+        # the feature is being told about a level on a name you are not
+        # currently looking at.
+        self.alerts = AlertBook()
+        self._alert_pending: list = []
 
         # thread-safe hand-off: feed thread appends, GUI timer drains.
         # ONE queue keeps trades and books in their true time order, so a book
@@ -597,6 +604,9 @@ class OmnitrixWindow(QMainWindow):
         self.sym_search.installEventFilter(self)
 
         self._last_cursor = None
+        # Parented to the chart host so it cannot end up behind the terminal,
+        # and cannot steal focus while a ticker is being typed.
+        self._toast = AlertToast(self._chart_host)
 
         # ---- Time & Sales tape dock (right) ----
         self.tape = TapeWidget(
@@ -747,6 +757,13 @@ class OmnitrixWindow(QMainWindow):
                 # three charts you are not clicking on would sit frozen.
                 if self._shows(ev.symbol):
                     self._dirty = True
+                # Alerts run HERE, not in a chart's paint, so a level on a
+                # symbol nobody is watching still fires. Costs one dict lookup
+                # per print when no alert exists for that symbol.
+                if self._alert_book_active:
+                    hit = self.alerts.check(ev.symbol, ev.price)
+                    if hit:
+                        self._alert_pending.extend(hit)
             else:  # BookSnapshot
                 self.latest_book[ev.symbol] = ev
                 self._bookmap(ev.symbol).add_book(ev)
@@ -764,6 +781,10 @@ class OmnitrixWindow(QMainWindow):
                     s.add_book(ev)
                 if self._shows(ev.symbol):
                     self._dirty = True
+
+        if self._alert_pending:
+            fired, self._alert_pending = self._alert_pending, []
+            self._fire_alerts(fired)
 
         # Refresh the live indicator ~2x/sec even when no data is flowing, so
         # "waiting for Takion" is visible before the first tick arrives.
@@ -945,6 +966,40 @@ class OmnitrixWindow(QMainWindow):
 
     def _on_layout(self, txt: str) -> None:
         self._apply_layout(LAYOUTS.get(txt, (1, 1, 1))[0])
+
+    # ---- price alerts ----------------------------------------------------
+    @property
+    def _alert_book_active(self) -> bool:
+        """Skip the per-print check entirely when nothing is armed."""
+        return self.alerts.active_count() > 0
+
+    def _fire_alerts(self, fired) -> None:
+        """Beep once and show one toast, however many triggered together."""
+        try:
+            SOUNDER.play()
+            self._toast.show_alerts(fired)
+            for a in fired:
+                log.info("ALERT %s at %.2f%s", a.symbol, a.fired_price,
+                         f" ({a.note})" if a.note else "")
+        except Exception:
+            log.exception("alert notification failed (the alert still fired)")
+
+    def add_alert_here(self) -> bool:
+        """Alt+A: alert at the crosshair's price on this chart's symbol."""
+        if self._last_cursor is None or not self.active_symbol:
+            return False
+        price = float(self._last_cursor[1])
+        if not (price > 0.0):
+            return False
+        tick = self.instruments.tick(self.active_symbol)
+        price = round(round(price / tick) * tick, 10)
+        a = self.alerts.add(self.active_symbol, price, CROSS)
+        # Draw it, so the level is visible on the chart rather than only
+        # existing in a list somewhere.
+        self._add_price_level(price)
+        log.info("alert armed: %s", a.describe())
+        self.lbl_stats.setText(f"  alert armed: {a.describe()}  ")
+        return True
 
     def _register_symbol(self, sym: str) -> None:
         self._known_symbols.add(sym)
@@ -1183,6 +1238,10 @@ class OmnitrixWindow(QMainWindow):
         # Alt+H drops a price level where the crosshair is.
         if key == Qt.Key.Key_H and mods & Qt.KeyboardModifier.AltModifier:
             self._add_price_level()
+            return
+        # Alt+A arms a price ALERT there - a level that beeps.
+        if key == Qt.Key.Key_A and mods & Qt.KeyboardModifier.AltModifier:
+            self.add_alert_here()
             return
         # Delete/Backspace removes the selected drawing. Checked before the
         # ticker search so the shortcuts cannot be swallowed by it.

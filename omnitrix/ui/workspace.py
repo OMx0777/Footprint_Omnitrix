@@ -40,6 +40,9 @@ def save(win, path: str = PATH) -> bool:
             "value_area": win.chk_va.isChecked(),
             "vwap": win.chk_vwap.isChecked(),
             "show_candles": fp.show_candles,
+            # Alerts are levels somebody chose to watch. Losing them on a
+            # restart is losing work, and the app restarts more than it should.
+            "alerts": win.alerts.to_list() if hasattr(win, "alerts") else [],
         }
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -72,6 +75,9 @@ def restore(win, path: str = PATH) -> bool:
             v = d.get(key)
             if v and combo.findText(v) >= 0:
                 combo.setCurrentText(v)
+
+        if "alerts" in d and hasattr(win, "alerts"):
+            win.alerts.load(d.get("alerts"))
 
         for chk, key in ((win.chk_imb, "imbalance"),
                          (win.chk_va, "value_area"),
