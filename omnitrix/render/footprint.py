@@ -23,6 +23,14 @@ from .pricegrid import AUTO_STEPS, TARGET_PX_LABELLED, step_ticks
 class FootprintItem(pg.GraphicsObject):
     BOX_W = 0.66                      # column block width in x-units
     CANDLE_GAP = 0.06                 # gap between candle and block
+    # Half-width of the candle body, in x-units. The body sits ON the split
+    # between the sell and buy histograms, so it has to be narrow enough that
+    # both sides remain readable and wide enough to read as a candle.
+    CANDLE_HW = 0.055
+    # Vertical padding inside a row, as a fraction of row height. A hairline
+    # between rows is what makes a stack of bars read as a histogram rather
+    # than as one solid block.
+    ROW_INSET = 0.12
     # Narrower than this (screen px across the whole block) and no cell label
     # can fit, so skip the text pass entirely rather than emit clipped digits.
     MIN_LABEL_PX = 26.0
@@ -159,27 +167,45 @@ class FootprintItem(pg.GraphicsObject):
         # drawing the footprint itself.
         pens = {}
         for cc in (c_bull, c_bear):
-            pens[(cc.name(), 2)] = pg.mkPen(cc, width=2)
+            pens[(cc.name(), 2)] = pg.mkPen(cc.lighter(118), width=2)
             pens[(cc.name(), 1)] = pg.mkPen(cc, width=1)
         brushes = {cc.name(): pg.mkBrush(cc) for cc in (c_bull, c_bear)}
+        self._body_pen = pg.mkPen(QColor(t.bg), width=1)
         pal = {
             "poc_bg": QColor(t.poc_bg), "bid_bg": QColor(t.bid_bg),
             "ask_bg": QColor(t.ask_bg), "bull": QColor(t.bull),
             "bear": QColor(t.bear), "va_line": QColor(t.va_line),
+            "sell_bar": QColor(t.sell_bar), "buy_bar": QColor(t.buy_bar),
         }
+
+        # ONE BASELINE FOR EVERY FOOTER IN THE VIEW.
+        #
+        # Each footer used to hang under its OWN bar's low, so on a trending
+        # chart they landed at wildly different heights and a bar's delta sat
+        # in the middle of its neighbour's cells. That is the overlap: not a
+        # font or a margin, an anchor that moves per bar. Anchored to the
+        # lowest low on screen they form one clean row, which is also how
+        # every chart worth copying draws its volume.
+        base_y = None
+        if show_text and x_hi > x_lo:
+            lows = [self.bars[i].low for i in range(x_lo, x_hi)]
+            if lows:
+                base_y = min(lows) - self.tick
 
         for x in range(x_lo, x_hi):
             bar = self.bars[x]
             cc = c_bull if bar.is_bull else c_bear
-            if self.show_candles:
-                self._paint_candle(p, x, bar, cc, half, tick,
-                                   pens[(cc.name(), 2)], pens[(cc.name(), 1)],
-                                   brushes[cc.name()])
             if self.draw_cells and bar.has_cells():
                 # Fold onto the drawn grid first, so POC, value area and the
                 # diagonal imbalances all describe the rows on screen.
                 self._paint_block(p, x, bar.aggregated(step), half, row_h,
-                                  show_text, pal)
+                                  show_text, pal, base_y)
+            # AFTER the cells: the candle is the thing you read first, so it
+            # goes on top of its own volume rather than under it.
+            if self.show_candles:
+                self._paint_candle(p, x, bar, cc, half, tick,
+                                   pens[(cc.name(), 2)], pens[(cc.name(), 1)],
+                                   brushes[cc.name()])
 
     def _step_ticks(self, px_h: float) -> int:
         """Ticks per drawn footprint row (`price_step` <= 0 selects auto)."""
@@ -188,18 +214,31 @@ class FootprintItem(pg.GraphicsObject):
 
     def _paint_candle(self, p, x, bar, color, half, tick,
                       pen2, pen1, brush) -> None:
-        cx = x - half - self.CANDLE_GAP
+        """The candle sits at the CENTRE of its column, not beside it.
+
+        The footprint then reads as one object: the candle down the middle
+        with its sell volume growing left and its buy volume growing right,
+        the way a profile grows from its axis. Drawn AFTER the cells so the
+        body stays legible over them.
+        """
+        cx = float(x)
         p.setPen(pen2)
         p.drawLine(QPointF(cx, bar.low), QPointF(cx, bar.high))
         top = max(bar.open, bar.close)
         bot = min(bar.open, bar.close)
         if top == bot:
             top += tick / 8
-        p.setPen(pen1)
+        # OUTLINED IN THE BACKGROUND COLOUR. The body now sits ON TOP of its
+        # own histogram, in the same hue family, so without a separating edge
+        # it disappears into the volume behind it - the candle stops being the
+        # thing you read first, which is the whole point of centring it.
         p.setBrush(brush)
-        p.drawRect(QRectF(cx - 0.09, bot, 0.18, top - bot))
+        p.setPen(self._body_pen)
+        p.drawRect(QRectF(cx - self.CANDLE_HW, bot,
+                          self.CANDLE_HW * 2, top - bot))
 
-    def _paint_block(self, p, x, bar, half, row_h, show_text, pal) -> None:
+    def _paint_block(self, p, x, bar, half, row_h, show_text, pal,
+                     base_y=None) -> None:
         """`bar` is already folded onto the drawn grid; its cell keys are BUCKET
         indices and one row spans `row_h` in price."""
         t = self.theme
@@ -228,6 +267,9 @@ class FootprintItem(pg.GraphicsObject):
 
         # scaling references for Profile / Delta modes
         max_tot = max((s + b for _t, s, b in cells), default=1) or 1
+        # One scale for both wings, so a row with 900 buys and 100 sells reads
+        # as lopsided rather than as two full-width blocks.
+        max_side = max((max(s, b) for _t, s, b in cells), default=1) or 1
         max_abs_d = max((abs(b - s) for _t, s, b in cells), default=1) or 1
 
         tr = p.transform()
@@ -247,17 +289,30 @@ class FootprintItem(pg.GraphicsObject):
             is_poc = ti == poc
 
             if mode == "Footprint":
-                c_sell = pal["poc_bg"] if is_poc else pal["bid_bg"]
-                c_buy = pal["poc_bg"] if is_poc else pal["ask_bg"]
-                if ti in sell_imb:
-                    c_sell = t.sell_imb
-                if ti in buy_imb:
-                    c_buy = t.buy_imb
-                p.fillRect(QRectF(x - half, y, half, row_h), c_sell)
-                p.fillRect(QRectF(x, y, half, row_h), c_buy)
+                # A HISTOGRAM EITHER SIDE OF THE CANDLE, not two filled boxes.
+                #
+                # Full-width boxes made every row the same size, so the shape
+                # of the auction was carried only by colour and by numbers too
+                # small to read at a glance. Scaling each side by its own
+                # volume turns the column into what it actually is - a profile
+                # split by aggressor, growing outward from the candle - and the
+                # heavy rows are then visible without reading a single digit.
+                ws = half * (sell_v / max_side)
+                wb = half * (buy_v / max_side)
+                c_sell = t.sell_imb if ti in sell_imb else pal["sell_bar"]
+                c_buy = t.buy_imb if ti in buy_imb else pal["buy_bar"]
+                if is_poc:
+                    c_sell = c_buy = pal["poc_bg"]
+                inset = row_h * self.ROW_INSET
+                yy, hh = y + inset, max(row_h - 2 * inset, row_h * 0.4)
+                if ws > 0:
+                    p.fillRect(QRectF(x - ws, yy, ws, hh), c_sell)
+                if wb > 0:
+                    p.fillRect(QRectF(x, yy, wb, hh), c_buy)
                 if show_text:
                     self._cell_two(p, tr, x, y, row_h, half, sell_v, buy_v,
-                                   t.poc_text if is_poc else t.cell_text)
+                                   t.poc_text if is_poc else t.cell_text,
+                                   ws, wb)
 
             elif mode == "Cluster":
                 bg = pal["poc_bg"] if is_poc else (
@@ -295,7 +350,7 @@ class FootprintItem(pg.GraphicsObject):
         if show_text:
             # Footer sits just under the bar's low, so it is offset by a real
             # tick - scaling that by the price step would push it far off at $1.
-            self._paint_footer(p, tr, x, bar, half, self.tick)
+            self._paint_footer(p, tr, x, bar, half, self.tick, base_y)
 
     def _fits(self, rect: QRectF, text: str) -> bool:
         """Does `text` fit inside `rect` (screen px) without being clipped?
@@ -308,9 +363,15 @@ class FootprintItem(pg.GraphicsObject):
         return (rect.width() >= fm.horizontalAdvance(text) + 2
                 and rect.height() >= fm.height() - 2)
 
-    def _cell_two(self, p, tr, x, y, row_h, half, sell_v, buy_v, color) -> None:
-        rb = tr.mapRect(QRectF(x - half, y, half - 0.05, row_h))
-        ra = tr.mapRect(QRectF(x + 0.05, y, half - 0.05, row_h))
+    def _cell_two(self, p, tr, x, y, row_h, half, sell_v, buy_v, color,
+                  ws=None, wb=None) -> None:
+        # Numbers sit against the OUTER end of their own bar, never over the
+        # candle in the middle. Given the bar widths they follow the histogram
+        # out; without them (other modes) they fall back to the half-column.
+        lw = half if ws is None else max(ws, 0.0)
+        rw = half if wb is None else max(wb, 0.0)
+        rb = tr.mapRect(QRectF(x - max(lw, 0.02), y, max(lw, 0.02) - 0.01, row_h))
+        ra = tr.mapRect(QRectF(x + 0.01, y, max(rw, 0.02) - 0.01, row_h))
         s_txt, b_txt = _fmt(sell_v), _fmt(buy_v)
         s_ok, b_ok = self._fits(rb, s_txt), self._fits(ra, b_txt)
         if not (s_ok or b_ok):
@@ -354,7 +415,7 @@ class FootprintItem(pg.GraphicsObject):
             p.drawRect(QRectF(x - half, a * row_h - row_h / 2, half,
                               (b - a) * row_h + row_h))
 
-    def _paint_footer(self, p, tr, x, bar, half, tick) -> None:
+    def _paint_footer(self, p, tr, x, bar, half, tick, base_y=None) -> None:
         t = self.theme
         # Anchored to the bar's low in screen space and stacked by real font
         # metrics. The old version offset by a hardcoded 10 px and 26 px, which
@@ -362,7 +423,8 @@ class FootprintItem(pg.GraphicsObject):
         # collided with the block above it or with the volume line below.
         fm = self._fm
         line = fm.height() + 1
-        base = tr.map(QPointF(float(x), bar.low - tick)).y()
+        anchor = base_y if base_y is not None else (bar.low - tick)
+        base = tr.map(QPointF(float(x), anchor)).y()
         w = tr.mapRect(QRectF(x - half, 0.0, self.BOX_W, tick)).width()
         cx = tr.map(QPointF(float(x), 0.0)).x()
 
