@@ -126,6 +126,10 @@ BACKFILL_HOLD_MAX_S = 45.0
 # depth moves 934 MB so the buffer can discard 94% of it.
 BACKFILL_SESSION_H = 7.0
 BACKFILL_L2_MIN = 23.0
+# How long to wait for the multicast seam before giving up on history. The join
+# buffers for a second before publishing first_live_seq, so this only has to
+# cover a slow start - not a slow load, which has its own cap.
+BACKFILL_SEAM_WAIT_S = 12.0
 
 TF_CHOICES = {
     "5s": 5, "10s": 10, "15s": 15, "30s": 30,
@@ -254,6 +258,8 @@ class OmnitrixWindow(QMainWindow):
         # Cancelled workers that have not noticed yet. Held so Qt cannot
         # destroy a running QThread; reaped in _tick.
         self._bf_zombies: list = []
+        self._bf_want = None
+        self._bf_arm_timer = None
 
         self._timer = GovernedTimer(self, self._tick, 33, priority=0)
         self.glw.set_gov_key(id(self))
@@ -821,12 +827,14 @@ class OmnitrixWindow(QMainWindow):
     def _drain_and_draw(self) -> None:
         drained = 0
         q = self._event_q
-        if self._bf_state == "holding":
+        if self._bf_state in ("arming", "holding"):
             # HELD, NOT DROPPED. The events stay in the queue and are drained
             # in order once the history is in, so the replay and the live
-            # stream meet at the seam rather than interleaving.
+            # stream meet at the seam rather than interleaving. "arming" is
+            # held for the same reason: a bar built from the first second of
+            # live data would make the swap refuse.
             self._check_backfill_hold()
-            if self._bf_state == "holding":
+            if self._bf_state in ("arming", "holding"):
                 self._update_link()
                 return
         backlog = len(q)
@@ -1403,8 +1411,17 @@ class OmnitrixWindow(QMainWindow):
         # holding the whole session; the difference has to be on screen, not
         # only in a log file nobody reads until something has already gone
         # wrong.
-        if self._bf_state == "holding":
+        if self._bf_state in ("arming", "holding"):
             txt += "   ⏳ loading history…"
+            # ON THE PANES TOO. The toolbar is one line at the top of one
+            # window; a trader looking at a four-chart grid needs to know which
+            # of those four is still filling in, not merely that something is.
+            for p_ in self._panes[:self._n_panes]:
+                if not p_.symbol or p_.symbol in self._bf_done:
+                    continue
+                if self._bf_want is None or p_.symbol in (self._bf_symbols
+                                                          or self._bf_want or []):
+                    p_.lbl_last.setText("loading history…")
         elif self._bf_state == "live_only":
             txt += "   ⚠ LIVE ONLY (no history)"
             col = "#FFB300"
@@ -2032,6 +2049,61 @@ class OmnitrixWindow(QMainWindow):
         self._history_timer.start()
 
     # ---- startup backfill --------------------------------------------------
+    def arm_startup_backfill(self, symbols=None) -> bool:
+        """Take the hold NOW, then wait for the seam.
+
+        Called straight after start_feed(). The order matters and is not
+        obvious: MulticastFeed buffers for a second before it can publish
+        first_live_seq, and if the stream were left running during that second
+        the drain would build bars from it - after which the swap correctly
+        refuses to replace a series that has already counted live trades, and
+        the backfill would fail every single time on a real cold start.
+
+        So the hold is taken before the seam is known. Nothing is processed,
+        nothing is counted, and the slot the worker builds into stays empty.
+        """
+        if self._bf_state not in ("idle",):
+            return False
+        if not getattr(self.feed, "replay_host", ""):
+            self._bf_state = "live_only" if getattr(self.feed, "connected", None)                 else "done"
+            return False
+        self._bf_want = list(symbols) if symbols is not None else None
+        self._bf_since = time.monotonic()
+        self._bf_dropped_at = self._dropped
+        self._bf_state = "arming"
+        self._bf_arm_timer = QTimer(self)
+        self._bf_arm_timer.setInterval(150)
+        self._bf_arm_timer.timeout.connect(self._bf_poll_seam)
+        self._bf_arm_timer.start()
+        log.info("startup backfill: holding from the first tick, waiting for "
+                 "the multicast seam")
+        return True
+
+    def _bf_poll_seam(self) -> None:
+        """The seam appears asynchronously; start the load the moment it does."""
+        if self._bf_state != "arming":
+            self._bf_arm_timer.stop()
+            return
+        seam = dict(getattr(self.feed, "first_live_seq", {}) or {})
+        if seam:
+            self._bf_arm_timer.stop()
+            # Only what is ON SCREEN. Four or five names is a few seconds; the
+            # other 990 stay on demand, because a mass reconnect of 100 clients
+            # each pulling a session is the one moment the LAN cannot take it.
+            syms = self._bf_want
+            if syms is None:
+                syms = sorted({p.symbol for p in self._panes[:self._n_panes]
+                               if p.symbol})
+            self._bf_state = "idle"          # let begin_ take it properly
+            if not self.begin_startup_backfill(syms):
+                self._bf_state = "live_only" if syms else "done"
+            return
+        if time.monotonic() - self._bf_since > BACKFILL_SEAM_WAIT_S:
+            self._bf_arm_timer.stop()
+            log.warning("startup backfill: no multicast seam after %.0fs - "
+                        "LIVE ONLY", BACKFILL_SEAM_WAIT_S)
+            self._bf_state = "live_only"
+
     def begin_startup_backfill(self, symbols=None) -> bool:
         """Hold the live stream and load today's history for `symbols`.
 
@@ -2110,11 +2182,17 @@ class OmnitrixWindow(QMainWindow):
         series.set_hot(True)
         buf.set_hot(True)
         log.info("startup backfill: %s loaded %s", symbol, rep)
+        for p_ in self._panes:
+            if p_.symbol == symbol:
+                p_.lbl_last.setText("")
         self._bf_done.add(symbol)
         self._maybe_finish_backfill()
 
     def _on_backfill_failed(self, symbol, err) -> None:
         log.warning("startup backfill: %s unavailable (%s)", symbol, err)
+        for p_ in self._panes:
+            if p_.symbol == symbol:
+                p_.lbl_last.setText("no history")
         self._bf_done.add(symbol)
         self._bf_failed.add(symbol)
         self._maybe_finish_backfill()
@@ -2185,6 +2263,9 @@ class OmnitrixWindow(QMainWindow):
             self._bf_zombies.append(f)
         self._bf_state = "live_only"
         self._bf_symbols = []
+        for p_ in self._panes:
+            if p_.lbl_last.text().startswith("loading"):
+                p_.lbl_last.setText("no history")
 
     def release_backfill(self) -> None:
         """History is in. Let the held live events through, in order."""

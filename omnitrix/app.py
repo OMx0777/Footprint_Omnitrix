@@ -288,6 +288,16 @@ def main() -> int:
         print(f"[omnitrix] recording -> {args.record}")
 
     win.start_feed()
+
+    # THE DAY'S HISTORY, for the symbols on screen. Armed immediately after
+
+    # start_feed and NOT before: the hold has to be taken from the first tick
+
+    # (see arm_startup_backfill), but the feed object has to exist to be asked
+
+    # for the seam. Silently does nothing on a feed with no replay server.
+
+    win.arm_startup_backfill()
     win.show()
     try:
         return app.exec()
