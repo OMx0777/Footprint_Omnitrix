@@ -456,6 +456,10 @@ class BarSeries:
         # only the affected tail instead of re-folding the whole session.
         self._tf_dirty: dict[int, int] = {}
         self._evicted = 0          # bumped when max_bars drops a bar off the front
+        # Trades that arrived too late to place at all - see add_trade. A bulk
+        # loader checks these are zero; live they are a health signal.
+        self.dropped_late = 0
+        self.dropped_late_vol = 0
         self._ov_cache: dict[int, tuple[tuple, tuple]] = {}
 
         # ---- O(1) running session stats -------------------------------------
@@ -583,7 +587,23 @@ class BarSeries:
                 self._stat_trade(tr)
                 self._touch(bucket)
                 self._version += 1
-            return              # too late to place: not charted, not counted
+            else:
+                # NOT CHARTED, NOT COUNTED - and now at least recorded.
+                #
+                # `bars` is drawn by index, so a bar cannot be inserted behind
+                # the last one without sending the x-axis backwards; a trade
+                # whose bucket was never created therefore has nowhere to go.
+                # Live that is one stale tick. In a BULK REPLAY it was 0.08% of
+                # a session's volume - measured - vanishing with nothing to say
+                # so, which is the kind of quiet shortfall this codebase treats
+                # as false data.
+                #
+                # The cure is to sort a bulk payload by timestamp before
+                # ingesting it, which removes the case entirely. This counter
+                # is how a loader checks that it did.
+                self.dropped_late += 1
+                self.dropped_late_vol += tr.size
+            return
 
         if not self.bars or self.bars[-1].start_ts != bucket:
             if self.bars:
