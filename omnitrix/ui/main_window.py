@@ -828,14 +828,24 @@ class OmnitrixWindow(QMainWindow):
         drained = 0
         q = self._event_q
         if self._bf_state in ("arming", "holding"):
-            # HELD, NOT DROPPED. The events stay in the queue and are drained
-            # in order once the history is in, so the replay and the live
-            # stream meet at the seam rather than interleaving. "arming" is
-            # held for the same reason: a bar built from the first second of
-            # live data would make the swap refuse.
+            # HOLD THE DRAIN, NOT THE DRAW.
+            #
+            # The events stay in the queue and are drained in order once the
+            # history is in, so the replay and the live stream meet at the seam
+            # rather than interleaving. "arming" is held for the same reason: a
+            # bar built from the first second of live data would make the swap
+            # refuse.
+            #
+            # But returning from here skipped the REDRAW as well, and with a
+            # seam wait plus a load cap that is nearly a minute in which the
+            # window paints nothing and changes nothing. Reported as "the app
+            # froze", and fairly - a terminal that has stopped updating is
+            # frozen as far as anyone using it is concerned. The frame still
+            # runs; only the queue is left alone.
             self._check_backfill_hold()
             if self._bf_state in ("arming", "holding"):
                 self._update_link()
+                self._redraw()
                 return
         backlog = len(q)
         budget = DRAIN_BUDGET_BUSY_S if backlog >= DRAIN_BUSY_AT else DRAIN_BUDGET_S
@@ -2166,6 +2176,19 @@ class OmnitrixWindow(QMainWindow):
         assumption has broken somewhere and the right answer is to keep what
         is real and refuse the load.
         """
+        if not rep.get("trades") and not rep.get("books"):
+            # NOTHING CAME BACK. Swapping in an empty series would replace a
+            # live one with less than it had and report success; the honest
+            # answer is that this symbol has no history.
+            log.warning("startup backfill: %s returned no data (%s) - "
+                        "no history for it", symbol, rep)
+            self._bf_failed.add(symbol)
+            for p_ in self._panes:
+                if p_.symbol == symbol:
+                    p_.lbl_last.setText("no history")
+            self._bf_done.add(symbol)
+            self._maybe_finish_backfill()
+            return
         old = self.series.get(symbol)
         if old is not None and old.bars:
             log.warning("startup backfill for %s discarded: %d live bars were "
