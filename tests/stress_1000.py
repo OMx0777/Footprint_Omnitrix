@@ -286,18 +286,32 @@ check("RSS stays under 2 GB at 1,000 symbols",
 # windows have had time to fill - and it is checked on the MODEL rather than
 # on RSS, because the allocator returns pages on its own schedule and would
 # otherwise be the thing under test.
-if len(model_series) >= 6:
+# Ten samples - five minutes - before judging anything. The retention windows
+# take minutes to fill, so a shorter run sees the FILLING and calls it a leak;
+# a 180 s run reported +64 MB/sample and failed while a 450 s run of the same
+# code was flat.
+if len(model_series) >= 10:
     k = len(model_series) // 3
     early = (model_series[k] - model_series[0]) / max(1, k)
     late = (model_series[-1] - model_series[-1 - k]) / max(1, k)
     check("model growth DECELERATES - the windows are filling, not leaking",
           late <= max(2.0, early * 0.5),
           f"{early:+.1f} MB/sample early vs {late:+.1f} late")
-    check("...and the last samples are essentially flat",
-          abs(late) < 6.0, f"{late:+.2f} MB per 30 s sample at the end")
+    # A LEAK IS SUSTAINED GROWTH, NOT MOVEMENT. The first version of this
+    # asserted abs(late) < 6, which fails on -50 MB/sample - memory being
+    # RELEASED, because the churn demotes symbols and demotion frees their
+    # columns and tape. Shrinking is the system working; only growth that does
+    # not stop is a fault.
+    check("...and the last samples are not still climbing",
+          late < 6.0, f"{late:+.2f} MB per 30 s sample at the end "
+                      f"(negative = released)")
+    check("...and the model stays bounded",
+          max(model_series) < 1200,
+          f"peak model {max(model_series):.0f} MB")
 else:
     print("  INFO  run too short to separate filling from leaking "
-          f"({len(model_series)} samples; the cold bar window alone needs ~25 min)")
+          f"({len(model_series)} samples, need 10; the cold bar window alone "
+          f"takes minutes to fill)")
 check("the demotion queue drains under churn", max(backlogs or [0]) < 200,
       f"deepest backlog {max(backlogs or [0])} symbols "
       f"(limit {MAX_DEMOTIONS_PER_SYNC}/pass)")
