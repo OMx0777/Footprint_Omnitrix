@@ -144,7 +144,10 @@ srv = subprocess.Popen([sys.executable, "-u", srv_py],
                        text=True)
 line = srv.stdout.readline()
 if "READY" not in line:
-    print("server failed:", line, srv.stdout.read()[:600]); sys.exit(1)
+    # The WHOLE traceback. Truncating at 600 characters cut it off exactly
+    # where the cause is - the last frame - and left "server failed" with a
+    # stack that says only that asyncio started.
+    print("server failed:", line, srv.stdout.read()); sys.exit(1)
 print(f"server up (pid {srv.pid})")
 
 import psutil

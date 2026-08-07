@@ -62,8 +62,16 @@ class HistoryFetcher(QThread):
     failed = pyqtSignal(str, str)
 
     def __init__(self, host: str, port: int, token: str, symbol: str,
-                 start_ms: int, end_ms: int, channels=(1, 2), parent=None):
+                 start_ms: int, end_ms: int, channels=(1, 2), parent=None,
+                 l2_start_ms=None):
         super().__init__(parent)
+        # L2 IS NOT FETCHED AS FAR BACK AS L1. The heat field is a bounded ring
+        # - depth older than it can hold cannot be shown however much arrives -
+        # so asking for more makes the server scan millions of batches to
+        # produce bytes the client will discard. Measured on the live server:
+        # a scroll-back asked ch2 1,604,353..5,919,489 and spent 3.66 s to
+        # return 2.8 MB, none of which could be drawn.
+        self.l2_start_ms = l2_start_ms
         self.host = host
         self.port = int(port)
         self.token = token or ""
@@ -136,7 +144,10 @@ class HistoryFetcher(QThread):
                     # sequence from a rate fetches the wrong window and
                     # nothing in the reply would show it - volume is not
                     # linear in time.
-                    ans = self._ask(s, f"RANGE {ch} {self.start_ms} {self.end_ms}")
+                    frm = self.start_ms
+                    if ch == 2 and self.l2_start_ms is not None:
+                        frm = max(frm, self.l2_start_ms)
+                    ans = self._ask(s, f"RANGE {ch} {frm} {self.end_ms}")
                     if not ans.startswith("OK "):
                         log.info("history: no range for ch%d (%s)", ch, ans)
                         continue

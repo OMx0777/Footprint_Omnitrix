@@ -91,7 +91,18 @@ MAX_DEMOTIONS_PER_SYNC = 6
 HISTORY_DEBOUNCE_MS = 200
 # Never ask for more than this in one go. The old backfill had no bound and
 # replayed a whole session - 1.3 GB of L2 - which is what froze the terminal.
-HISTORY_MAX_SPAN_MS = 60 * 60 * 1000
+#
+# Four hours, not one. One hour truncated the window on any view wider than
+# that - a 1-minute chart showing 100 bars is 100 minutes - so the bars beyond
+# it stayed blank however long you waited, which is "it does not show full
+# footprint candles". Affordable now only because the fold is spread across
+# frames (see _fold_pending); the reply is still capped by MAX_REPLY_BYTES.
+HISTORY_MAX_SPAN_MS = 4 * 60 * 60 * 1000
+# How much of one frame the fold may take. The measured cost of folding a
+# single scroll-back was 484 ms - 431 for 135,000 trades and 53 for the heat -
+# in ONE frame, against a 33 ms budget. That is the lag: not a slow leak, a
+# half-second stall every time you scroll into cold history.
+FOLD_BUDGET_S = 0.008
 
 # How long a symbol must be OFF SCREEN before its detail is released.
 #
@@ -242,6 +253,8 @@ class OmnitrixWindow(QMainWindow):
         # Windows already asked for, so a range that legitimately has no
         # recording is not re-requested every time the user pans over it.
         self._history_tried: set = set()
+        # Replay payloads waiting to be folded, a slice per frame.
+        self._fold_q: deque = deque()
         # When each symbol was last seen on screen. Absent means "on screen
         # now"; see DEMOTE_GRACE_S.
         self._cold_since: dict = {}
@@ -913,6 +926,7 @@ class OmnitrixWindow(QMainWindow):
         # nobody would find.
         if self._link_tick % 25 == 0:
             self._sync_hot()
+        self._fold_pending()
         if self._bf_zombies:
             self._bf_zombies = [f for f in self._bf_zombies if f.isRunning()]
 
@@ -2383,9 +2397,11 @@ class OmnitrixWindow(QMainWindow):
         if len(self._history_tried) > 500:
             self._history_tried.clear()
 
+        # The heat ring holds BACKFILL_L2_MIN of depth, so ask for no more.
         f = HistoryFetcher(host, getattr(self.feed, "replay_port", 9998),
                            getattr(self.feed, "token", ""), pane.symbol,
-                           a_ms, b_ms, parent=self)
+                           a_ms, b_ms, parent=self,
+                           l2_start_ms=b_ms - int(BACKFILL_L2_MIN * 60 * 1000))
         f.ready.connect(self._on_history_ready)
         f.failed.connect(self._on_history_failed)
         self._history_fetcher = f
@@ -2394,46 +2410,81 @@ class OmnitrixWindow(QMainWindow):
         f.start()
 
     def _on_history_ready(self, symbol, trades, books, rep) -> None:
-        """GUI thread. Fold the replay in and redraw.
+        """GUI thread. QUEUE the replay; fold it a slice at a time.
 
-        rebuild_footprint writes cells and refuses to touch volume, delta or
-        any session total - those already counted these trades when they
-        arrived live. See tests/rebuild_fp.py.
+        Folding it here cost 484 ms in one frame, measured - 431 for 135,000
+        trades and 53 for the depth - against a 33 ms budget. It is not a leak
+        and not the network; it is a half-second stall every time you scroll
+        into cold history, and it lands again on every scroll.
+
+        So the payload is grouped by BAR and folded a few bars per frame. By
+        bar rather than by trade because rebuild_footprint's rule is that a bar
+        gets its whole footprint or none of it - splitting a bar across two
+        frames would leave it briefly showing a partial footprint next to a
+        candle that says a different number.
         """
         s = self.series.get(symbol)
         if s is None:
             return
-        # THE BOOKS WERE BEING THROWN AWAY. HistoryFetcher downloads L2 for
-        # the window and this slot only folded the trades, so the heat field
-        # could never come back however far you scrolled - the bubbles (from
-        # the tape) reached further back than the colour (from the columns),
-        # which is exactly what that looks like on screen.
-        b = self.bookmaps.get(symbol)
-        if b is not None and books:
-            nb = b.rebuild_heatmap(books)
-            if nb:
-                log.info("history: %s heat field restored for %d columns",
-                         symbol, nb)
-        if not trades:
-            if books:
-                self._dirty = True
+        if not trades and not books:
+            log.warning("startup backfill: %s returned no data (%s)", symbol, rep)
             return
-        out = s.rebuild_footprint(trades)
-        log.info("history: %s %s <- %s", symbol, out, rep)
-        if out.get("partial"):
-            # Expected at a window edge, not a fault: those bars were reverted
-            # to empty rather than left showing a footprint that disagrees with
-            # their own candle. Logged at info because a wider scroll will
-            # cover them.
-            log.info("history: %d edge bars of %s were only partly covered and "
-                     "stay empty", out["partial"], symbol)
-        if out["bars"]:
-            # rebuild_footprint already cleared the aggregation cache, so the
-            # next redraw refolds from the refilled base bars and set_bars
-            # picks it up - no separate invalidation to keep in step.
+        by_bar: dict[int, list] = {}
+        step = s.base_tf_s
+        for tr in trades:
+            by_bar.setdefault(int(tr.ts_ms // 1000 // step) * step, []).append(tr)
+        self._fold_q.append({"symbol": symbol, "bars": sorted(by_bar.items()),
+                             "books": list(books), "rep": rep,
+                             "done_bars": 0, "done_books": 0})
+        log.info("history: %s queued %d bars and %d books to fold",
+                 symbol, len(by_bar), len(books))
+
+    def _fold_pending(self) -> None:
+        """Fold queued history within one frame's budget, then stop.
+
+        Bounded by TIME rather than by a fixed count: a bar with four price
+        levels and one with four hundred are not the same work, and a count
+        tuned for one is wrong for the other.
+        """
+        if not self._fold_q:
+            return
+        deadline = time.perf_counter() + FOLD_BUDGET_S
+        job = self._fold_q[0]
+        sym = job["symbol"]
+        s = self.series.get(sym)
+        if s is None:
+            self._fold_q.popleft()
+            return
+        # ---- footprint, whole bars at a time ----------------------------
+        bars = job["bars"]
+        applied = 0
+        while job["done_bars"] < len(bars) and time.perf_counter() < deadline:
+            chunk = []
+            for _ in range(8):
+                if job["done_bars"] >= len(bars):
+                    break
+                chunk.extend(bars[job["done_bars"]][1])
+                job["done_bars"] += 1
+            if chunk:
+                out = s.rebuild_footprint(chunk)
+                applied += out["bars"]
+        # ---- then the depth ---------------------------------------------
+        b = self.bookmaps.get(sym)
+        books = job["books"]
+        if b is not None:
+            while job["done_books"] < len(books) and time.perf_counter() < deadline:
+                nxt = min(len(books), job["done_books"] + 400)
+                b.rebuild_heatmap(books[job["done_books"]:nxt])
+                job["done_books"] = nxt
+        if applied:
             for p in self._panes[:self._n_panes]:
-                if p.symbol == symbol:
+                if p.symbol == sym:
                     p.fp.update()
+            self._dirty = True
+        if job["done_bars"] >= len(bars) and job["done_books"] >= len(books):
+            self._fold_q.popleft()
+            log.info("history: %s folded - %d bars, %d books", sym,
+                     len(bars), len(books))
             self._dirty = True
 
     def _on_history_failed(self, symbol, err) -> None:
