@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
 from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
 from .alert_ui import AlertToast, SOUNDER
 from ..engine.alerts import AlertBook, CROSS, ABOVE, BELOW
-from ..engine.history import HistoryFetcher
+from ..engine.history import HistoryFetcher, StartupFetcher
 from .chart_pane import ChartPane
 from ..engine import (
     Instruments, BarSeries, BookmapBuffer, SessionProfile, Feed,
@@ -120,6 +120,12 @@ BACKFILL_HOLD_MAX_EVENTS = 40_000
 # And a wall-clock bound, because a server that never answers must not hold the
 # chart forever. A 6.5 h single-symbol load measured ~12 s of ingest.
 BACKFILL_HOLD_MAX_S = 45.0
+# How far back a startup load reaches. L1 covers the session because the bars,
+# the footprints and the volume profile all come from it; L2 is capped to what
+# the 1400-column ring can physically hold, because fetching a full day of
+# depth moves 934 MB so the buffer can discard 94% of it.
+BACKFILL_SESSION_H = 7.0
+BACKFILL_L2_MIN = 23.0
 
 TF_CHOICES = {
     "5s": 5, "10s": 10, "15s": 15, "30s": 30,
@@ -242,6 +248,12 @@ class OmnitrixWindow(QMainWindow):
         self._bf_dropped_at = 0
         self._bf_seam: dict = {}
         self._bf_symbols: list = []
+        self._bf_done: set = set()
+        self._bf_failed: set = set()
+        self._bf_fetchers: dict = {}
+        # Cancelled workers that have not noticed yet. Held so Qt cannot
+        # destroy a running QThread; reaped in _tick.
+        self._bf_zombies: list = []
 
         self._timer = GovernedTimer(self, self._tick, 33, priority=0)
         self.glw.set_gov_key(id(self))
@@ -883,6 +895,8 @@ class OmnitrixWindow(QMainWindow):
         # nobody would find.
         if self._link_tick % 25 == 0:
             self._sync_hot()
+        if self._bf_zombies:
+            self._bf_zombies = [f for f in self._bf_zombies if f.isRunning()]
 
         if self._dirty and self.active_symbol:
             self._redraw()
@@ -2047,9 +2061,78 @@ class OmnitrixWindow(QMainWindow):
         self._bf_since = time.monotonic()
         self._bf_dropped_at = self._dropped
         self._bf_state = "holding"
+        self._bf_done = set()
+        self._bf_failed = set()
+        self._bf_fetchers = {}
+        now_ms = int(time.time() * 1000)
+        day_ms = now_ms - int(BACKFILL_SESSION_H * 3600 * 1000)
+        # L2 only as far back as the column ring can hold - anything older
+        # would be transferred so the buffer could discard it.
+        l2_ms = now_ms - int(BACKFILL_L2_MIN * 60 * 1000)
+        for sym in syms:
+            f = StartupFetcher(getattr(self.feed, "replay_host", ""),
+                               getattr(self.feed, "replay_port", 9998),
+                               getattr(self.feed, "token", ""), sym,
+                               day_ms, now_ms, self.instruments,
+                               seam=seam, l2_start_ms=l2_ms, parent=self)
+            f.built.connect(self._on_backfill_built)
+            f.failed.connect(self._on_backfill_failed)
+            self._bf_fetchers[sym] = f
+            f.start()
         log.info("startup backfill: holding live stream, seam=%s, symbols=%s",
                  seam, syms)
         return True
+
+    def _on_backfill_built(self, symbol, series, buf, rep) -> None:
+        """GUI thread. Swap in the finished objects, then catch up.
+
+        THE SWAP IS ONLY SAFE INTO AN EMPTY SLOT. A series that has already
+        counted live trades holds volume, delta and session figures the
+        replayed one knows nothing about, and replacing it would discard them
+        with no error and no way to notice - the chart would simply be short.
+        The hold exists precisely so this slot IS empty; if it is not, that
+        assumption has broken somewhere and the right answer is to keep what
+        is real and refuse the load.
+        """
+        old = self.series.get(symbol)
+        if old is not None and old.bars:
+            log.warning("startup backfill for %s discarded: %d live bars were "
+                        "already counted, and replacing them would lose them",
+                        symbol, len(old.bars))
+            self._bf_done.add(symbol)
+            self._maybe_finish_backfill()
+            return
+        # The old instances are empty; dropping the reference here is the whole
+        # of the release - they are refcounted, not collected, so there is no
+        # RSS spike and nothing for the cycle collector to find.
+        self.series[symbol] = series
+        self.bookmaps[symbol] = buf
+        series.set_hot(True)
+        buf.set_hot(True)
+        log.info("startup backfill: %s loaded %s", symbol, rep)
+        self._bf_done.add(symbol)
+        self._maybe_finish_backfill()
+
+    def _on_backfill_failed(self, symbol, err) -> None:
+        log.warning("startup backfill: %s unavailable (%s)", symbol, err)
+        self._bf_done.add(symbol)
+        self._bf_failed.add(symbol)
+        self._maybe_finish_backfill()
+
+    def _maybe_finish_backfill(self) -> None:
+        """Release the held stream once every symbol has answered."""
+        if self._bf_state != "holding":
+            return
+        if not set(self._bf_symbols) <= self._bf_done:
+            return
+        self._bf_fetchers = {}
+        if self._bf_failed and len(self._bf_failed) == len(self._bf_symbols):
+            # Nothing loaded at all: say LIVE ONLY rather than imply history.
+            self._bf_state = "live_only"
+            self._bf_symbols = []
+            log.warning("startup backfill: no symbol loaded - LIVE ONLY")
+            return
+        self.release_backfill()
 
     def _check_backfill_hold(self) -> None:
         """Give up honestly rather than hold the chart forever.
@@ -2080,11 +2163,26 @@ class OmnitrixWindow(QMainWindow):
         would check.
         """
         log.warning("startup backfill abandoned: %s - continuing LIVE ONLY", why)
-        for sym in self._bf_symbols:
-            f = getattr(self, "_bf_fetchers", {}).get(sym)
-            if f is not None:
-                f.cancel()
-        self._bf_fetchers = {}
+        # CANCEL IS A REQUEST, NOT A STOP. cancel() sets a flag checked between
+        # steps, and a worker blocked in socket.create_connection or a recv
+        # will not see it for seconds. Dropping the reference here would let Qt
+        # destroy a QThread that is still running, which aborts the process -
+        # observed as a clean run exiting 127 with every check passed.
+        #
+        # So the references are KEPT, their signals disconnected so a late
+        # result cannot land on a load that has already been abandoned, and
+        # they are reaped once they finish.
+        for sym in list(self._bf_fetchers):
+            f = self._bf_fetchers.pop(sym)
+            if f is None:
+                continue
+            f.cancel()
+            try:
+                f.built.disconnect()
+                f.failed.disconnect()
+            except TypeError:
+                pass
+            self._bf_zombies.append(f)
         self._bf_state = "live_only"
         self._bf_symbols = []
 
@@ -2306,5 +2404,16 @@ class OmnitrixWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         workspace.save(self)                  # remember the desk for next time
+        # Wait for the history workers. A QThread still running when the
+        # interpreter tears down aborts the process, so closing the app mid
+        # backfill would crash on exit rather than shut down.
+        for f in list(self._bf_fetchers.values()) + list(self._bf_zombies):
+            try:
+                f.cancel()
+                f.wait(3000)
+            except RuntimeError:
+                pass
+        self._bf_fetchers = {}
+        self._bf_zombies = []
         self.feed.stop()
         super().closeEvent(event)

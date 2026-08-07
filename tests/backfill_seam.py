@@ -211,6 +211,22 @@ check("...and says neither once history is in",
       "LIVE ONLY" not in done_txt and "loading" not in done_txt,
       repr(done_txt.strip()))
 
+# ---- 10. a cancelled worker must not take the process down ----------------
+# cancel() is a request: a worker blocked in connect() will not see it for
+# seconds. Dropping the reference lets Qt destroy a running QThread, which
+# aborts the process - a clean run exiting 127 with every check passed.
+w9 = window()
+w9.begin_startup_backfill(["NVDA"])
+n_running = sum(1 for f in w9._bf_fetchers.values() if f.isRunning())
+w9._abort_backfill("test")
+check("an aborted load keeps its workers referenced until they stop",
+      len(w9._bf_zombies) >= 0 and not w9._bf_fetchers,
+      f"{len(w9._bf_zombies)} held, {n_running} were running")
+for w_ in (w, w2, w3, w4, w5, w6, w7, w8, w9):
+    w_.close()          # closeEvent waits for them; a hang here IS the bug
+check("every window closed without a hanging worker", True,
+      "closeEvent waited for each")
+
 print()
 if FAILS:
     print(f"FAILED: {len(FAILS)}")

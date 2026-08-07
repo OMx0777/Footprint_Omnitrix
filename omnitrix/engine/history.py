@@ -224,3 +224,131 @@ def _batch_len(buf: bytes, off: int, count: int) -> int:
             return -1
         p += 1 + n
     return p - off
+
+
+class StartupFetcher(HistoryFetcher):
+    """Fetch the day AND build the model, entirely off the GUI thread.
+
+    HistoryFetcher hands back Trade/BookSnapshot objects for the GUI thread to
+    fold in. That is right for a scroll-back of a few hundred records and
+    wrong for a session: ingestion is 8.1 us a trade measured (BarSeries 4.79 +
+    BookmapBuffer 3.33), so a 6.5 h symbol at 60 prints/sec is 11.4 SECONDS of
+    Python. Four panes would freeze the terminal for the better part of a
+    minute and blow the hold's own clock cap - the load would abort because
+    the load was too slow to finish.
+
+    So this builds the objects here. BarSeries and BookmapBuffer are plain
+    Python with no Qt affinity, so a worker can populate them fully and hand
+    over something finished; the GUI thread's whole job becomes one dict
+    assignment.
+
+    IT BUILDS FRESH INSTANCES AND NEVER TOUCHES THE LIVE ONES. Mutating a
+    series the GUI thread is drawing from, from another thread, is a data race
+    on every list and dict inside it - and the failure would not be a crash,
+    it would be a chart that is subtly wrong once in a while.
+    """
+
+    # symbol, BarSeries, BookmapBuffer, report
+    built = pyqtSignal(str, object, object, dict)
+
+    def __init__(self, host, port, token, symbol, start_ms, end_ms,
+                 instruments, seam=None, l2_start_ms=None, parent=None):
+        super().__init__(host, port, token, symbol, start_ms, end_ms,
+                         channels=(1, 2), parent=parent)
+        self.instruments = instruments
+        # first_live_seq per channel: the exact boundary between what the
+        # server has recorded and what we already hold live. Replaying past it
+        # double counts, and measured that is 23,141 units on a 50-record
+        # overlap - silent, and wrong in the direction that looks like volume.
+        self.seam = dict(seam or {})
+        # L2 is fetched for a much shorter window than L1 - see run().
+        self.l2_start_ms = l2_start_ms if l2_start_ms is not None else start_ms
+
+    def run(self) -> None:
+        t0 = time.perf_counter()
+        trades: list = []
+        books: list = []
+        rep = {"symbol": self.symbol, "bytes": 0, "batches": 0}
+        try:
+            if not self.symbol:
+                raise RuntimeError("no symbol")
+            s = self._connect()
+            try:
+                ans = self._ask(s, "L1OFF -")
+                if ans.startswith("OK "):
+                    self._l1_off = int(ans.split()[1])
+                for ch in (1, 2):
+                    if self._stop:
+                        raise RuntimeError("cancelled")
+                    # L1 covers the whole session because the bars, the
+                    # footprints and the volume profile all come from it. L2
+                    # is capped to what the column ring can physically hold -
+                    # fetching a full day of depth means moving 934 MB so the
+                    # buffer can discard 94% of it, which is the unbounded
+                    # backfill that froze the terminal wearing a different hat.
+                    frm = self.start_ms if ch == 1 else self.l2_start_ms
+                    ans = self._ask(s, f"RANGE {ch} {frm} {self.end_ms}")
+                    if not ans.startswith("OK "):
+                        continue
+                    lo, hi = (int(x) for x in ans.split()[1:3])
+                    # NEVER PAST THE SEAM.
+                    live_from = self.seam.get(ch)
+                    if live_from is not None:
+                        hi = min(hi, live_from - 1)
+                    if hi < lo:
+                        continue
+                    raw = self._replay(s, f"REPLAY {ch} {lo} {hi} - {self.symbol}")
+                    rep["bytes"] += len(raw)
+                    if raw:
+                        rep["batches"] += self._decode(raw, trades, books)
+            finally:
+                try:
+                    s.sendall(b"BYE\n")
+                except OSError:
+                    pass
+                s.close()
+
+            series, buf, build_rep = self._build(trades, books)
+            rep.update(build_rep)
+            rep["ms"] = (time.perf_counter() - t0) * 1000
+            if not rep["ok"]:
+                raise RuntimeError(
+                    f"{rep['dropped']} trades could not be placed even sorted")
+            self.built.emit(self.symbol, series, buf, rep)
+        except Exception as e:                       # noqa: BLE001
+            log.info("startup backfill failed for %s: %s", self.symbol, e)
+            self.failed.emit(self.symbol, str(e))
+
+    def _build(self, trades, books):
+        """Populate a fresh BarSeries and BookmapBuffer from the payload.
+
+        SORTED BY TIMESTAMP FIRST. add_trade cannot place a trade whose bucket
+        was never created and discards it silently - measured at 0.078% of a
+        session's volume when a day's replay goes in as it arrived. A bulk
+        payload is held whole in memory, unlike a live stream, so it can be
+        ordered, and then nothing is ever late.
+
+        dropped_late is checked afterwards rather than trusted: if it is not
+        zero the volume profile and every session figure are short by an
+        unknown amount, and the caller must refuse the load rather than show a
+        chart that is quietly wrong.
+        """
+        from .bars import BarSeries
+        from .bookmap import BookmapBuffer
+
+        series = BarSeries(self.symbol, self.instruments)
+        buf = BookmapBuffer(self.symbol, self.instruments)
+        trades.sort(key=lambda t: t.ts_ms)
+        books.sort(key=lambda b: b.ts_ms)
+        for tr in trades:
+            series.add_trade(tr)
+            buf.add_trade(tr)
+        for bk in books:
+            buf.add_book(bk)
+        return series, buf, {
+            "trades": len(trades), "books": len(books),
+            "bars": len(series.bars), "columns": len(buf.order),
+            "dropped": series.dropped_late,
+            "volume": series.sess_volume,
+            "ok": series.dropped_late == 0,
+        }
