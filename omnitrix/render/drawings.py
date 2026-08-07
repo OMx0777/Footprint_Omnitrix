@@ -149,7 +149,7 @@ class FibRetracement(_DrawTool):
     """
 
     LEVELS = (0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0)
-    COLORS = ("#787B86", "#F44336", "#4CAF50", "#00E676",
+    COLORS = ("#787B86", "#F44336", "#4CAF50", "#40E094",
               "#2196F3", "#9C27B0", "#787B86")
 
     def __init__(self, p1, p2, **kw):
@@ -266,7 +266,7 @@ class PositionDrawer(_DrawTool):
         self._text(p, tr, self.data_x(0), entry,
                    f"{side}  entry {entry:,.2f}   R/R {rr:.2f}", "#E8ECF2")
         self._text(p, tr, self.data_x(0), tp, f"TP {tp:,.2f}  (+{reward:,.2f})",
-                   "#00E676")
+                   "#40E094")
         self._text(p, tr, self.data_x(0), sl, f"SL {sl:,.2f}  (-{risk:,.2f})",
                    "#FF5252")
 

@@ -694,7 +694,7 @@ class OmnitrixWindow(QMainWindow):
         self.sym_search = QLineEdit(self._chart_host)
         self.sym_search.setPlaceholderText("Type ticker, Enter to open")
         self.sym_search.setStyleSheet(
-            "QLineEdit { background:#0A0D14; color:#F0F0F0; border:2px solid #26A69A;"
+            "QLineEdit { background:#0A0D14; color:#F0F0F0; border:2px solid #2E9E7E;"
             " border-radius:8px; padding:8px 14px; font-size:15px; font-weight:700;"
             " letter-spacing:1px; }")
         self.sym_search.setFixedSize(240, 40)
@@ -1373,31 +1373,31 @@ class OmnitrixWindow(QMainWindow):
             lost = gaps.lost if gaps is not None else 0
             unrep = getattr(self.feed, "unrepaired", 0)
             if live and replay:
-                txt, col = f"● MULTICAST  {len(self.series)} sym", "#26A69A"
+                txt, col = f"● MULTICAST  {len(self.series)} sym", "#2E9E7E"
             elif live:
                 txt, col = (f"● MULTICAST  {len(self.series)} sym  "
-                            f"⚠ no replay (gaps cannot be repaired)"), "#FFB300"
+                            f"⚠ no replay (gaps cannot be repaired)"), "#E0A03C"
             else:
-                txt, col = "○ waiting for the multicast group…", "#EF5350"
+                txt, col = "○ waiting for the multicast group…", "#D4564F"
             if lost:
                 repaired = getattr(self.feed, "repairs", 0)
                 txt += f"   lost {lost:,} · repaired {repaired:,}"
                 if unrep:
                     txt += f" · UNREPAIRED {unrep:,}"
-                    col = "#EF5350"
+                    col = "#D4564F"
         elif "network" in conn:
             live = bool(conn.get("network"))
-            txt, col = ((f"● LIVE  {len(self.series)} sym", "#26A69A") if live
-                        else ("○ waiting for the broadcaster…", "#EF5350"))
+            txt, col = ((f"● LIVE  {len(self.series)} sym", "#2E9E7E") if live
+                        else ("○ waiting for the broadcaster…", "#D4564F"))
         else:
             l1, l2 = bool(conn.get("l1")), bool(conn.get("l2"))
             if l1 and l2:
-                txt, col = f"● LIVE  {len(self.series)} sym", "#26A69A"
+                txt, col = f"● LIVE  {len(self.series)} sym", "#2E9E7E"
             elif l1 or l2:
                 txt, col = (f"● PARTIAL  L1:{'✓' if l1 else '×'} "
-                            f"L2:{'✓' if l2 else '×'}"), "#FFB300"
+                            f"L2:{'✓' if l2 else '×'}"), "#E0A03C"
             else:
-                txt, col = "○ waiting for Takion…", "#EF5350"
+                txt, col = "○ waiting for Takion…", "#D4564F"
         # How much of the delta is evidence and how much is an even split.
         # Every buy/sell figure on screen rests on this, so it belongs on the
         # status line rather than in a log nobody reads: if `?` is large, the
@@ -1422,14 +1422,14 @@ class OmnitrixWindow(QMainWindow):
                     txt += (f"   flow {attributed:.0%} attributed"
                             f" ({quoted:.0%} quoted)  ? {unknown:.0%}")
                     if unknown > 0.15:
-                        col = "#FFB300"
+                        col = "#E0A03C"
             except Exception:
                 pass
         if self._dropped:
             # Visible, not silent: if the GUI cannot keep up you need to know the
             # chart is now an incomplete picture.
             txt += f"   ⚠ dropped {self._dropped:,}"
-            col = "#FFB300"
+            col = "#E0A03C"
         # THE BACKFILL STATE IS PART OF THE TRUTH ABOUT THIS FEED. A chart
         # holding only what arrived since the app opened looks exactly like one
         # holding the whole session; the difference has to be on screen, not
@@ -1448,7 +1448,7 @@ class OmnitrixWindow(QMainWindow):
                     p_.lbl_last.setText("loading history…")
         elif self._bf_state == "live_only":
             txt += "   ⚠ LIVE ONLY (no history)"
-            col = "#FFB300"
+            col = "#E0A03C"
         self.lbl_link.setText(f"  {txt}  ")
         self.lbl_link.setStyleSheet(f"color:{col}; font-weight:700;")
 
@@ -1472,9 +1472,90 @@ class OmnitrixWindow(QMainWindow):
             self._dirty = True
 
     # ---- TradingView-style ticker search --------------------------------
+    # TradingView's keys, because they are the ones a trader's hands already
+    # know. Digits pick a timeframe, letters arm a drawing tool, and the
+    # navigation keys do what they do in every charting package.
+    #
+    # Bare letters are ALSO the ticker search, so every tool key is checked
+    # BEFORE that fallback and none of them may be a plain letter that would
+    # make typing a symbol impossible - hence Alt for the tools.
+    TF_KEYS = {Qt.Key.Key_1: "1m", Qt.Key.Key_2: "2m", Qt.Key.Key_3: "3m",
+               Qt.Key.Key_4: "5m", Qt.Key.Key_5: "15m", Qt.Key.Key_6: "30m",
+               Qt.Key.Key_7: "1h", Qt.Key.Key_8: "4h", Qt.Key.Key_9: "1d",
+               Qt.Key.Key_0: "10s"}
+    TOOL_KEYS = {Qt.Key.Key_T: "Trend", Qt.Key.Key_F: "Fib",
+                 Qt.Key.Key_P: "Pen", Qt.Key.Key_M: "Measure",
+                 Qt.Key.Key_L: "Long", Qt.Key.Key_S: "Short",
+                 Qt.Key.Key_V: "VP", Qt.Key.Key_C: "CPR"}
+
     def keyPressEvent(self, ev) -> None:
         key = ev.key()
         mods = ev.modifiers()
+        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+
+        # ---- timeframe: 1..9,0 like every charting package -----------------
+        if key in self.TF_KEYS and not (alt or ctrl):
+            if not self.sym_search.isVisible():
+                tf = self.TF_KEYS[key]
+                if self.tf_combo.findText(tf) >= 0:
+                    self.tf_combo.setCurrentText(tf)
+                return
+
+        # ---- drawing tools, on Alt so bare letters stay the ticker search --
+        if alt and key in self.TOOL_KEYS:
+            t = self.TOOL_KEYS[key]
+            if t in self._tool_buttons:
+                # Pressing the armed tool's key again disarms it, which is
+                # what the same key does everywhere else.
+                self._set_drawing_tool(None if self.active_drawing_tool == t
+                                       else t)
+            return
+
+        # ---- navigation ----------------------------------------------------
+        pane = self._active_pane
+        if pane is not None and not self.sym_search.isVisible():
+            vb = pane.price_plot.getViewBox()
+            if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+                r = vb.viewRect()
+                span = r.width()
+                step = span * (0.5 if ctrl else 0.12)
+                d = -step if key == Qt.Key.Key_Left else step
+                pane.auto_scroll = False
+                vb.setXRange(r.left() + d, r.right() + d, padding=0)
+                return
+            if key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal,
+                       Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+                f = 0.8 if key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal) else 1.25
+                r = vb.viewRect()
+                c = r.center().x()
+                half = r.width() * f / 2
+                vb.setXRange(c - half, c + half, padding=0)
+                return
+            if key == Qt.Key.Key_End:
+                pane.auto_scroll = True
+                pane.auto_y = True
+                self._center(pane)
+                return
+            if key == Qt.Key.Key_Home:
+                s_ = self.series.get(pane.symbol)
+                if s_ is not None:
+                    n = len(s_.view(pane.tf_s))
+                    pane.auto_scroll = False
+                    vb.setXRange(0, max(3, min(n, 60)), padding=0)
+                return
+
+        # ---- panels and windows, on Ctrl ------------------------------------
+        if ctrl:
+            if key == Qt.Key.Key_B:
+                self._open_bookmap()
+                return
+            if key == Qt.Key.Key_T:
+                self._open_tape()
+                return
+            if key == Qt.Key.Key_P:
+                self._open_profile()
+                return
         # Alt+R re-centres. Tested before the ticker search, which otherwise
         # eats any bare letter - `ev.text()` for Alt+R is still "r".
         if key == Qt.Key.Key_R and mods & Qt.KeyboardModifier.AltModifier:
@@ -1487,6 +1568,17 @@ class OmnitrixWindow(QMainWindow):
         # Alt+A arms a price ALERT there - a level that beeps.
         if key == Qt.Key.Key_A and mods & Qt.KeyboardModifier.AltModifier:
             self.add_alert_here()
+            return
+        # Alt+D shows or hides the CVD pane.
+        if key == Qt.Key.Key_D and alt:
+            self.chk_cvd.setChecked(not self.chk_cvd.isChecked())
+            return
+        # Alt+G steps through the chart grids.
+        if key == Qt.Key.Key_G and alt:
+            order = list(LAYOUTS)
+            cur = self.layout_combo.currentText()
+            nxt = order[(order.index(cur) + 1) % len(order)] if cur in order                 else order[0]
+            self.layout_combo.setCurrentText(nxt)
             return
         # Delete/Backspace removes the selected drawing. Checked before the
         # ticker search so the shortcuts cannot be swallowed by it.

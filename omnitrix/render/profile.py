@@ -9,8 +9,8 @@ from PyQt6.QtGui import QColor, QPainter, QFont
 TPO_FILL = QColor(96, 152, 226)
 TPO_VA = QColor(120, 190, 255)
 POC_COL = QColor(255, 196, 60)
-BUY_COL = QColor(38, 166, 154)
-SELL_COL = QColor(239, 83, 80)
+BUY_COL = QColor(46, 158, 126)
+SELL_COL = QColor(212, 86, 79)
 HVN_COL = QColor(255, 196, 60, 60)
 
 

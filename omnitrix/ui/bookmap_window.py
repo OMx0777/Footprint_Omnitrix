@@ -414,7 +414,7 @@ class BookmapWindow(QMainWindow):
         self.sym_search = QLineEdit(host)
         self.sym_search.setPlaceholderText("Type ticker, Enter to open")
         self.sym_search.setStyleSheet(
-            "QLineEdit{background:#0A0D14;color:#F0F0F0;border:2px solid #26A69A;"
+            "QLineEdit{background:#0A0D14;color:#F0F0F0;border:2px solid #2E9E7E;"
             " border-radius:8px;padding:8px 14px;font-size:15px;font-weight:700;"
             " letter-spacing:1px;}")
         self.sym_search.setFixedSize(240, 40)

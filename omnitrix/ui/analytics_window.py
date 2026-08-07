@@ -100,16 +100,16 @@ class AnalyticsWindow(QMainWindow):
                       ignoreBounds=True)
         p_imb.setYRange(-1, 1, padding=0)
 
-        self.bid_curve = pg.PlotDataItem(pen=pg.mkPen("#26A69A", width=1.4))
-        self.ask_curve = pg.PlotDataItem(pen=pg.mkPen("#EF5350", width=1.4))
+        self.bid_curve = pg.PlotDataItem(pen=pg.mkPen("#2E9E7E", width=1.4))
+        self.ask_curve = pg.PlotDataItem(pen=pg.mkPen("#D4564F", width=1.4))
         p_depth.addItem(self.bid_curve); p_depth.addItem(self.ask_curve)
 
         # plain line, no fill — spread sits in a narrow band, so a fill to zero
         # would flood the pane and hide the variation
-        self.spread_curve = pg.PlotDataItem(pen=pg.mkPen("#FFB300", width=1.4))
+        self.spread_curve = pg.PlotDataItem(pen=pg.mkPen("#E0A03C", width=1.4))
         p_spread.addItem(self.spread_curve)
 
-        self.speed_curve = pg.PlotDataItem(pen=pg.mkPen("#9C7BFF", width=1.2),
+        self.speed_curve = pg.PlotDataItem(pen=pg.mkPen("#8E7BC4", width=1.2),
                                            fillLevel=0,
                                            brush=pg.mkBrush(156, 123, 255, 60))
         p_speed.addItem(self.speed_curve)

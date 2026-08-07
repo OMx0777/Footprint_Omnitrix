@@ -142,7 +142,7 @@ class BookmapPane:
         self.vol.addItem(self.vol_item)
 
         self.cursor = pg.InfiniteLine(angle=90, movable=False,
-                                      pen=pg.mkPen("#E8C13A", width=1))
+                                      pen=pg.mkPen("#C9A227", width=1))
         self.main.addItem(self.cursor, ignoreBounds=True)
         self.price_line = pg.InfiniteLine(
             angle=0, movable=False,

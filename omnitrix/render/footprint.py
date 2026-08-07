@@ -27,6 +27,11 @@ class FootprintItem(pg.GraphicsObject):
     # between the sell and buy histograms, so it has to be narrow enough that
     # both sides remain readable and wide enough to read as a candle.
     CANDLE_HW = 0.055
+    # ...and this one when the histogram is NOT drawn. With the cells off the
+    # chart is a plain candlestick chart, and a 0.11-wide body on a 1.0-wide
+    # column is a hairline - which is what "our candles look ugly" was. Every
+    # charting package draws a body around 60-70% of the slot.
+    CANDLE_HW_PLAIN = 0.30
     # Vertical padding inside a row, as a fraction of row height. A hairline
     # between rows is what makes a stack of bars read as a histogram rather
     # than as one solid block.
@@ -222,6 +227,7 @@ class FootprintItem(pg.GraphicsObject):
         body stays legible over them.
         """
         cx = float(x)
+        hw = self.CANDLE_HW if (self.draw_cells and bar.has_cells())             else self.CANDLE_HW_PLAIN
         p.setPen(pen2)
         p.drawLine(QPointF(cx, bar.low), QPointF(cx, bar.high))
         top = max(bar.open, bar.close)
@@ -234,8 +240,7 @@ class FootprintItem(pg.GraphicsObject):
         # thing you read first, which is the whole point of centring it.
         p.setBrush(brush)
         p.setPen(self._body_pen)
-        p.drawRect(QRectF(cx - self.CANDLE_HW, bot,
-                          self.CANDLE_HW * 2, top - bot))
+        p.drawRect(QRectF(cx - hw, bot, hw * 2, top - bot))
 
     def _paint_block(self, p, x, bar, half, row_h, show_text, pal,
                      base_y=None) -> None:

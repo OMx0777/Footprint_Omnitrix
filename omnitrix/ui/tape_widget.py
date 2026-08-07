@@ -14,8 +14,8 @@ from PyQt6.QtWidgets import QWidget
 from PyQt6.QtGui import QPainter, QColor, QFont
 from ..render.crosshair import clock_label
 
-BUY = QColor(38, 166, 154)
-SELL = QColor(239, 83, 80)
+BUY = QColor(46, 158, 126)
+SELL = QColor(212, 86, 79)
 BG = QColor(10, 13, 20)
 GRID = QColor(26, 32, 42)
 TEXT = QColor(200, 205, 214)
