@@ -229,6 +229,14 @@ class TakionDecoder(Feed):
             self._ts_offset = int(round(diff / quarter)) * quarter
             log.info("L1 clock offset locked at %+d min (from %d samples)",
                      self._ts_offset // 60000, len(self._ts_samples))
+            # AND EVERY CLOCK IN THE UI FOLLOWS THE EXCHANGE FROM HERE.
+            # This is the same number, measured the same way, so the labels
+            # cannot drift from the timestamps they describe.
+            try:
+                from ..render.crosshair import set_display_offset
+                set_display_offset(self._ts_offset)
+            except Exception:
+                log.debug("could not set the display clock", exc_info=True)
         return t + self._ts_offset
 
     def _sweep_ts(self, marker_price: float) -> int:

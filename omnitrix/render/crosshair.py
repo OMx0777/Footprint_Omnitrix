@@ -19,6 +19,40 @@ import time
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt
 
+# ---- exchange time -------------------------------------------------------
+#
+# EVERY CLOCK IN THE APPLICATION READS THE EXCHANGE, NOT THE DESK.
+#
+# A trader works in market time: the open, the close, the 09:30 and 16:00
+# boundaries, the session high - all of those are exchange wall clock, and a
+# chart labelled in the desk's own timezone forces a subtraction in the head on
+# every glance. Measured on the live feed, the desk is 9.5 hours ahead of the
+# exchange, so a print at 07:17 ET was being drawn at 16:47.
+#
+# STORED TIMESTAMPS ARE NOT TOUCHED. Everything internal stays absolute epoch
+# milliseconds: the sequence seam, gap repair, alert crossings, bar buckets and
+# the recording all depend on one unambiguous clock, and shifting that to suit
+# a label would be the kind of two-clocks-that-disagree bug this codebase keeps
+# removing. Only the CONVERSION TO TEXT shifts, at the one place every
+# conversion already goes through (enforced by tests/clock_guard.py).
+#
+# The offset is MEASURED, not configured: TakionDecoder already derives it by
+# comparing the exchange's ms-since-midnight against the wall clock and
+# snapping to 15 minutes, and it publishes that here. Zero until it locks, so
+# an app with no feed yet simply shows local time rather than a guess.
+_DISPLAY_OFFSET_S = 0.0
+
+
+def set_display_offset(ms: int) -> None:
+    """Milliseconds the DESK is ahead of the EXCHANGE. See above."""
+    global _DISPLAY_OFFSET_S
+    _DISPLAY_OFFSET_S = float(ms) / 1000.0
+
+
+def display_offset_ms() -> int:
+    return int(_DISPLAY_OFFSET_S * 1000)
+
+
 def clock_label(t: float, fmt: str = "%H:%M:%S") -> str:
     """Epoch seconds -> clock text, or "" when the value is not a real time.
 
@@ -32,7 +66,10 @@ def clock_label(t: float, fmt: str = "%H:%M:%S") -> str:
     if not (0.0 < t < 32503680000.0) or t != t:      # 1970..3000, and not NaN
         return ""
     try:
-        return time.strftime(fmt, time.localtime(t))
+        # Shift THEN localtime: subtracting the desk-ahead-of-exchange offset
+        # and letting localtime add the desk's own UTC offset back leaves the
+        # exchange's wall-clock digits, whatever timezone the desk sits in.
+        return time.strftime(fmt, time.localtime(t - _DISPLAY_OFFSET_S))
     except (OSError, OverflowError, ValueError):
         return ""
 
@@ -46,7 +83,7 @@ def safe_localtime(t: float):
     if not (0.0 < t < 32503680000.0) or t != t:
         return None
     try:
-        return time.localtime(t)
+        return time.localtime(t - _DISPLAY_OFFSET_S)
     except (OSError, OverflowError, ValueError):
         return None
 
