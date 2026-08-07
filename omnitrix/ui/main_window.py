@@ -93,6 +93,20 @@ HISTORY_DEBOUNCE_MS = 200
 # replayed a whole session - 1.3 GB of L2 - which is what froze the terminal.
 HISTORY_MAX_SPAN_MS = 60 * 60 * 1000
 
+# How long a symbol must be OFF SCREEN before its detail is released.
+#
+# Demotion is destructive and promotion does not undo it, so demoting the
+# instant a symbol leaves the screen means glancing at another ticker for ten
+# seconds permanently destroys the footprint and the heat field behind the
+# cold window on the one you came back to. That is what "footprint only for
+# the last fifteen minutes after an hour of watching" was: not a fetch that
+# failed, an eviction that fired on ordinary use.
+#
+# Five minutes of grace costs a few hundred kB per recently-viewed symbol and
+# makes switching between a handful of names free, which is how the app is
+# actually used.
+DEMOTE_GRACE_S = 300.0
+
 TF_CHOICES = {
     "5s": 5, "10s": 10, "15s": 15, "30s": 30,
     "1m": 60, "2m": 120, "3m": 180, "5m": 300,
@@ -204,6 +218,9 @@ class OmnitrixWindow(QMainWindow):
         # Windows already asked for, so a range that legitimately has no
         # recording is not re-requested every time the user pans over it.
         self._history_tried: set = set()
+        # When each symbol was last seen on screen. Absent means "on screen
+        # now"; see DEMOTE_GRACE_S.
+        self._cold_since: dict = {}
 
         self._timer = GovernedTimer(self, self._tick, 33, priority=0)
         self.glw.set_gov_key(id(self))
@@ -903,6 +920,9 @@ class OmnitrixWindow(QMainWindow):
         # few seconds. This is deliberately not a full scan either - it
         # resumes where it stopped, so the cost per call is bounded by
         # MAX_DEMOTIONS and not by the size of the universe.
+        now = time.monotonic()
+        for sym in hot:
+            self._cold_since.pop(sym, None)
         done = 0
         syms = self._demote_cursor = getattr(self, "_demote_cursor", 0)
         keys = list(self.bookmaps)
@@ -913,6 +933,15 @@ class OmnitrixWindow(QMainWindow):
             sym = keys[(syms + k) % n]
             self._demote_cursor = (syms + k + 1) % n
             if sym in hot:
+                continue
+            # GRACE. A symbol that just left the screen keeps everything for a
+            # while - releasing it immediately is what made a glance at
+            # another ticker destroy the history of the one being traded.
+            first = self._cold_since.get(sym)
+            if first is None:
+                self._cold_since[sym] = now
+                continue
+            if now - first < DEMOTE_GRACE_S:
                 continue
             # The budget counts WORK DONE, not calls made. A symbol registered
             # a moment ago has no columns to evict and no ring to shrink, so
@@ -2024,7 +2053,22 @@ class OmnitrixWindow(QMainWindow):
         arrived live. See tests/rebuild_fp.py.
         """
         s = self.series.get(symbol)
-        if s is None or not trades:
+        if s is None:
+            return
+        # THE BOOKS WERE BEING THROWN AWAY. HistoryFetcher downloads L2 for
+        # the window and this slot only folded the trades, so the heat field
+        # could never come back however far you scrolled - the bubbles (from
+        # the tape) reached further back than the colour (from the columns),
+        # which is exactly what that looks like on screen.
+        b = self.bookmaps.get(symbol)
+        if b is not None and books:
+            nb = b.rebuild_heatmap(books)
+            if nb:
+                log.info("history: %s heat field restored for %d columns",
+                         symbol, nb)
+        if not trades:
+            if books:
+                self._dirty = True
             return
         out = s.rebuild_footprint(trades)
         log.info("history: %s %s <- %s", symbol, out, rep)

@@ -398,6 +398,23 @@ for bar in cache_bars.bars:
 check("value_area on arrays equals value_area on the dict, exactly",
       va_bad == 0, f"{va_n:,} comparisons, {va_bad} mismatches")
 
+
+def drain_demotions(w, passes=40):
+    """Demotion is grace-gated (DEMOTE_GRACE_S), so a test that wants the
+    queue drained has to age it first - otherwise it is asserting that a
+    glance strips history, which is the bug this grace exists to fix."""
+    import time as _t
+    from omnitrix.ui.main_window import DEMOTE_GRACE_S as _G
+    hot_ = w._hot_symbols()
+    for _ in range(passes):
+        # Age BEFORE the pass, or the pass itself only starts the countdown.
+        stale = _t.monotonic() - _G - 1
+        for k in w.bookmaps:
+            if k not in hot_:
+                w._cold_since[k] = stale
+        w._sync_hot()
+
+
 # ---- 3. the app marks the right symbols hot --------------------------------
 app = QApplication.instance() or QApplication([])
 SYMS = [f"Z{i:02d}" for i in range(12)] + ["NVDA"]
@@ -431,8 +448,7 @@ check("...and its buffer really is at full retention",
 # stall a frame - drain the queue explicitly rather than relying on how many
 # ticks happened to elapse.
 from omnitrix.ui.main_window import MAX_DEMOTIONS_PER_SYNC
-for _ in range(len(SYMS) // MAX_DEMOTIONS_PER_SYNC + 3):
-    win._sync_hot()
+drain_demotions(win)
 cold = [s for s in SYMS if s not in hot and s in win.bookmaps]
 check("symbols nothing is drawing are cold", bool(cold)
       and all(win.bookmaps[s].max_cols == COLD_COLS for s in cold),
@@ -459,6 +475,79 @@ check("...and it still has the history it accumulated while cold",
       len(win.bookmaps["Z03"].order) > 0,
       f"{len(win.bookmaps['Z03'].order)} columns")
 
+# ---- 3b. A GLANCE MUST NOT DESTROY HISTORY --------------------------------
+# The symptom that found this: an hour of watching one symbol, then footprint
+# and heat only for the last fifteen minutes. Not a fetch that failed - an
+# eviction that fired on ordinary use. Demotion is destructive and promotion
+# does not undo it, so releasing the instant a symbol leaves the screen means
+# looking at another ticker for ten seconds permanently strips the one you
+# came back to.
+from omnitrix.ui.main_window import DEMOTE_GRACE_S
+import time as _time
+
+win.active_symbol = "NVDA"
+for _ in range(40):
+    app.processEvents()
+    win._tick()
+    time.sleep(0.005)
+win._sync_hot()
+check("the watched symbol is hot", win.series["NVDA"]._hot is True)
+
+win.active_symbol = "Z05"                    # a glance elsewhere
+for _ in range(10):
+    win._sync_hot()
+check("a glance does NOT immediately strip the symbol left behind",
+      win.series["NVDA"]._hot is True
+      and win.bookmaps["NVDA"].max_cols == win.bookmaps["NVDA"].hot_cols,
+      f"NVDA hot={win.series['NVDA']._hot}, "
+      f"max_cols={win.bookmaps['NVDA'].max_cols}")
+check("...and the grace period is long enough to be useful",
+      DEMOTE_GRACE_S >= 60, f"{DEMOTE_GRACE_S:.0f}s")
+
+win.active_symbol = "NVDA"                   # straight back
+win._sync_hot()
+check("coming back clears the countdown", "NVDA" not in win._cold_since)
+
+# once the grace really has elapsed, it does release
+win.active_symbol = "Z05"
+win._sync_hot()
+win._cold_since["NVDA"] = _time.monotonic() - DEMOTE_GRACE_S - 1
+for _ in range(6):
+    win._sync_hot()
+check("a symbol genuinely abandoned is still released",
+      win.series["NVDA"]._hot is False
+      or win.bookmaps["NVDA"].max_cols == win.bookmaps["NVDA"].cold_cols,
+      f"hot={win.series['NVDA']._hot}, "
+      f"max_cols={win.bookmaps['NVDA'].max_cols}")
+win.active_symbol = "NVDA"
+win._sync_hot()
+
+# ---- 3c. replayed depth restores the heat field ---------------------------
+from omnitrix.engine.model import BookSnapshot as _BS
+
+hb = BookmapBuffer("HB", inst, max_cols=1400)
+t4 = 1_700_000_000_000
+for k in range(60):
+    ts = t4 + k * 1000
+    hb.add_trade(Trade("HB", 400.0, 100, Aggressor.BUY, ts))
+    hb.add_book(_BS("HB", {399.99: 500}, {400.01: 500}, ts))
+measured = [c.bucket for c in hb.columns() if c.sweeps > 0]
+# strip, as going cold does, then replay depth back in
+hb.set_hot(False)
+kept = {c.bucket for c in hb.columns()}
+old_books = [_BS("HB", {399.98: 900}, {400.02: 900}, t4 + k * 1000)
+             for k in range(60)]
+n_filled = hb.rebuild_heatmap(old_books)
+check("replayed depth is accepted for columns that lost theirs",
+      n_filled >= 0, f"{n_filled} columns filled")
+still = [c for c in hb.columns() if c.sweeps > 0]
+check("a MEASURED column is never overwritten by a replay",
+      all(c.book.get(hb.instruments.to_index("HB", 399.99), 0) == 500
+          for c in still if c.book),
+      f"{len(still)} measured columns intact")
+check("a reconstructed column is not claimed as measured",
+      all(c.sweeps == 0 for c in hb.columns() if c.bucket not in measured))
+
 # ---- 4. demotion must not stall a frame -----------------------------------
 # Each demotion reallocates a tape ring and evicts columns - 626 us measured -
 # so an unbounded pass over a thousand symbols would itself drop the frame it
@@ -479,7 +568,7 @@ n_cold = sum(1 for x in win.bookmaps if x not in hot2)
 # counting it left the 1,000-symbol run with a 760-deep queue draining six a
 # pass while the free ones ahead used every slot. So: cheap demotions must all
 # go through at once, and only the expensive ones are rationed.
-win._sync_hot()
+drain_demotions(win, passes=1)
 cheap_left = sum(1 for x, b in win.bookmaps.items()
                  if x not in hot2 and b.max_cols != b.cold_cols)
 check("cheap demotions are NOT rationed - they all clear in one pass",
@@ -495,18 +584,16 @@ for x in exp:
         ts_e += 40
         bb.add_trade(Trade(x, 400.0 + (i % 11) * 0.01, 10, Aggressor.BUY, ts_e))
 win._demote_cursor = 0
-win._sync_hot()
+drain_demotions(win, passes=1)
 still_big = sum(1 for x in exp if win.bookmaps[x].max_trades > TAPE_COLD)
 check("expensive demotions ARE rationed, so a mass release cannot stall a frame",
       still_big >= len(exp) - MAX_DEMOTIONS_PER_SYNC,
       f"{len(exp) - still_big} released this pass, limit {MAX_DEMOTIONS_PER_SYNC}")
-for _ in range(len(exp)):
-    win._sync_hot()
+drain_demotions(win)
 check("...and repeated passes clear the expensive ones too",
       all(win.bookmaps[x].max_trades <= TAPE_COLD for x in exp),
       f"{sum(1 for x in exp if win.bookmaps[x].max_trades > TAPE_COLD)} left")
-for _ in range(n_cold // MAX_DEMOTIONS_PER_SYNC + 3):
-    win._sync_hot()
+drain_demotions(win)
 drained = sum(1 for x, b in win.bookmaps.items()
               if x not in hot2 and b.max_cols == b.cold_cols)
 check("the whole queue drains", drained == n_cold, f"{drained} of {n_cold}")

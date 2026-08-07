@@ -345,6 +345,61 @@ class BookmapBuffer:
         # Every renderer cache keyed on the tape describes prints that are gone.
         self._all_cache = None
 
+    def rebuild_heatmap(self, books) -> int:
+        """Put replayed depth back into columns that lost theirs.
+
+        The counterpart to BarSeries.rebuild_footprint, and it has the same
+        rule: it restores what was released and refuses to touch what is
+        still there.
+
+        A column that carries `sweeps > 0` was MEASURED - a real sweep arrived
+        and was recorded. Overwriting it with a replayed snapshot would
+        replace an observation with a copy of an observation, and if the two
+        ever disagreed there would be no way to tell which was the tape. So
+        those are left alone and only columns with no sweep of their own are
+        filled.
+
+        NO COLUMN IS CREATED PAST THE RETENTION LIMIT. Columns are evicted
+        from the front, so inserting buckets older than the oldest retained
+        one would push them straight back out - and, worse, evict live
+        columns to make room. Anything older than what the ring can hold is
+        counted and skipped.
+
+        Returns how many columns were actually filled.
+        """
+        if not books:
+            return 0
+        tick = self.instruments.tick(self.symbol)
+        # The oldest bucket this ring may hold once `books` are folded in.
+        newest = self.order[-1] if self.order else None
+        filled = 0
+        for bk in books:
+            b = int((bk.ts_ms / 1000.0) // self.col_dt)
+            if newest is not None and (newest - b) >= self.max_cols:
+                continue                     # older than the ring can keep
+            c = self.cols.get(b)
+            if c is not None and c.sweeps > 0:
+                continue                     # measured; not ours to overwrite
+            if c is None:
+                if newest is not None and b > newest:
+                    continue                 # not history: leave the live edge
+                c = self._col(bk.ts_ms)
+            c.book = bk.ladder(tick)
+            if bk.best_bid is not None:
+                c.bid_ti = round(bk.best_bid / tick)
+            if bk.best_ask is not None:
+                c.ask_ti = round(bk.best_ask / tick)
+            # sweeps stays 0 on purpose: this column was NOT measured, it was
+            # reconstructed, and the renderer fades what it never saw.
+            filled += 1
+        if filled:
+            self._all_cache = None
+            self._agg_cache.clear()
+            for agg in self._dirty:
+                self._dirty[agg] = None
+            self._version += 1
+        return filled
+
     def set_hot(self, hot: bool) -> bool:
         """How much per-column history this symbol is worth keeping.
 
