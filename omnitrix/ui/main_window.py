@@ -107,6 +107,20 @@ HISTORY_MAX_SPAN_MS = 60 * 60 * 1000
 # actually used.
 DEMOTE_GRACE_S = 300.0
 
+# ---- startup backfill -------------------------------------------------------
+# Live events are HELD while the day's history loads, so the two meet at the
+# sequence seam instead of interleaving. Two caps decide when to give up.
+#
+# The event cap is deliberately well below EVENT_QUEUE_MAX. _event_q is a
+# deque(maxlen=60_000) and a full deque DROPS FROM THE LEFT - silently, and
+# from exactly the end the seam depends on. Aborting at 40,000 means the queue
+# never wraps, so the choice is always between a complete load and an honest
+# refusal, never a quiet hole.
+BACKFILL_HOLD_MAX_EVENTS = 40_000
+# And a wall-clock bound, because a server that never answers must not hold the
+# chart forever. A 6.5 h single-symbol load measured ~12 s of ingest.
+BACKFILL_HOLD_MAX_S = 45.0
+
 TF_CHOICES = {
     "5s": 5, "10s": 10, "15s": 15, "30s": 30,
     "1m": 60, "2m": 120, "3m": 180, "5m": 300,
@@ -221,6 +235,13 @@ class OmnitrixWindow(QMainWindow):
         # When each symbol was last seen on screen. Absent means "on screen
         # now"; see DEMOTE_GRACE_S.
         self._cold_since: dict = {}
+        # Startup backfill: "idle" until asked, "holding" while history loads,
+        # then "done" or "live_only". Only "holding" gates the drain.
+        self._bf_state = "idle"
+        self._bf_since = 0.0
+        self._bf_dropped_at = 0
+        self._bf_seam: dict = {}
+        self._bf_symbols: list = []
 
         self._timer = GovernedTimer(self, self._tick, 33, priority=0)
         self.glw.set_gov_key(id(self))
@@ -788,6 +809,14 @@ class OmnitrixWindow(QMainWindow):
     def _drain_and_draw(self) -> None:
         drained = 0
         q = self._event_q
+        if self._bf_state == "holding":
+            # HELD, NOT DROPPED. The events stay in the queue and are drained
+            # in order once the history is in, so the replay and the live
+            # stream meet at the seam rather than interleaving.
+            self._check_backfill_hold()
+            if self._bf_state == "holding":
+                self._update_link()
+                return
         backlog = len(q)
         budget = DRAIN_BUDGET_BUSY_S if backlog >= DRAIN_BUSY_AT else DRAIN_BUDGET_S
         deadline = time.perf_counter() + budget
@@ -1354,6 +1383,16 @@ class OmnitrixWindow(QMainWindow):
             # Visible, not silent: if the GUI cannot keep up you need to know the
             # chart is now an incomplete picture.
             txt += f"   ⚠ dropped {self._dropped:,}"
+            col = "#FFB300"
+        # THE BACKFILL STATE IS PART OF THE TRUTH ABOUT THIS FEED. A chart
+        # holding only what arrived since the app opened looks exactly like one
+        # holding the whole session; the difference has to be on screen, not
+        # only in a log file nobody reads until something has already gone
+        # wrong.
+        if self._bf_state == "holding":
+            txt += "   ⏳ loading history…"
+        elif self._bf_state == "live_only":
+            txt += "   ⚠ LIVE ONLY (no history)"
             col = "#FFB300"
         self.lbl_link.setText(f"  {txt}  ")
         self.lbl_link.setStyleSheet(f"color:{col}; font-weight:700;")
@@ -1977,6 +2016,113 @@ class OmnitrixWindow(QMainWindow):
         # fire or fire constantly. This one means a human moved the view.
         self._history_pane = pane
         self._history_timer.start()
+
+    # ---- startup backfill --------------------------------------------------
+    def begin_startup_backfill(self, symbols=None) -> bool:
+        """Hold the live stream and load today's history for `symbols`.
+
+        Only the symbols bound to VISIBLE panes, by default. Four or five
+        names is a few seconds and a few hundred MB; the other 990 stay on
+        demand, because a mass reconnect of 100 clients all pulling a full
+        session at once is the one moment the LAN cannot absorb it.
+
+        Returns whether the hold was actually taken.
+        """
+        if self._bf_state == "holding":
+            return False
+        seam = dict(getattr(self.feed, "first_live_seq", {}) or {})
+        if not seam or not getattr(self.feed, "replay_host", ""):
+            # No seam means no multicast join, and without an exact boundary
+            # there is nothing to be exact about - a timestamp guess can both
+            # gap and overlap, and an overlap is silent double counting.
+            self._bf_state = "live_only"
+            return False
+        syms = [x for x in (symbols if symbols is not None
+                            else self._hot_symbols()) if x]
+        if not syms:
+            self._bf_state = "done"
+            return False
+        self._bf_seam = seam
+        self._bf_symbols = list(syms)
+        self._bf_since = time.monotonic()
+        self._bf_dropped_at = self._dropped
+        self._bf_state = "holding"
+        log.info("startup backfill: holding live stream, seam=%s, symbols=%s",
+                 seam, syms)
+        return True
+
+    def _check_backfill_hold(self) -> None:
+        """Give up honestly rather than hold the chart forever.
+
+        Three ways out, and all of them end in a chart that is either complete
+        or plainly labelled - never one that looks complete and is not.
+        """
+        held = len(self._event_q)
+        if self._dropped > self._bf_dropped_at:
+            # The queue wrapped, so live events are already gone from the
+            # front. The seam can no longer be honoured and no amount of
+            # history would make the result correct.
+            self._abort_backfill(
+                f"the live queue overflowed ({self._dropped - self._bf_dropped_at} "
+                f"events lost) - the seam is broken")
+        elif held >= BACKFILL_HOLD_MAX_EVENTS:
+            self._abort_backfill(f"{held:,} live events held, cap is "
+                                 f"{BACKFILL_HOLD_MAX_EVENTS:,}")
+        elif time.monotonic() - self._bf_since > BACKFILL_HOLD_MAX_S:
+            self._abort_backfill(f"took longer than {BACKFILL_HOLD_MAX_S:.0f}s")
+
+    def _abort_backfill(self, why: str) -> None:
+        """Discard the partial load and say so. Never a half-loaded chart.
+
+        The partial objects go in the bin deliberately: a series holding the
+        first forty minutes of a session, with totals to match, is a chart
+        that reads as authoritative and is wrong about every figure a trader
+        would check.
+        """
+        log.warning("startup backfill abandoned: %s - continuing LIVE ONLY", why)
+        for sym in self._bf_symbols:
+            f = getattr(self, "_bf_fetchers", {}).get(sym)
+            if f is not None:
+                f.cancel()
+        self._bf_fetchers = {}
+        self._bf_state = "live_only"
+        self._bf_symbols = []
+
+    def release_backfill(self) -> None:
+        """History is in. Let the held live events through, in order."""
+        if self._bf_state != "holding":
+            return
+        self._bf_state = "done"
+        log.info("startup backfill complete: releasing %d held events",
+                 len(self._event_q))
+
+    def ingest_backfill(self, symbol: str, trades) -> dict:
+        """Bulk-load a replayed session, and REFUSE it if anything was lost.
+
+        SORTED FIRST, ALWAYS. add_trade cannot place a trade whose bucket was
+        never created and discards it - measured at 0.078% of a session's
+        volume when a day's replay is fed in arrival order. A bulk payload is
+        held whole in memory, unlike a live stream, so it can be ordered and
+        then nothing is ever late. See tests/backfill_order.py.
+
+        The assertion afterwards is the point: dropped_late must be zero. If
+        it is not, the volume profile and every session figure are short by an
+        unknown amount, and a chart that is quietly wrong is worse than one
+        that says it has no history.
+        """
+        s = self.series.get(symbol)
+        if s is None:
+            s = self.series[symbol] = BarSeries(symbol, self.instruments)
+        before = s.dropped_late
+        for tr in sorted(trades, key=lambda t: t.ts_ms):
+            s.add_trade(tr)
+        lost = s.dropped_late - before
+        if lost:
+            log.error("startup backfill REJECTED for %s: %d trades (%d volume) "
+                      "could not be placed even sorted",
+                      symbol, lost, s.dropped_late_vol)
+        return {"symbol": symbol, "trades": len(trades), "dropped": lost,
+                "ok": lost == 0}
 
     # ---- deep scroll-back -------------------------------------------------
     def _fetch_history_if_needed(self) -> None:

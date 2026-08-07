@@ -193,6 +193,8 @@ class MulticastFeed(TakionDecoder):
         self.port = port
         self.iface = iface
         self.replay_host = replay_host
+        # Set the moment multicast joins; empty until then.
+        self.first_live_seq: dict[int, int] = {}
         self.replay_port = replay_port
         # BACKFILL IS OFF BY DEFAULT. Deliberately, and after two live
         # failures caused by it rather than by the live path:
@@ -310,6 +312,15 @@ class MulticastFeed(TakionDecoder):
         # differs by an order of magnitude between the two channels.
         elapsed = max(1e-6, time.perf_counter() - t_start)
         rates = {ch: n / elapsed for ch, n in counts.items()}
+        # THE SEAM, published for the client's startup backfill.
+        #
+        # The first sequence seen on each channel is the exact boundary between
+        # "the server has it recorded" and "we already have it live". A replay
+        # bounded at first_live - 1 therefore meets the live stream with no gap
+        # and no overlap - and an overlap is not cosmetic: measured, a 50-record
+        # overlap adds 23,141 to the session volume, silently. A timestamp
+        # boundary can both gap AND overlap; this cannot do either.
+        self.first_live_seq = dict(first_seq)
 
         if (self.replay_host and first_seq
                 and (self.backfill_l1_s > 0 or self.backfill_l2_s > 0)):
