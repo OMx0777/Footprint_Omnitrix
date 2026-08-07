@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
 from .alert_ui import AlertToast, SOUNDER
 from ..engine.alerts import AlertBook, CROSS, ABOVE, BELOW
+from ..engine.history import HistoryFetcher
 from .chart_pane import ChartPane
 from ..engine import (
     Instruments, BarSeries, BookmapBuffer, SessionProfile, Feed,
@@ -84,6 +85,13 @@ DRAIN_BUSY_AT = 2_000            # backlog that switches to the busy budget
 # protect. The queue drains over the following seconds and a symbol waiting its
 # turn is only holding memory it already held.
 MAX_DEMOTIONS_PER_SYNC = 6
+
+# Deep scroll-back. A pan emits a range change per mouse move; waiting this
+# long after the last one turns a drag into ONE request instead of forty.
+HISTORY_DEBOUNCE_MS = 200
+# Never ask for more than this in one go. The old backfill had no bound and
+# replayed a whole session - 1.3 GB of L2 - which is what froze the terminal.
+HISTORY_MAX_SPAN_MS = 60 * 60 * 1000
 
 TF_CHOICES = {
     "5s": 5, "10s": 10, "15s": 15, "30s": 30,
@@ -182,6 +190,21 @@ class OmnitrixWindow(QMainWindow):
 
         # Priority 0: this is the chart being traded from. When the shared
         # budget is tight, every other window gives way to this one.
+        # Deep scroll-back. Debounced rather than immediate: a pan emits a
+        # range change per mouse move, and one socket round trip per move is
+        # how the previous backfill attempt drowned the terminal.
+        self._history_timer = QTimer(self)
+        self._history_timer.setSingleShot(True)
+        self._history_timer.setInterval(HISTORY_DEBOUNCE_MS)
+        self._history_timer.timeout.connect(self._fetch_history_if_needed)
+        # A QThread with no Python reference is collected mid-run and takes the
+        # process with it. This is the reference.
+        self._history_fetcher = None
+        self._history_pane = None
+        # Windows already asked for, so a range that legitimately has no
+        # recording is not re-requested every time the user pans over it.
+        self._history_tried: set = set()
+
         self._timer = GovernedTimer(self, self._tick, 33, priority=0)
         self.glw.set_gov_key(id(self))
         GOVERNOR.set_focus(id(self))
@@ -1919,6 +1942,110 @@ class OmnitrixWindow(QMainWindow):
         # Touching a chart is also how you choose it in a grid.
         if pane is not self._active_pane:
             self._select_pane(pane)
+        # HUNG OFF sigRangeChangedManually, not sigXRangeChanged. The latter
+        # also fires on the auto-scroll setXRange this class issues every
+        # frame, so it would restart the debouncer forever and either never
+        # fire or fire constantly. This one means a human moved the view.
+        self._history_pane = pane
+        self._history_timer.start()
+
+    # ---- deep scroll-back -------------------------------------------------
+    def _fetch_history_if_needed(self) -> None:
+        """After the user stops moving: is anything on screen missing cells?
+
+        A cold symbol has its footprint released behind COLD_BARS, so scrolling
+        back into that region shows candles with no per-price detail. This
+        notices, and asks the server for exactly that window.
+
+        Everything here is a reason NOT to ask. One request in flight at a
+        time, only for a window not already tried, only when a replay server
+        exists, and only when bars are genuinely missing cells - because the
+        cheapest fetch is the one that does not happen, and the previous
+        version of this feature failed by asking too often for too much.
+        """
+        pane = self._history_pane or self._active_pane
+        if pane is None or not pane.symbol:
+            return
+        if self._history_fetcher is not None and self._history_fetcher.isRunning():
+            return
+        host = getattr(self.feed, "replay_host", "")
+        if not host:
+            return                       # synthetic or pipe feed: no history
+        s = self.series.get(pane.symbol)
+        if s is None or not s.bars:
+            return
+
+        vbars = s.view(pane.tf_s)
+        if not vbars:
+            return
+        vr = pane.price_plot.getViewBox().viewRect()
+        lo = max(0, int(vr.left()))
+        hi = min(len(vbars) - 1, int(vr.right()) + 1)
+        if hi < lo:
+            return
+        t0 = vbars[lo].start_ts
+        t1 = vbars[hi].start_ts + pane.tf_s
+
+        # Which BASE bars in that span have lost their footprint. Checked on
+        # the base series rather than the aggregated view because that is what
+        # rebuild_footprint fills, and an aggregate can look populated while
+        # the bars under it are stripped.
+        missing = [b for b in s.bars
+                   if t0 <= b.start_ts <= t1 and b.n_levels() == 0
+                   and b is not s.bars[-1]]
+        if not missing:
+            return
+        a_ms = missing[0].start_ts * 1000
+        b_ms = (missing[-1].start_ts + s.base_tf_s) * 1000
+        if b_ms - a_ms > HISTORY_MAX_SPAN_MS:
+            a_ms = b_ms - HISTORY_MAX_SPAN_MS
+        key = (pane.symbol, a_ms // 1000, b_ms // 1000)
+        if key in self._history_tried:
+            return
+        self._history_tried.add(key)
+        if len(self._history_tried) > 500:
+            self._history_tried.clear()
+
+        f = HistoryFetcher(host, getattr(self.feed, "replay_port", 9998),
+                           getattr(self.feed, "token", ""), pane.symbol,
+                           a_ms, b_ms, parent=self)
+        f.ready.connect(self._on_history_ready)
+        f.failed.connect(self._on_history_failed)
+        self._history_fetcher = f
+        log.info("history: fetching %s %d..%d (%d bars missing cells)",
+                 pane.symbol, a_ms, b_ms, len(missing))
+        f.start()
+
+    def _on_history_ready(self, symbol, trades, books, rep) -> None:
+        """GUI thread. Fold the replay in and redraw.
+
+        rebuild_footprint writes cells and refuses to touch volume, delta or
+        any session total - those already counted these trades when they
+        arrived live. See tests/rebuild_fp.py.
+        """
+        s = self.series.get(symbol)
+        if s is None or not trades:
+            return
+        out = s.rebuild_footprint(trades)
+        log.info("history: %s %s <- %s", symbol, out, rep)
+        if out.get("partial"):
+            # Expected at a window edge, not a fault: those bars were reverted
+            # to empty rather than left showing a footprint that disagrees with
+            # their own candle. Logged at info because a wider scroll will
+            # cover them.
+            log.info("history: %d edge bars of %s were only partly covered and "
+                     "stay empty", out["partial"], symbol)
+        if out["bars"]:
+            # rebuild_footprint already cleared the aggregation cache, so the
+            # next redraw refolds from the refilled base bars and set_bars
+            # picks it up - no separate invalidation to keep in step.
+            for p in self._panes[:self._n_panes]:
+                if p.symbol == symbol:
+                    p.fp.update()
+            self._dirty = True
+
+    def _on_history_failed(self, symbol, err) -> None:
+        log.info("history: %s unavailable (%s)", symbol, err)
 
     def _follow_price(self, bars: list, pane=None) -> None:
         """Keep live price on screen while following, without nagging the view.

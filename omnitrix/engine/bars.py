@@ -520,18 +520,35 @@ class BarSeries:
             bar.add_cells_only(ti, tr.size, tr.aggressor)
             applied += 1
 
-        mismatched = 0
-        for bar in filled.values():
+        # A BAR GETS ITS WHOLE FOOTPRINT OR NONE OF IT.
+        #
+        # A fetch window cuts across bars at its edges, so a boundary bar
+        # receives only the trades that fell inside the window and its cells
+        # then sum to less than the volume it has carried all along. Left in
+        # place that is the worst kind of wrong: a footprint that looks
+        # complete, next to a candle that says a different number, with
+        # nothing to indicate which to believe.
+        #
+        # Observed immediately - the very first UI run reported one such bar -
+        # so the partial fill is reverted and the bar stays honestly empty
+        # until a window that covers it fully comes along.
+        partial = 0
+        for bar in list(filled.values()):
             _t, sell, buy = bar.arrays()
             if int(sell.sum()) + int(buy.sum()) != bar.volume:
-                mismatched += 1
+                bar.drop_dense()
+                del filled[bar.start_ts]
+                partial += 1
+                continue
             bar.seal()                       # recompact and refresh analytics
+        mismatched = partial
         if filled:
             self._agg_cache.clear()
             self._tf_dirty.clear()
             self._version += 1
         return {"bars": len(filled), "applied": applied,
-                "skipped": skipped, "mismatched": mismatched}
+                "skipped": skipped, "partial": partial,
+                "mismatched": mismatched}
 
     def _stat_trade(self, tr: Trade) -> None:
         if self.sess_open is None:
