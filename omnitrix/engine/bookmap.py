@@ -86,8 +86,7 @@ class TapeView:
         self._b = buf
 
     def __len__(self) -> int:
-        b = self._b
-        return b.trade_count if b.trade_count < b.max_trades else b.max_trades
+        return self._b._tape_n
 
     def __bool__(self) -> bool:
         return self._b.trade_count > 0
@@ -203,9 +202,18 @@ class BookmapBuffer:
         self.trade_ti = np.empty(self.max_trades, dtype=np.int32)
         self.trade_sz = np.empty(self.max_trades, dtype=np.int32)
         self.trade_ag = np.empty(self.max_trades, dtype=np.uint8)
-        # Physical slot of the OLDEST retained trade. Stays 0 until the ring
-        # wraps, then tracks the write head.
+        # Physical slot of the OLDEST retained trade, and how many are
+        # retained.
+        #
+        # _tape_n IS NOT trade_count. The session total keeps counting for the
+        # stats docks and deliberately never shrinks, so deriving the retained
+        # count from it was only correct while the ring could exclusively
+        # grow. Once a ring can also SHRINK, trade_count claims more history
+        # than is held and the extra slots read back as uninitialised memory -
+        # which surfaced as an aggressor code outside 0..2 during the
+        # 1,000-symbol run. Tracked explicitly, both operations are trivial.
         self._tape_first = 0
+        self._tape_n = 0
         self.trades = TapeView(self)
         # Aggregation cache, mirroring BarSeries. `view()` runs on the Bookmap's
         # 80 ms timer, and rebuilding the whole fold each time cost 6.6 ms at
@@ -282,66 +290,49 @@ class BookmapBuffer:
         new = min(old * 4, self.tape_cap)
         if new <= old:
             return
+        self._rehouse(new, self._tape_n)
 
-        def _ext(a, dtype):
-            b = np.empty(new, dtype=dtype)
-            b[:old] = a
-            return b
+    def _set_tape_cap(self, cap: int) -> bool:
+        """Move the tape ceiling, shrinking the ring if it is already past it.
 
-        self.trade_x = _ext(self.trade_x, np.float64)
-        self.trade_ti = _ext(self.trade_ti, np.int32)
-        self.trade_sz = _ext(self.trade_sz, np.int32)
-        self.trade_ag = _ext(self.trade_ag, np.uint8)
-        self.max_trades = new
-        self._tape_first = 0
-
-    def _set_tape_cap(self, cap: int) -> None:
-        """Move the tape ceiling, shrinking the ring if it is already past it."""
+        Returns whether it actually had to move memory.
+        """
         cap = max(TAPE_SEED, min(int(cap), self.tape_hot))
         if cap == self.tape_cap:
-            return
+            return False
         self.tape_cap = cap
         if self.max_trades > cap:
             self._shrink_tape(cap)
+            return True
+        return False
 
     def _shrink_tape(self, new_cap: int) -> None:
-        """Drop the oldest prints and rehouse the rest in a smaller ring.
+        """Drop the oldest prints and rehouse the rest in a smaller ring."""
+        self._rehouse(new_cap, min(self._tape_n, new_cap))
 
-        THE RING INVARIANTS HAVE TO SURVIVE THIS, and getting them wrong is
-        not a crash - it is bubbles drawn at the wrong prices, which is the
-        failure this file cares about most. Two of them:
+    def _rehouse(self, new_cap: int, keep: int) -> None:
+        """Move the newest `keep` prints into a fresh ring of `new_cap`.
 
-          * logical index 0 is the OLDEST retained print, and TapeView reads
-            it at (_tape_first + i) % max_trades;
-          * add_trade writes at trade_count % max_trades, and once the ring is
-            full that slot must be exactly where the oldest print sits, so the
-            next write evicts it.
+        THE ONE PLACE THE RING IS RESIZED, and deliberately so. Growth used to
+        have its own copy that assumed the ring had never wrapped - true while
+        it could only grow, false the moment it could also shrink, because a
+        shrunk ring is ROTATED. Growth then copied it verbatim and every slot
+        past the old capacity read back as uninitialised memory, which showed
+        up as an aggressor code outside 0..2 in the 1,000-symbol run.
 
-        The second is why the survivors cannot simply be packed at slot 0.
-        trade_count keeps counting across the shrink - it is a session total
-        and deliberately does not reset - so the head lands wherever
-        trade_count % new_cap falls, and the data must be laid out around THAT
-        rather than the other way round.
-
-        Allocating once per demotion, not per print: a demotion follows a user
-        action, so this is rare, and doing it in place would leave the old
-        arrays alive anyway.
+        Laying the survivors out from slot 0 and setting _tape_first to 0 is
+        what makes both directions the same operation: the retained count is
+        tracked explicitly, so nothing has to be inferred from a session
+        counter that does not shrink.
         """
-        old_cap = self.max_trades
-        n_have = self.trade_count if self.trade_count < old_cap else old_cap
-        keep = min(n_have, new_cap)
-        if self.trade_count >= new_cap:
-            first = self.trade_count % new_cap     # == the write head: full ring
-        else:
-            first = 0
         src = (self._tape_first
-               + np.arange(n_have - keep, n_have, dtype=np.int64)) % old_cap
-        dst = (first + np.arange(keep, dtype=np.int64)) % new_cap
+               + np.arange(self._tape_n - keep, self._tape_n,
+                           dtype=np.int64)) % self.max_trades
 
         def _move(a, dtype):
             b = np.empty(new_cap, dtype=dtype)
             if keep:
-                b[dst] = a[src]
+                b[:keep] = a[src]
             return b
 
         self.trade_x = _move(self.trade_x, np.float64)
@@ -349,12 +340,20 @@ class BookmapBuffer:
         self.trade_sz = _move(self.trade_sz, np.int32)
         self.trade_ag = _move(self.trade_ag, np.uint8)
         self.max_trades = new_cap
-        self._tape_first = first
+        self._tape_first = 0
+        self._tape_n = keep
         # Every renderer cache keyed on the tape describes prints that are gone.
         self._all_cache = None
 
-    def set_hot(self, hot: bool) -> None:
+    def set_hot(self, hot: bool) -> bool:
         """How much per-column history this symbol is worth keeping.
+
+        Returns whether it actually RELEASED anything. The caller budgets on
+        that rather than on the number of calls: a symbol created a moment ago
+        has no columns to evict and no ring to shrink, so demoting it is free
+        and must not consume a budget meant for the expensive case. Counting
+        calls instead left a thousand-symbol backlog draining at six a pass
+        while the free ones ahead of it used up every slot.
 
         A symbol nobody is looking at still needs its bars, its latest book
         and its tape - alerts fire on it, the monitor lists it, and selecting
@@ -373,10 +372,10 @@ class BookmapBuffer:
         demotion evicts on the spot rather than waiting for the next column,
         because the point is to release the memory.
         """
-        self._set_tape_cap(self.tape_hot if hot else self.tape_cold)
+        worked = self._set_tape_cap(self.tape_hot if hot else self.tape_cold)
         want = self.hot_cols if hot else min(self.cold_cols, self.hot_cols)
         if want == self.max_cols:
-            return
+            return worked
         self.max_cols = want
         if len(self.order) > want:
             while len(self.order) > want:
@@ -388,6 +387,8 @@ class BookmapBuffer:
             for agg in self._dirty:
                 self._dirty[agg] = None
             self._version += 1
+            worked = True
+        return worked
 
     def _touch(self, bucket: int) -> None:
         """Record that `bucket` changed, for every cached aggregation."""
@@ -413,16 +414,19 @@ class BookmapBuffer:
         x = (tr.ts_ms / 1000.0) / self.col_dt
         if self.trade_count >= self.max_trades > 0 and self.max_trades < self.tape_cap:
             self._grow_tape()
-        slot = self.trade_count % self.max_trades
+        cap = self.max_trades
+        slot = (self._tape_first + self._tape_n) % cap
         self.trade_x[slot] = x
         self.trade_ti[slot] = ti
         self.trade_sz[slot] = tr.size
         self.trade_ag[slot] = _AG_CODE.get(tr.aggressor, 2)
         self.trade_count += 1
-        if self.trade_count > self.max_trades:
-            # Wrapped: the oldest retained entry is now the one after the head,
-            # which is what deque(maxlen=N) did by dropping from the left.
-            self._tape_first = self.trade_count % self.max_trades
+        if self._tape_n < cap:
+            self._tape_n += 1
+        else:
+            # Full: this write landed on the oldest entry, so the oldest is now
+            # the next one along - what deque(maxlen=N) did by dropping left.
+            self._tape_first = (self._tape_first + 1) % cap
         self.trade_vol += tr.size
         if tr.size > self.trade_max:
             self.trade_max = tr.size

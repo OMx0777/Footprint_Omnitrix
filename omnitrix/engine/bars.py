@@ -36,10 +36,27 @@ from .instruments import Instruments
 # base, so scrolling back stays fully painted while the other 10,500 bars stop
 # costing 1,880 B each.
 #
-# COLD_BARS: what a symbol nothing is drawing keeps. 150 bars is 25 minutes at
-# the base timeframe - enough that selecting one shows immediate context.
+# COLD_BARS: what a symbol nothing is drawing keeps.
+#
+# 30 bars is five minutes at the 10 s base. It was 150, which LOOKED like the
+# bookmap's cold window of 150 columns and is not the same thing at all: a
+# column is one second and a base bar is ten, so the two "cold" windows
+# differed by 10x and the bar side was retaining twenty-five minutes of
+# footprint detail per symbol.
+#
+# The 1,000-symbol run caught it. Per-bar state grew linearly for the whole
+# thirteen minutes and never began to plateau, because at ~78 bars a symbol
+# nothing had yet crossed the 150-bar threshold to be stripped - projected to
+# 322 MB at the plateau against 44 MB of ladders and 127 MB of buy/sell dicts,
+# making it the largest term in the model by a wide margin.
+#
+# What five minutes costs: selecting a symbol shows five minutes of per-price
+# footprint behind it instead of twenty-five. OHLC, volume and delta are
+# untouched for all 12,000 bars either way, so the candles, the delta and
+# every statistic still draw over the full history - it is only the per-price
+# cells behind the cold window that are gone.
 BOOK_BARS = 1500
-COLD_BARS = 150
+COLD_BARS = 30
 
 
 class Bar:
@@ -479,8 +496,11 @@ class BarSeries:
             if j >= 0:
                 bars[j].drop_dense()
 
-    def set_hot(self, hot: bool) -> None:
+    def set_hot(self, hot: bool) -> bool:
         """How much per-BAR detail this symbol is worth keeping.
+
+        Returns whether it actually STRIPPED anything, so the caller can
+        budget on work done rather than on calls made.
 
         The counterpart to BookmapBuffer.set_hot, and the larger of the two.
         Measured per sealed bar at 100 depth a side: 3,501 B, of which the L2
@@ -496,13 +516,15 @@ class BarSeries:
         the data-truth gate forced on BookmapBuffer.
         """
         if hot == self._hot:
-            return
+            return False
         self._hot = hot
         if hot:
-            return                      # nothing to restore; detail accrues again
+            return False                # nothing to restore; detail accrues again
         bars = self.bars
         cut = len(bars) - COLD_BARS
-        for k in range(max(0, cut)):
+        if cut <= 0:
+            return False                # nothing behind the window yet: free
+        for k in range(cut):
             bars[k].drop_dense()
         # Folded aggregations describe bars that no longer carry cells.
         self._agg_cache.clear()

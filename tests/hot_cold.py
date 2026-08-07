@@ -209,6 +209,58 @@ for i in range(TAPE_COLD + 200):
 check("...and the ring grows past the cold ceiling again",
       t.max_trades > TAPE_COLD, f"{t.max_trades:,}")
 
+# ---- 2a-ii. SHRINK THEN GROW - the sequence that actually broke -----------
+# Found by tests/stress_1000.py, not by reasoning. Growth originally assumed
+# the ring had never wrapped, which is true while it can only grow and false
+# the moment it can also shrink: a shrunk ring is ROTATED, so growth copied it
+# verbatim and every slot past the old capacity read back as uninitialised
+# memory. It surfaced as an aggressor code outside 0..2 while painting the
+# tape - a crash, but it could equally have been a plausible wrong price.
+#
+# The general fix was to stop deriving the retained count from trade_count,
+# which is a session total and does not shrink. This checks the whole cycle
+# against a deque, and checks every reachable slot decodes.
+cyc_bad = []
+for pre in (300, 9000, 20001, 41000):
+    t = BookmapBuffer("C", inst, max_trades=60000)
+    m = deque(maxlen=60000)
+    ts = 1_700_000_000_000
+
+    def push(buf, mir, n, ts):
+        for i in range(n):
+            ts += 50
+            tr = Trade("C", round(400 + (i % 37) * 0.01, 2), 1 + (i % 401),
+                       (Aggressor.BUY, Aggressor.SELL, Aggressor.UNKNOWN)[i % 3], ts)
+            buf.add_trade(tr)
+            mir.append((round((tr.ts_ms / 1000.0) / buf.col_dt, 9),
+                        inst.to_index("C", tr.price), tr.size, tr.aggressor))
+        return ts
+
+    ts = push(t, m, pre, ts)
+    t.set_hot(False)                       # shrink (rotates the ring)
+    keep = min(len(m), t.max_trades)
+    m = deque(list(m)[-keep:], maxlen=keep)
+    t.set_hot(True)                        # ceiling back up
+    ts = push(t, m2 := deque(list(m), maxlen=60000), 30000, ts)   # regrow
+    # every reachable slot must decode - this is what raised IndexError
+    codes = {int(t.trade_ag[(t._tape_first + i) % t.max_trades])
+             for i in range(len(t.trades))}
+    if not codes <= {0, 1, 2}:
+        cyc_bad.append((pre, "garbage", sorted(codes)[:4]))
+        continue
+    want = list(m2)[-min(len(m2), t.max_trades):]
+    if list(t.trades) != want:
+        first = next((k for k in range(min(len(want), len(t.trades)))
+                      if list(t.trades)[k] != want[k]), None)
+        cyc_bad.append((pre, "mismatch at", first))
+check("shrink then grow leaves no uninitialised slot and no wrong print",
+      not cyc_bad, f"{cyc_bad[:2]}" if cyc_bad else "4 starting sizes checked")
+
+# and the session totals still describe the whole session
+check("the retained count is tracked apart from the session total",
+      t.trade_count > t._tape_n and t._tape_n == len(t.trades),
+      f"{t.trade_count:,} ingested, {t._tape_n:,} retained")
+
 # ---- 2b. BarSeries: the bigger half ---------------------------------------
 # Measured per SEALED bar at 100 depth a side: 3,501 B, of which the L2 book is
 # 53.7% (1,880 B, and no two bars share one) and the footprint arrays 36.3%.
@@ -343,18 +395,43 @@ for s_ in win.series.values():
 win._demote_cursor = 0
 hot2 = win._hot_symbols()
 n_cold = sum(1 for x in win.bookmaps if x not in hot2)
+
+# THE BUDGET COUNTS WORK, NOT CALLS. A symbol registered a moment ago has no
+# columns to evict and no ring to shrink, so demoting it is free - and
+# counting it left the 1,000-symbol run with a 760-deep queue draining six a
+# pass while the free ones ahead used every slot. So: cheap demotions must all
+# go through at once, and only the expensive ones are rationed.
 win._sync_hot()
-now_cold = sum(1 for x, b in win.bookmaps.items()
-               if x not in hot2 and b.max_cols == b.cold_cols)
-check("one pass demotes at most MAX_DEMOTIONS_PER_SYNC symbols",
-      now_cold <= MAX_DEMOTIONS_PER_SYNC,
-      f"{now_cold} demoted of {n_cold} eligible, limit {MAX_DEMOTIONS_PER_SYNC}")
+cheap_left = sum(1 for x, b in win.bookmaps.items()
+                 if x not in hot2 and b.max_cols != b.cold_cols)
+check("cheap demotions are NOT rationed - they all clear in one pass",
+      cheap_left == 0, f"{cheap_left} of {n_cold} still pending")
+
+# Now make them expensive - real tape and real columns - and re-check.
+ts_e = 1_700_000_900_000
+exp = [x for x in win.bookmaps if x not in hot2][:10]
+for x in exp:
+    bb = win.bookmaps[x]
+    bb.set_hot(True)
+    for i in range(TAPE_COLD + 2000):
+        ts_e += 40
+        bb.add_trade(Trade(x, 400.0 + (i % 11) * 0.01, 10, Aggressor.BUY, ts_e))
+win._demote_cursor = 0
+win._sync_hot()
+still_big = sum(1 for x in exp if win.bookmaps[x].max_trades > TAPE_COLD)
+check("expensive demotions ARE rationed, so a mass release cannot stall a frame",
+      still_big >= len(exp) - MAX_DEMOTIONS_PER_SYNC,
+      f"{len(exp) - still_big} released this pass, limit {MAX_DEMOTIONS_PER_SYNC}")
+for _ in range(len(exp)):
+    win._sync_hot()
+check("...and repeated passes clear the expensive ones too",
+      all(win.bookmaps[x].max_trades <= TAPE_COLD for x in exp),
+      f"{sum(1 for x in exp if win.bookmaps[x].max_trades > TAPE_COLD)} left")
 for _ in range(n_cold // MAX_DEMOTIONS_PER_SYNC + 3):
     win._sync_hot()
 drained = sum(1 for x, b in win.bookmaps.items()
               if x not in hot2 and b.max_cols == b.cold_cols)
-check("...and repeated passes drain the whole queue", drained == n_cold,
-      f"{drained} of {n_cold}")
+check("the whole queue drains", drained == n_cold, f"{drained} of {n_cold}")
 check("a hot symbol is never deferred - it is promoted on the same pass",
       all(win.bookmaps[x].max_cols == win.bookmaps[x].hot_cols
           for x in hot2 if x in win.bookmaps), f"hot={sorted(hot2)}")

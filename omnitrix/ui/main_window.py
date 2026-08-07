@@ -888,18 +888,21 @@ class OmnitrixWindow(QMainWindow):
             if done >= MAX_DEMOTIONS_PER_SYNC:
                 break
             sym = keys[(syms + k) % n]
+            self._demote_cursor = (syms + k + 1) % n
             if sym in hot:
                 continue
-            buf = self.bookmaps[sym]
+            # The budget counts WORK DONE, not calls made. A symbol registered
+            # a moment ago has no columns to evict and no ring to shrink, so
+            # demoting it is free - and counting it left a thousand-symbol
+            # backlog draining six a pass while the free ones ahead of it used
+            # every slot. Measured at 1,000 symbols: a 760-deep queue that
+            # never cleared. set_hot reports whether it released anything.
+            worked = self.bookmaps[sym].set_hot(False)
             ser = self.series.get(sym)
-            changed = (buf.max_cols != buf.cold_cols
-                       or (ser is not None and ser._hot))
-            buf.set_hot(False)
             if ser is not None:
-                ser.set_hot(False)
-            if changed:
+                worked = ser.set_hot(False) or worked
+            if worked:
                 done += 1
-                self._demote_cursor = (syms + k + 1) % n
 
     def _bind_pane(self, pane) -> None:
         """Point the window's chart attributes at `pane`.

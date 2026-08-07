@@ -801,7 +801,10 @@ class _TapeItem(_BufItem):
         tx, tti, tsz, tag = buf.trade_x, buf.trade_ti, buf.trade_sz, buf.trade_ag
         cap = buf.max_trades
         total = buf.trade_count
-        n = total if total < cap else cap
+        # RETAINED, not derived from the session total: the ring can shrink
+        # (see BookmapBuffer._rehouse), after which trade_count claims more
+        # history than is held.
+        n = buf._tape_n
         first_abs = total - n                # absolute index of logical 0
         base = buf._tape_first               # physical slot of logical 0
         fold_lo = x_lo - _TRADE_SCAN_SLACK
