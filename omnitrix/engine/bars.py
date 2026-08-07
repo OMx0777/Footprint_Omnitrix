@@ -178,6 +178,32 @@ class Bar:
         return (ti[order], vals[order, 0].astype(np.int32),
                 vals[order, 1].astype(np.int32))
 
+    def add_cells_only(self, tick_index: int, size: int,
+                       aggressor: Aggressor) -> None:
+        """Put a trade into the footprint WITHOUT touching volume or delta.
+
+        For replaying history into a bar that already counted it. `add()`
+        maintains volume and delta as it goes, so routing a replayed trade
+        through it would add the same size twice - to the bar, and through
+        BarSeries._stat_trade to the session totals as well. This is the
+        cells, and only the cells.
+
+        The distinction is not cosmetic: volume and delta are what the candle,
+        the CVD and the monitor read, and they were already correct before the
+        footprint was ever stripped.
+        """
+        if self.cells is None:
+            self._thaw()
+        cell = self.cells.get(tick_index)
+        if cell is None:
+            cell = [0, 0]
+            self.cells[tick_index] = cell
+        buy, sell = split_size(size, aggressor, tick_index)
+        cell[0] += sell
+        cell[1] += buy
+        self._dirty = True
+        self._imb = None
+
     def drop_book(self) -> None:
         """Release this bar's L2 snapshot, keeping everything else.
 
@@ -450,6 +476,62 @@ class BarSeries:
         self.sess_volume: int = 0
         self.sess_delta: int = 0
         self.sess_trades: int = 0
+
+    def rebuild_footprint(self, trades) -> dict:
+        """Refill stripped bars' per-price cells from replayed history.
+
+        A cold symbol has its footprint released behind COLD_BARS (see
+        set_hot); OHLC, volume and delta survive, the cells do not. This puts
+        the cells back from a replay of the same trades.
+
+        IT DELIBERATELY DOES NOT GO THROUGH add_trade(). That path maintains
+        the bar's volume and delta AND feeds _stat_trade, and every one of
+        those figures already counted these trades when they arrived live. A
+        replay through the normal path would double the session volume, the
+        session delta and the bar's own volume - permanently, with nothing to
+        indicate it. So this writes cells and nothing else.
+
+        NO BAR IS CREATED. A trade whose bar has been evicted, or which
+        belongs to a bar that still has its cells, is counted and skipped:
+        inventing a bar from replayed data would put volume on the chart that
+        the session totals do not know about, which is the same falsehood in
+        the other direction.
+
+        Returns a report rather than nothing, because the useful question
+        afterwards is whether the refilled bars now agree with themselves -
+        `mismatched` counts bars whose cells do not sum to the volume they
+        have carried all along, which means the replay was not the same data.
+        """
+        filled = {}
+        applied = skipped = 0
+        for tr in trades:
+            bucket = int(tr.ts_ms // 1000 // self.base_tf_s) * self.base_tf_s
+            bar = self._bar_by_ts.get(bucket)
+            if bar is None or bar is self.bars[-1]:
+                # Evicted, or the live bar - which owns its own cells and must
+                # not be written behind add_trade's back.
+                skipped += 1
+                continue
+            if bar.start_ts not in filled and bar.n_levels() > 0:
+                skipped += 1
+                continue                     # this bar still has its footprint
+            filled[bar.start_ts] = bar
+            ti = self.instruments.to_index(self.symbol, tr.price)
+            bar.add_cells_only(ti, tr.size, tr.aggressor)
+            applied += 1
+
+        mismatched = 0
+        for bar in filled.values():
+            _t, sell, buy = bar.arrays()
+            if int(sell.sum()) + int(buy.sum()) != bar.volume:
+                mismatched += 1
+            bar.seal()                       # recompact and refresh analytics
+        if filled:
+            self._agg_cache.clear()
+            self._tf_dirty.clear()
+            self._version += 1
+        return {"bars": len(filled), "applied": applied,
+                "skipped": skipped, "mismatched": mismatched}
 
     def _stat_trade(self, tr: Trade) -> None:
         if self.sess_open is None:
