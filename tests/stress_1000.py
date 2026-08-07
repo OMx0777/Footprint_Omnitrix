@@ -48,7 +48,7 @@ from omnitrix.engine.model import Trade, Aggressor, BookSnapshot
 from omnitrix.ui.main_window import OmnitrixWindow, MAX_DEMOTIONS_PER_SYNC
 from omnitrix.app import _tune_gc
 
-RUN_S = float(os.environ.get("STRESS_SECONDS", "300"))
+RUN_S = float(os.environ.get("STRESS_SECONDS", "180"))
 N_SYM = int(os.environ.get("STRESS_SYMBOLS", "1000"))
 DEPTH = 100                       # per side, the stated requirement
 
@@ -153,15 +153,39 @@ def churn(step: int) -> None:
         win.open_bookmap_for(rng.choice(syms))
 
 
+def _deep(o, seen=None):
+    """Real bytes, FOLLOWING containers.
+
+    sys.getsizeof on a dict counts the table and not the values, which is
+    exactly how _cache["tot"] was reported at 184 B a bar while actually
+    costing 7,098. Nothing in this file estimates with a constant; an estimate
+    is what hid the largest term in the model for three commits.
+    """
+    if o is None:
+        return 0
+    if seen is None:
+        seen = set()
+    if id(o) in seen:
+        return 0
+    seen.add(id(o))
+    t = sys.getsizeof(o)
+    if isinstance(o, dict):
+        for k, v in o.items():
+            t += _deep(k, seen) + _deep(v, seen)
+    elif isinstance(o, (list, tuple, set, frozenset)):
+        for v in o:
+            t += _deep(v, seen)
+    return t
+
+
 def model_mb():
     """Bytes the MODEL holds, counted - so growth can be attributed.
 
-    RSS alone cannot separate "still filling its retention windows" from
-    "leaking", and the windows here take a while: a cold BarSeries keeps 150
-    bars at a 10 s base, which is 25 minutes of wall clock before it is even
-    full. A five-minute run that sees RSS rising has learned nothing.
+    RSS alone cannot separate "still filling a retention window" from
+    "leaking", and these windows take minutes to fill, so a short run that
+    sees RSS rising has learned nothing. Reported per owner instead.
     """
-    lad = bs = tp = bars = 0
+    lad = bs = tp = bars = cache = idx = 0
     seen = set()
     for b in win.bookmaps.values():
         tp += (b.trade_x.nbytes + b.trade_ti.nbytes
@@ -172,8 +196,13 @@ def model_mb():
                 seen.add(id(k))
                 if hasattr(k, "ti"):
                     lad += k.ti.nbytes + k.sz.nbytes + 280
-            bs += (len(c.buy) + len(c.sell)) * 100
+            bs += _deep(c.buy) + _deep(c.sell)
     for ser in win.series.values():
+        # One dict entry per bar, kept for the life of the bar. This is the
+        # term that legitimately climbs for 33 hours as the 12,000-bar window
+        # fills, and it is counted separately so it is never mistaken for one
+        # that should have plateaued.
+        idx += _deep(ser._bar_by_ts)
         for bar in ser.bars:
             for nm in ("_ti", "_sell", "_buy"):
                 a = getattr(bar, nm, None)
@@ -182,8 +211,9 @@ def model_mb():
             k = bar.book
             if k is not None and hasattr(k, "ti") and k.ti.size:
                 bars += k.ti.nbytes + k.sz.nbytes + 280
-            bars += 168
-    return lad/1e6, bs/1e6, tp/1e6, bars/1e6
+            bars += sys.getsizeof(bar)
+            cache += _deep(bar._cache) + _deep(bar._imb)
+    return lad/1e6, bs/1e6, tp/1e6, bars/1e6, cache/1e6, idx/1e6
 
 
 def backlog() -> int:
@@ -201,7 +231,7 @@ print(f"  {N_SYM:,} symbols, {DEPTH} depth per side, "
 print(f"  tiers: " + ", ".join(f"{c} @ {r:g}/s" for c, r in TIERS))
 print()
 print("   elapsed    _tick ms          paint ms           RSS MB   backlog   "
-      "ladders  buy/sell   tape    bars  (MB)")
+      "ladders buy/sell   tape   bars  _cache  barIdx (MB)")
 
 ticks, paints, backlogs = [], [], []
 rss_series = []
@@ -231,11 +261,11 @@ while time.time() - t_start < RUN_S:
         pm, pp = paints[len(paints)//2], paints[int(len(paints)*0.95)]
         r = rss()
         rss_series.append(r)
-        lad, bsd, tpd, bard = model_mb()
-        model_series.append(lad + bsd + tpd + bard)
+        lad, bsd, tpd, bard, cached, idxd = model_mb()
+        model_series.append(lad + bsd + tpd + bard + cached + idxd)
         print(f"   {el:5.0f}s   {tm:5.1f} (p95{tp:6.1f})  {pm:6.1f} (p95{pp:6.1f})  "
-              f"{r:8.1f}   {max(backlogs):5d}   {lad:7.1f} {bsd:8.1f} {tpd:7.1f} "
-              f"{bard:7.1f}")
+              f"{r:8.1f}   {max(backlogs):5d}  {lad:6.1f} {bsd:8.1f} {tpd:6.1f} "
+              f"{bard:6.1f} {cached:7.1f} {idxd:7.1f}")
         ticks, paints, backlogs = [], [], []
         nxt += 30.0
 

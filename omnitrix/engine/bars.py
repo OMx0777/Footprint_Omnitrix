@@ -247,8 +247,19 @@ class Bar:
         # on round sizes (measured: 14 of 400 random bars), so this is worth
         # pinning down rather than leaving to arrival order.
         poc = int(ti[int(v.argmax())])
-        return {"poc": poc, "tot": dict(zip(t64.tolist(), v.tolist())),
-                "ti_v": ti_v, "ti2_v": ti2_v}
+        # NO "tot" DICT. It used to cache {tick_index: volume} here, which is
+        # the same data _ti/_sell/_buy already hold - a second copy, in the
+        # exact boxed-dict shape seal() exists to get rid of.
+        #
+        # Measured with a deep sizer (sys.getsizeof does NOT follow a dict's
+        # values, which is how it was previously reported as 184 B): 7,098 B a
+        # bar, 68% of a sealed bar and nearly four times the L2 book. Across
+        # 1,000 symbols at the 12,000-bar cap, 85 GB.
+        #
+        # Its only consumer was value_area(), which now walks the arrays. They
+        # are sorted ascending by seal(), which is what the dict version got
+        # from sorted(tot) - so the walk is the same walk, without the copy.
+        return {"poc": poc, "ti_v": ti_v, "ti2_v": ti2_v}
 
     @property
     def ti_moments(self) -> tuple[float, float]:
@@ -263,30 +274,43 @@ class Bar:
     def value_area(self, pct: float = 0.70) -> tuple[int | None, int | None]:
         """(VAH index, VAL index) enclosing `pct` of volume, expanded from the
         POC toward the heavier adjacent side. Computed on demand so the pct is
-        adjustable; only ever called for on-screen bars."""
-        a = self._analytics()
-        tot = a["tot"]
-        poc = a["poc"]
-        if not tot:
+        adjustable; only ever called for on-screen bars.
+
+        Walks the footprint ARRAYS. It used to walk a {tick_index: volume}
+        dict cached in _cache["tot"] - the same data a second time, boxed, at
+        7,098 B a bar. The arrays are sorted ascending by seal(), which is
+        exactly what sorted(tot) produced, so this is the same traversal in
+        the same order and returns the same pair.
+        """
+        ti, sell, buy = self.arrays()
+        if ti.size == 0:
             return None, None
-        target = sum(tot.values()) * pct
-        idxs = sorted(tot)
-        pos = idxs.index(poc)
+        poc = self._analytics()["poc"]
+        if poc is None:
+            return None, None
+        v = (sell.astype(np.int64) + buy.astype(np.int64))
+        n = int(ti.size)
+        pos = int(np.searchsorted(ti, poc))
+        if pos >= n or int(ti[pos]) != poc:
+            # A stripped bar keeps its cached POC but not its cells; there is
+            # no area to report and inventing one would be worse than saying so.
+            return None, None
+        target = float(v.sum()) * pct
+        vl = v.tolist()                      # one conversion, then plain ints
         lo = hi = pos
-        acc = tot[poc]
-        n = len(idxs)
+        acc = vl[pos]
         while acc < target and (lo > 0 or hi < n - 1):
-            up = tot[idxs[hi + 1]] if hi < n - 1 else -1
-            dn = tot[idxs[lo - 1]] if lo > 0 else -1
+            up = vl[hi + 1] if hi < n - 1 else -1
+            dn = vl[lo - 1] if lo > 0 else -1
             if up < 0 and dn < 0:
                 break
             if up >= dn:
                 hi += 1
-                acc += tot[idxs[hi]]
+                acc += vl[hi]
             else:
                 lo -= 1
-                acc += tot[idxs[lo]]
-        return idxs[hi], idxs[lo]
+                acc += vl[lo]
+        return int(ti[hi]), int(ti[lo])
 
     def imbalances(self, factor: float = 3.0, min_vol: int = 20) -> tuple[set[int], set[int]]:
         """Diagonal imbalances (recomputed on demand — cheap, factor-dependent).

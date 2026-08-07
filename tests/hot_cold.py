@@ -30,6 +30,7 @@ from omnitrix.ui import workspace
 workspace.save = lambda *a, **k: None
 workspace.restore = lambda *a, **k: None
 
+import numpy as np
 from PyQt6.QtWidgets import QApplication
 from omnitrix.engine import Instruments, BookmapBuffer, SyntheticFeed
 from omnitrix.engine.bookmap import COLD_COLS, TAPE_SEED
@@ -319,6 +320,83 @@ hot_bs, _ = build_bars(60, 1_700_000_500_000)
 check("a hot series keeps its recent books",
       sum(1 for b in hot_bs.bars if b.book is not None and len(b.book)) > 0,
       f"{sum(1 for b in hot_bs.bars if b.book is not None and len(b.book))} bars with a book")
+
+# ---- 2c. the cached footprint DICT is gone --------------------------------
+# _cache["tot"] held {tick_index: volume} - the same data _ti/_sell/_buy
+# already hold, boxed, in the exact shape seal() exists to remove. It was
+# reported as 184 B a bar because sys.getsizeof does not follow a dict's
+# VALUES; measured with a deep sizer it is 7,098 B, 68% of a sealed bar and
+# nearly four times the L2 book. Across 1,000 symbols at the 12,000-bar cap,
+# 85 GB.
+#
+# value_area() was its only consumer and now walks the arrays, which seal()
+# already sorts ascending - the same traversal the dict got from sorted(tot).
+
+
+def deep(o, seen=None):
+    """Real bytes, following containers. getsizeof alone does not."""
+    if seen is None:
+        seen = set()
+    if id(o) in seen:
+        return 0
+    seen.add(id(o))
+    t = sys.getsizeof(o)
+    if isinstance(o, dict):
+        for k, v in o.items():
+            t += deep(k, seen) + deep(v, seen)
+    elif isinstance(o, (list, tuple, set, frozenset)):
+        for v in o:
+            t += deep(v, seen)
+    return t
+
+
+cache_bars, _ = build_bars(80, 1_700_000_700_000)
+sealed_b = [x for x in cache_bars.bars if x.cells is None]
+per_cache = sum(deep(x._cache or {}) for x in sealed_b) / max(1, len(sealed_b))
+check("no bar caches a boxed copy of its own footprint",
+      per_cache < 400, f"{per_cache:.0f} B of _cache per sealed bar")
+check("...and no 'tot' key survives anywhere",
+      all("tot" not in (x._cache or {}) for x in cache_bars.bars))
+
+
+def old_value_area(bar, pct):
+    """The dict formulation, verbatim, as the oracle."""
+    ti, sell, buy = bar.arrays()
+    if ti.size == 0:
+        return None, None
+    t64 = ti.astype(np.int64)
+    v = sell.astype(np.int64) + buy.astype(np.int64)
+    tot = dict(zip(t64.tolist(), v.tolist()))
+    poc = int(ti[int(v.argmax())])
+    target = sum(tot.values()) * pct
+    idxs = sorted(tot)
+    pos = idxs.index(poc)
+    lo = hi = pos
+    acc = tot[poc]
+    n = len(idxs)
+    while acc < target and (lo > 0 or hi < n - 1):
+        up = tot[idxs[hi + 1]] if hi < n - 1 else -1
+        dn = tot[idxs[lo - 1]] if lo > 0 else -1
+        if up < 0 and dn < 0:
+            break
+        if up >= dn:
+            hi += 1
+            acc += tot[idxs[hi]]
+        else:
+            lo -= 1
+            acc += tot[idxs[lo]]
+    return idxs[hi], idxs[lo]
+
+
+va_bad = 0
+va_n = 0
+for bar in cache_bars.bars:
+    for pct in (0.5, 0.68, 0.70, 0.9, 1.0):
+        va_n += 1
+        if bar.value_area(pct) != old_value_area(bar, pct):
+            va_bad += 1
+check("value_area on arrays equals value_area on the dict, exactly",
+      va_bad == 0, f"{va_n:,} comparisons, {va_bad} mismatches")
 
 # ---- 3. the app marks the right symbols hot --------------------------------
 app = QApplication.instance() or QApplication([])
