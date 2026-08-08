@@ -259,6 +259,9 @@ class OmnitrixWindow(QMainWindow):
         # When each symbol was last seen on screen. Absent means "on screen
         # now"; see DEMOTE_GRACE_S.
         self._cold_since: dict = {}
+        # Symbols that have been on screen at least once. Only these earn the
+        # demotion grace period - see _sync_hot.
+        self._ever_hot: set = set()
         # Startup backfill: "idle" until asked, "holding" while history loads,
         # then "done" or "live_only". Only "holding" gates the drain.
         self._bf_state = "idle"
@@ -867,10 +870,24 @@ class OmnitrixWindow(QMainWindow):
         _w_drain = watch("drain")
         _w_drain.__enter__()
         while q:
-            # Check the clock every 256 events rather than every event:
-            # perf_counter() costs about as much as processing a Trade, so
-            # calling it per event would double the drain cost to police it.
-            if not (drained & 255) and time.perf_counter() > deadline:
+            # CHECK THE CLOCK EVERY 32 EVENTS, NOT EVERY 256.
+            #
+            # The old interval was chosen against the cost of a TRADE, where
+            # perf_counter is comparable to the work and checking per event
+            # would double the drain's cost to police it. That reasoning does
+            # not survive a deep book: a fresh 800-level snapshot costs 93 us
+            # against a trade's 1.7 us - 50x - so a window of 256 events can
+            # be 24 ms of work before the budget is even consulted, and the
+            # budget is 22 ms.
+            #
+            # Found by the watchdog, which named it directly:
+            #     SLOW FRAME 199 ms - drain 198ms  redraw 1ms
+            # with half the queued events being 800-level books.
+            #
+            # 32 costs 40 ns per check spread over 32 events - about 1 ns each,
+            # against the 47 us average this queue actually carries. The
+            # original concern is a rounding error at this granularity.
+            if not (drained & 31) and time.perf_counter() > deadline:
                 break
             ev = q.popleft()
             drained += 1
@@ -1005,6 +1022,7 @@ class OmnitrixWindow(QMainWindow):
         now = time.monotonic()
         for sym in hot:
             self._cold_since.pop(sym, None)
+            self._ever_hot.add(sym)
         done = 0
         syms = self._demote_cursor = getattr(self, "_demote_cursor", 0)
         keys = list(self.bookmaps)
@@ -1016,15 +1034,24 @@ class OmnitrixWindow(QMainWindow):
             self._demote_cursor = (syms + k + 1) % n
             if sym in hot:
                 continue
-            # GRACE. A symbol that just left the screen keeps everything for a
-            # while - releasing it immediately is what made a glance at
-            # another ticker destroy the history of the one being traded.
-            first = self._cold_since.get(sym)
-            if first is None:
-                self._cold_since[sym] = now
-                continue
-            if now - first < DEMOTE_GRACE_S:
-                continue
+            # GRACE, BUT ONLY FOR A SYMBOL THAT WAS ACTUALLY ON SCREEN.
+            #
+            # The grace exists so that glancing at another ticker does not
+            # destroy the history of the one being traded. A symbol that has
+            # NEVER been displayed has no history worth protecting, and giving
+            # it five minutes anyway means every symbol in the basket is held
+            # at full retention for the first five minutes of every session.
+            #
+            # Measured at 100 symbols and 400 depth a side, that is 2.3 GB and
+            # a bookmap p95 of 325 ms - the whole startup window spent in
+            # exactly the state the hot/cold split exists to avoid.
+            if sym in self._ever_hot:
+                first = self._cold_since.get(sym)
+                if first is None:
+                    self._cold_since[sym] = now
+                    continue
+                if now - first < DEMOTE_GRACE_S:
+                    continue
             # The budget counts WORK DONE, not calls made. A symbol registered
             # a moment ago has no columns to evict and no ring to shrink, so
             # demoting it is free - and counting it left a thousand-symbol
