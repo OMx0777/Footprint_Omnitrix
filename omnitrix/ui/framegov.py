@@ -37,7 +37,10 @@ cost is paint, not compute.
 from __future__ import annotations
 
 import math
+import logging
 import time
+
+log = logging.getLogger(__name__)
 
 import pyqtgraph as pg
 
@@ -310,6 +313,7 @@ class GovernedTimer:
 
     def _fire(self) -> None:
         t = time.perf_counter()
+        WATCHDOG.begin()
         if self._last_end is not None:
             # Measured from the END of the previous frame, which is when the
             # timer was re-armed. Timing fire-to-fire instead would include our
@@ -324,6 +328,7 @@ class GovernedTimer:
             # consumed the thread, and pretending it was free would let a
             # failing window keep its rate while everyone else is throttled.
             end = time.perf_counter()
+            WATCHDOG.end(self._key, end - t)
             GOVERNOR.report(self._key, end - t)
             self._last_end = end
             self._timer.start(GOVERNOR.interval(self._key))
@@ -358,3 +363,85 @@ class GovernedPlotWidget(pg.GraphicsLayoutWidget):
             return super().paintEvent(ev)
         finally:
             GOVERNOR.report_paint(self._gov_key, time.perf_counter() - t)
+
+
+# ---------------------------------------------------------------- watchdog
+
+
+class FrameWatchdog:
+    """Names the culprit when a frame runs long.
+
+    EVERY freeze in this application has been the same shape: unbounded work
+    on the frame thread. A dict rebuilt in paint, an alert gate sorting its
+    book per print, a demotion batch, a history fold. Each one was found by a
+    user saying "it froze" and then hours of measurement, because the app
+    recorded the symptom and nothing about the cause.
+
+    So a slow frame now writes down what it was doing. Sections are marked by
+    the code that could be expensive; when a frame goes over budget the
+    watchdog logs the total and the sections that made it up. The next report
+    of a stall arrives with the answer attached.
+
+    IT MUST NOT BECOME THE PROBLEM. perf_counter twice per section is ~80 ns,
+    the section table is a handful of dict writes, and a frame that is fine
+    logs nothing at all. A frame that is NOT fine has already lost far more
+    than that.
+    """
+
+    __slots__ = ("over_s", "quiet_s", "_sections", "_t0", "_last_log",
+                 "worst_ms", "over_count")
+
+    def __init__(self, over_ms: float = 120.0, quiet_s: float = 5.0):
+        self.over_s = over_ms / 1000.0
+        # A stall usually repeats every frame. Logging each one turns the file
+        # into noise and hides the first occurrence, which is the useful one.
+        self.quiet_s = quiet_s
+        self._sections: dict = {}
+        self._t0 = 0.0
+        self._last_log = 0.0
+        self.worst_ms = 0.0
+        self.over_count = 0
+
+    def begin(self) -> None:
+        if self._sections:
+            self._sections.clear()
+        self._t0 = time.perf_counter()
+
+    def add(self, name: str, secs: float) -> None:
+        s = self._sections
+        s[name] = s.get(name, 0.0) + secs
+
+    def end(self, key: int, secs: float) -> None:
+        ms = secs * 1000.0
+        if ms > self.worst_ms:
+            self.worst_ms = ms
+        if secs < self.over_s:
+            return
+        self.over_count += 1
+        now = time.perf_counter()
+        if now - self._last_log < self.quiet_s:
+            return
+        self._last_log = now
+        parts = sorted(self._sections.items(), key=lambda kv: -kv[1])[:5]
+        detail = "  ".join(f"{n} {v*1000:.0f}ms" for n, v in parts) or "unmarked"
+        log.warning("SLOW FRAME %.0f ms (window %s) - %s", ms, key, detail)
+
+
+WATCHDOG = FrameWatchdog()
+
+
+class watch:
+    """`with watch("fold"): ...` - attribute this block to the current frame."""
+
+    __slots__ = ("name", "t")
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        self.t = time.perf_counter()
+        return self
+
+    def __exit__(self, *_exc):
+        WATCHDOG.add(self.name, time.perf_counter() - self.t)
+        return False

@@ -18,7 +18,8 @@ from PyQt6.QtWidgets import (
     QToolButton, QWidgetAction, QHBoxLayout, QSplitter, QVBoxLayout,
 )
 
-from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
+from .framegov import (GOVERNOR, GovernedTimer, GovernedPlotWidget,
+                       watch, WATCHDOG)
 from .alert_ui import AlertToast, SOUNDER
 from ..engine.alerts import AlertBook, CROSS, ABOVE, BELOW
 from ..engine.history import HistoryFetcher, StartupFetcher
@@ -863,6 +864,8 @@ class OmnitrixWindow(QMainWindow):
         backlog = len(q)
         budget = DRAIN_BUDGET_BUSY_S if backlog >= DRAIN_BUSY_AT else DRAIN_BUDGET_S
         deadline = time.perf_counter() + budget
+        _w_drain = watch("drain")
+        _w_drain.__enter__()
         while q:
             # Check the clock every 256 events rather than every event:
             # perf_counter() costs about as much as processing a Trade, so
@@ -909,9 +912,11 @@ class OmnitrixWindow(QMainWindow):
                 if self._shows(ev.symbol):
                     self._dirty = True
 
+        _w_drain.__exit__()
         if self._alert_pending:
-            fired, self._alert_pending = self._alert_pending, []
-            self._fire_alerts(fired)
+            with watch("alerts"):
+                fired, self._alert_pending = self._alert_pending, []
+                self._fire_alerts(fired)
 
         # Refresh the live indicator ~2x/sec even when no data is flowing, so
         # "waiting for Takion" is visible before the first tick arrives.
@@ -925,8 +930,10 @@ class OmnitrixWindow(QMainWindow):
         # loses history. A second's lag costs nothing; a missed hook is a bug
         # nobody would find.
         if self._link_tick % 25 == 0:
-            self._sync_hot()
-        self._fold_pending()
+            with watch("sync_hot"):
+                self._sync_hot()
+        with watch("history_fold"):
+            self._fold_pending()
         if self._bf_zombies:
             self._bf_zombies = [f for f in self._bf_zombies if f.isRunning()]
 
@@ -1254,8 +1261,9 @@ class OmnitrixWindow(QMainWindow):
 
     def _redraw(self) -> None:
         """Redraw every VISIBLE pane, each against its own symbol."""
-        for pane in self._visible_panes():
-            self._redraw_pane(pane)
+        with watch("redraw"):
+            for pane in self._visible_panes():
+                self._redraw_pane(pane)
 
     def _redraw_pane(self, pane) -> None:
         # A tick change (or a symbol selected before its first print) leaves the
