@@ -6,6 +6,7 @@ and tape composition (buy vs sell share, average and largest print).
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QTimer, QRectF
+from .framegov import GovernedTimer, watch
 from PyQt6.QtGui import QPainter, QColor, QFont
 from PyQt6.QtWidgets import QWidget
 
@@ -36,9 +37,15 @@ class StatsPanel(QWidget):
         self.setMinimumWidth(232)
         self.f_head = QFont("Consolas", 9, QFont.Weight.Bold)
         self.f_row = QFont("Consolas", 9)
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self.update)
-        self._timer.start(400)
+        # Governed for the same reason as the signals panel: a side panel
+        # must be throttleable when the chart is struggling, and its cost has
+        # to be visible to the watchdog rather than landing in "unmarked".
+        self._timer = GovernedTimer(self, self._tick, 400, priority=1)
+        self._timer.start()
+
+    def _tick(self) -> None:
+        with watch("stats_panel"):
+            self.update()
 
     # ---- data ------------------------------------------------------------
     def _collect(self) -> list:

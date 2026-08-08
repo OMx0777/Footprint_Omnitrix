@@ -12,6 +12,7 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, QRectF
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtGui import QPainter, QColor, QFont
+from .framegov import GovernedTimer, watch
 from ..render.crosshair import clock_label
 
 BUY = QColor(46, 158, 126)
@@ -38,9 +39,17 @@ class TapeWidget(QWidget):
         self.setMinimumWidth(220)
         self.font = QFont("Consolas", 9)
         self.header_font = QFont("Consolas", 9, QFont.Weight.Bold)
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self.update)
-        self._timer.start(150)
+        # Governed. A bare timer cannot be throttled when the chart is
+        # already late, and its cost is invisible to the watchdog - a stall
+        # here would be reported as "unmarked", which is the state that made
+        # every previous freeze expensive to find. Priority 1: a side panel
+        # gives way to the chart being traded from.
+        self._timer = GovernedTimer(self, self._tick, 150, priority=1)
+        self._timer.start()
+
+    def _tick(self) -> None:
+        with watch("tape_widget"):
+            self.update()
 
     def paintEvent(self, _) -> None:
         p = QPainter(self)

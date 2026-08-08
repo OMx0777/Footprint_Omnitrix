@@ -163,10 +163,15 @@ check("panes cannot be collapsed to nothing",
       and not bm._rows[0].childrenCollapsible())
 
 # ---- budget ---------------------------------------------------------------
+# As in tests/grid_check.py: the property is that four BOOKS share the bookmap
+# window's single timer, so it appears once however many panes are open.
+# Counting the whole registry also asserted that nothing else in the app was
+# governed, which stopped being true - and should have - when the side panels
+# were moved onto the governor.
 keys = [k for k, *_ in GOVERNOR.snapshot()]
 check("four books cost ONE frame-budget entry",
-      keys.count(id(bm)) == 1 and len(keys) == 2,      # main window + bookmap
-      f"registry {len(keys)} entries")
+      keys.count(id(bm)) == 1,
+      f"bookmap appears {keys.count(id(bm))}x in a registry of {len(keys)}")
 
 # ---- re-opening a symbol already on screen selects it ---------------------
 win.open_bookmap_for("NVDA")

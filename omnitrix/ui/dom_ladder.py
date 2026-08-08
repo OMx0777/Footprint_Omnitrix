@@ -16,6 +16,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, QTimer, QRectF
 from PyQt6.QtGui import QPainter, QColor, QFont
 from PyQt6.QtWidgets import QWidget, QMainWindow
+from .framegov import GovernedTimer, watch
 
 BG = QColor(11, 14, 20)
 GRID = QColor(30, 36, 47)
@@ -48,9 +49,17 @@ class DomLadderWidget(QWidget):
         self.setMinimumWidth(460)
         self.f_head = QFont("Consolas", 9, QFont.Weight.Bold)
         self.f_row = QFont("Consolas", 9)
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self.update)
-        self._timer.start(200)
+        # Governed. A bare timer cannot be throttled when the chart is
+        # already late, and its cost is invisible to the watchdog - a stall
+        # here would be reported as "unmarked", which is the state that made
+        # every previous freeze expensive to find. Priority 1: a side panel
+        # gives way to the chart being traded from.
+        self._timer = GovernedTimer(self, self._tick, 200, priority=1)
+        self._timer.start()
+
+    def _tick(self) -> None:
+        with watch("dom_ladder"):
+            self.update()
 
     def paintEvent(self, _) -> None:
         p = QPainter(self)

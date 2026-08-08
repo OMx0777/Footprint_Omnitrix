@@ -7,6 +7,7 @@ from __future__ import annotations
 import time
 
 from PyQt6.QtCore import Qt, QTimer, QRectF
+from .framegov import GovernedTimer, watch
 from PyQt6.QtGui import QPainter, QColor, QFont
 from PyQt6.QtWidgets import QWidget
 
@@ -45,11 +46,23 @@ class SignalsPanel(QWidget):
         self.f_head = QFont("Consolas", 9, QFont.Weight.Bold)
         self.f_row = QFont("Consolas", 9)
         self._events: list = []
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(900)
+        # GOVERNED, not a bare QTimer. detect_all costs 26.7 ms on a full
+        # 1400-column buffer, so this panel alone is ~3% of a core running
+        # continuously - and on a bare timer the governor could not throttle
+        # it when frames were ALREADY late, which is exactly when it should
+        # give way. It was also invisible to the watchdog, so a stall here
+        # would have been reported as "unmarked".
+        #
+        # Priority 1: this is a side panel. The chart being traded from comes
+        # first when the budget is tight.
+        self._timer = GovernedTimer(self, self._tick, 900, priority=1)
+        self._timer.start()
 
     def _tick(self) -> None:
+        with watch("signals_panel"):
+            self._refresh()
+
+    def _refresh(self) -> None:
         app = self.app
         sym = app.active_symbol
         buf = app.bookmaps.get(sym) if sym else None
