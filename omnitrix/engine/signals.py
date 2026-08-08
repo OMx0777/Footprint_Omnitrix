@@ -154,3 +154,81 @@ def detect_all(buffer, agg: int = 1, cols_window: int = COLS_WINDOW,
           + detect_wall_breaks(cols))
     ev.sort(key=lambda d: -d["bucket"])
     return ev
+
+
+# ---------------------------------------------------------------- divergence
+
+def detect_delta_divergence(bars, lookback: int = 60, swing: int = 2,
+                            min_bars: int = 3, top_n: int = 20) -> list[dict]:
+    """Price makes a new extreme; cumulative delta does not.
+
+    The trade this is for: price grinds to a higher high while the aggressive
+    buying that should be driving it is smaller than it was at the last high.
+    The move is being made by fewer and fewer buyers, so the next seller of
+    size has less to absorb.
+
+    MEASURED ON SWING POINTS, NOT ON EVERY BAR. Comparing consecutive bars
+    would fire on noise - a single quiet bar in an advance is not a
+    divergence, it is a quiet bar. A swing high here is a bar whose high is
+    the highest of the `swing` bars either side of it, so the comparison is
+    between two points a trader would also have marked.
+
+    CUMULATIVE delta, not per-bar. Per-bar delta at a high says what that one
+    bar did; the running total says what the whole leg did, which is the thing
+    that is supposed to confirm the move.
+
+    Returns newest last:
+        {"kind": "bear_div"|"bull_div", "i": bar index, "prev_i": the swing it
+         is compared against, "price": float, "delta": int, "prev_delta": int}
+    """
+    n = len(bars)
+    if n < min_bars + 2 * swing + 2:
+        return []
+    lo_i = max(0, n - lookback)
+    window = list(range(lo_i, n))
+
+    # Running cumulative delta over the whole window, so both swings are read
+    # off the same curve.
+    cum = {}
+    run = 0
+    for i in window:
+        run += bars[i].delta
+        cum[i] = run
+
+    def is_swing_high(i):
+        if i - swing < lo_i or i + swing >= n:
+            return False
+        h = bars[i].high
+        return all(bars[j].high <= h for j in range(i - swing, i + swing + 1)
+                   if j != i)
+
+    def is_swing_low(i):
+        if i - swing < lo_i or i + swing >= n:
+            return False
+        l_ = bars[i].low
+        return all(bars[j].low >= l_ for j in range(i - swing, i + swing + 1)
+                   if j != i)
+
+    out = []
+    highs = [i for i in window if is_swing_high(i)]
+    lows = [i for i in window if is_swing_low(i)]
+
+    for seq, kind in ((highs, "bear_div"), (lows, "bull_div")):
+        for a, b in zip(seq, seq[1:]):
+            if b - a < min_bars:
+                continue                      # too close to be two legs
+            if kind == "bear_div":
+                # Higher high in price, lower high in cumulative delta.
+                if not (bars[b].high > bars[a].high and cum[b] < cum[a]):
+                    continue
+                price = bars[b].high
+            else:
+                # Lower low in price, higher low in delta.
+                if not (bars[b].low < bars[a].low and cum[b] > cum[a]):
+                    continue
+                price = bars[b].low
+            out.append({"kind": kind, "i": b, "prev_i": a, "price": price,
+                        "delta": cum[b], "prev_delta": cum[a],
+                        "ts": bars[b].start_ts})
+    out.sort(key=lambda d: d["i"])
+    return out[-top_n:]
