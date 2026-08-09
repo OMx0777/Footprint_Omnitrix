@@ -105,6 +105,10 @@ ARCH_MAX_SLOTS = 1200
 # How many aggregations keep a converted copy. Four bookmap panes is the most
 # the app opens at once, so four entries covers every real layout.
 _CONV_CACHE_MAX = 4
+# How many archive slots one frame may convert when building cold. At the
+# measured cost this is a few milliseconds; the rest of the session arrives
+# over the following frames, newest first.
+_COLD_SLOTS_PER_CALL = 50
 
 
 class ArchiveSlot:
@@ -345,25 +349,64 @@ class SessionArchive:
         # Bounded so a user cycling the timeframe combo cannot accumulate
         # conversions of a whole session at every zoom.
         c = self._conv.get(agg)
-        if c is not None and c[0] == len(self._slots):
-            return self._trim(c[1], before_bucket)      # nothing new at all
-        if c is None or c[0] > len(self._slots):
-            cols, start = [], 0
+        n = len(self._slots)
+        if c is not None and c[0] == n and c[3] == 0:
+            return self._trim(c[1], before_bucket)      # nothing left to do
+        if c is None or c[0] > n:
+            # COLD BUILD, NEWEST FIRST AND BUDGETED.
+            #
+            # Selecting a symbol that already holds a whole session converts
+            # its entire archive in one frame - measured 143 ms in a 200-symbol
+            # soak, and named by the watchdog as `bookmap 143ms`. So the build
+            # starts at the RECENT end, does at most _COLD_SLOTS_PER_CALL slots
+            # per frame, and walks backwards on later frames. The part of the
+            # chart the user is looking at appears immediately and the older
+            # history fills in behind it over the next few frames, which is
+            # both faster to first paint and the order anyone actually reads.
+            oldest = n
+            cols = []
         else:
-            # Re-do the final group: a newly arrived slot can merge into it.
-            start = c[2]
-            first_new_g = int(self._slots[start].bucket * self.col_s
-                              / self.live_dt) // agg
+            oldest = c[3]
             cols = c[1]
-            k = len(cols)
-            while k > 0 and cols[k - 1].bucket >= first_new_g:
-                k -= 1
-            cols = cols[:k]
-        cols, group_start = self._convert(agg, cols, start)
+            if c[0] < n:
+                # New slots arrived: redo the final group, which one of them
+                # may have merged into.
+                start = c[2]
+                first_new_g = int(self._slots[start].bucket * self.col_s
+                                  / self.live_dt) // agg
+                k = len(cols)
+                while k > 0 and cols[k - 1].bucket >= first_new_g:
+                    k -= 1
+                cols = cols[:k]
+                cols, gs = self._convert(agg, cols, start, oldest)
+                self._store(agg, n, cols, gs, oldest)
+                if oldest == 0:
+                    return self._trim(cols, before_bucket)
+
+        if oldest > 0:
+            back = max(0, oldest - _COLD_SLOTS_PER_CALL)
+            head, _gs = self._convert(agg, [], back, oldest)
+            cols = _merge_head(head, cols)
+            oldest = back
+        gs = self._group_start(agg, cols)
+        self._store(agg, n, cols, gs, oldest)
+        return self._trim(cols, before_bucket)
+
+    def _store(self, agg, n, cols, group_start, oldest) -> None:
         if len(self._conv) >= _CONV_CACHE_MAX and agg not in self._conv:
             self._conv.pop(next(iter(self._conv)))
-        self._conv[agg] = (len(self._slots), cols, group_start)
-        return self._trim(cols, before_bucket)
+        self._conv[agg] = (n, cols, group_start, oldest)
+
+    def _group_start(self, agg: int, cols: list) -> int:
+        """Index of the first slot whose group is the last column's group."""
+        if not cols:
+            return 0
+        last_g = cols[-1].bucket
+        per_slot = self.col_s / self.live_dt
+        for i in range(len(self._slots) - 1, -1, -1):
+            if int(self._slots[i].bucket * per_slot) // agg < last_g:
+                return i + 1
+        return 0
 
     @staticmethod
     def _trim(cols: list, before_bucket) -> list:
@@ -371,13 +414,14 @@ class SessionArchive:
             return cols
         return cols[:_bisect_cols(cols, before_bucket)]
 
-    def _convert(self, agg: int, cols: list, start: int):
-        """Convert slots [start:] onto the agg grid, extending `cols`."""
+    def _convert(self, agg: int, cols: list, start: int, stop: int | None = None):
+        """Convert slots [start:stop) onto the agg grid, extending `cols`."""
         per_slot = self.col_s / self.live_dt
         out = list(cols)
         by_group = {}
         group_start = start
-        for si in range(start, len(self._slots)):
+        end = len(self._slots) if stop is None else min(stop, len(self._slots))
+        for si in range(start, end):
             s = self._slots[si]
             first = int(s.bucket * per_slot)
             last = int((s.bucket + 1) * per_slot) - 1
@@ -501,3 +545,30 @@ def _bisect_cols(cols, bucket):
         else:
             hi = mid
     return lo
+
+
+def _merge_head(head: list, tail: list) -> list:
+    """Join an older chunk to a newer one, merging the group they share.
+
+    A backward chunk can end in the same drawn column the newer chunk starts
+    with, and appending both would put two columns at one bucket - the x axis
+    would then be non-monotonic, which every consumer downstream assumes it is
+    not.
+    """
+    if not head:
+        return tail
+    if not tail:
+        return head
+    if head[-1].bucket == tail[0].bucket:
+        a, b = head[-1], tail[0]
+        b.vol += a.vol
+        b.net += a.net
+        b.sweeps += a.sweeps
+        if not len(b.book):
+            b.book = a.book
+        for k, v in a.buy.items():
+            b.buy[k] = b.buy.get(k, 0) + v
+        for k, v in a.sell.items():
+            b.sell[k] = b.sell.get(k, 0) + v
+        return head[:-1] + tail
+    return head + tail
