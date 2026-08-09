@@ -1876,17 +1876,12 @@ class OmnitrixWindow(QMainWindow):
         self._apply_theme()
         self._dirty = True
 
-    def _time_at(self, x: float) -> str:
-        """Wall-clock label for a bar position on the SELECTED chart."""
-        bars = self._active_pane.time_axis._bars
-        i = int(round(x))
-        if not (0 <= i < len(bars)):
-            return ""
-        lt = safe_localtime(bars[i].start_ts)
-        if lt is None:
-            return ""
-        fmt = "%H:%M:%S" if self.tf_s < 60 else "%d %b  %H:%M"
-        return time.strftime(fmt, lt)
+    # _time_at lived here until the chart moved into ChartPane, which took the
+    # crosshair with it. The copy left behind was dead AND broken - it called
+    # safe_localtime without importing it, so anything that had reached it
+    # would have raised NameError. Deleted rather than repaired: the live one
+    # is ChartPane._time_at, and a second implementation of a label the user
+    # reads off the time axis is how the two quietly drift apart.
 
     def _place_xhair_badges(self) -> None:
         self.xhair.place()
