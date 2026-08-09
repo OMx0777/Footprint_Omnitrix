@@ -24,6 +24,7 @@ import math
 import pyqtgraph as pg
 from PyQt6.QtCore import QRectF, QPointF, Qt
 from PyQt6.QtGui import QColor, QPainter, QPen, QFont
+from ..paintguard import safe_paint
 
 BUY_RING = QColor(126, 217, 87)        # position increased
 SELL_RING = QColor(240, 78, 78)        # position decreased
@@ -77,6 +78,7 @@ class ExecutionMarkersItem(pg.GraphicsObject):
             return None
         return float(i)
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         if not self.execs or not self.bars:
             return

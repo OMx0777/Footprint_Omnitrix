@@ -23,6 +23,7 @@ import pyqtgraph as pg
 from PyQt6 import QtCore
 from PyQt6.QtCore import Qt, QRectF, QPointF
 from PyQt6.QtGui import (QColor, QPen, QBrush, QPainter, QFont, QPainterPath)
+from ..paintguard import safe_paint
 
 _LABEL_FONT = QFont("Consolas", 8, QFont.Weight.Bold)
 
@@ -163,6 +164,7 @@ class FibRetracement(_DrawTool):
     def _local_y(self, level: float, h: float) -> float:
         return h * (1.0 - level) if self._flip else h * level
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         r = self.shape_rect()
         w, h = r.width(), r.height()
@@ -227,6 +229,7 @@ class PositionDrawer(_DrawTool):
                     self._syncing = False
         super()._changed()
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         r = self.shape_rect()
         w, h = r.width(), r.height()
@@ -405,6 +408,7 @@ class MeasureTool(_DrawTool):
                  f"{m}m" if m else "", f"{s}s" if s else ""]
         return " ".join(p for p in parts if p) or "0s"
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         r = self.shape_rect()
         w, h = r.width(), r.height()
@@ -476,6 +480,7 @@ class PenDrawing(_DrawTool):
         self.width = width
         self.points = [(x - pos[0], y - pos[1]) for x, y in pts]
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         if len(self.points) < 2:
             return
@@ -533,6 +538,7 @@ class CprDrawing(_DrawTool):
             tc, bc = bc, tc
         return pv, tc, bc
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         r = self.shape_rect()
         w, h = r.width(), r.height()
@@ -590,6 +596,7 @@ class FixedVolumeProfile(_DrawTool):
         self.addScaleHandle([0.5, 1], [0.5, 0])
         self.addScaleHandle([0.5, 0], [0.5, 1])
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         r = self.shape_rect()
         w, h = r.width(), r.height()

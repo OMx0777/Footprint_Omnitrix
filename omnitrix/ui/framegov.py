@@ -43,6 +43,7 @@ import time
 log = logging.getLogger(__name__)
 
 import pyqtgraph as pg
+from ..paintguard import safe_paint
 
 # Fraction of one GUI thread we allow the UI to request. The remainder absorbs
 # Qt's own event handling, the feed thread's GIL slices, styling, layout and
@@ -355,6 +356,7 @@ class GovernedPlotWidget(pg.GraphicsLayoutWidget):
     def set_gov_key(self, key: int) -> None:
         self._gov_key = key
 
+    @safe_paint
     def paintEvent(self, ev):
         if self._gov_key is None:
             return super().paintEvent(ev)

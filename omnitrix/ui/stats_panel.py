@@ -9,6 +9,7 @@ from PyQt6.QtCore import Qt, QTimer, QRectF
 from .framegov import GovernedTimer, watch
 from PyQt6.QtGui import QPainter, QColor, QFont
 from PyQt6.QtWidgets import QWidget
+from ..paintguard import safe_paint
 
 BG = QColor(8, 11, 17)
 HEAD = QColor(143, 160, 182)
@@ -114,6 +115,7 @@ class StatsPanel(QWidget):
         return rows
 
     # ---- paint -----------------------------------------------------------
+    @safe_paint
     def paintEvent(self, _) -> None:
         p = QPainter(self)
         p.fillRect(self.rect(), BG)

@@ -17,6 +17,7 @@ from PyQt6.QtCore import Qt, QTimer, QRectF
 from PyQt6.QtGui import QPainter, QColor, QFont
 from PyQt6.QtWidgets import QWidget, QMainWindow
 from .framegov import GovernedTimer, watch
+from ..paintguard import safe_paint
 
 BG = QColor(11, 14, 20)
 GRID = QColor(30, 36, 47)
@@ -61,6 +62,7 @@ class DomLadderWidget(QWidget):
         with watch("dom_ladder"):
             self.update()
 
+    @safe_paint
     def paintEvent(self, _) -> None:
         p = QPainter(self)
         p.fillRect(self.rect(), BG)

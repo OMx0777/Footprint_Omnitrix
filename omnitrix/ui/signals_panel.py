@@ -14,6 +14,7 @@ from ..engine import signals
 # clock_label applies the display offset; time.strftime would show IST and
 # quietly disagree with the chart's own axis by nine and a half hours.
 from ..render.crosshair import clock_label
+from ..paintguard import safe_paint
 
 BG = QColor(8, 11, 17)
 HEAD = QColor(143, 160, 182)
@@ -131,6 +132,7 @@ class SignalsPanel(QWidget):
             })
         return out
 
+    @safe_paint
     def paintEvent(self, _) -> None:
         p = QPainter(self)
         p.fillRect(self.rect(), BG)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pyqtgraph as pg
 from PyQt6.QtCore import QRectF, QPointF, Qt
 from PyQt6.QtGui import QColor, QPainter, QFont
+from ..paintguard import safe_paint
 
 TPO_FILL = QColor(96, 152, 226)
 TPO_VA = QColor(120, 190, 255)
@@ -52,6 +53,7 @@ class TPOItem(pg.GraphicsObject):
     def boundingRect(self) -> QRectF:
         return self._bounds
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         if not self.rows:
             return
@@ -102,6 +104,7 @@ class VolumeProfileItem(pg.GraphicsObject):
     def boundingRect(self) -> QRectF:
         return self._bounds
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         tis = set(self.buy) | set(self.sell)
         if not tis:

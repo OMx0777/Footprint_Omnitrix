@@ -25,6 +25,7 @@ from PyQt6.QtGui import QImage, QPainter
 #
 # _LUT_ARGB is _pack(_LUT), so the packed ramp cannot drift from the QColor one.
 from .bookmap import _LUT_ARGB  # noqa: E402  (single source of truth for the ramp)
+from ..paintguard import safe_paint
 
 
 class HeatmapItem(pg.GraphicsObject):
@@ -58,6 +59,7 @@ class HeatmapItem(pg.GraphicsObject):
     def boundingRect(self) -> QRectF:
         return self._bounds
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         """Composite the field into one ARGB buffer and blit it once.
 

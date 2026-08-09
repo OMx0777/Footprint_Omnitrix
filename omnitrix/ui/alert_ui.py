@@ -22,6 +22,7 @@ from PyQt6.QtGui import QColor, QPainter, QFont
 from PyQt6.QtWidgets import QWidget
 
 from ..render.crosshair import clock_label
+from ..paintguard import safe_paint
 
 log = logging.getLogger(__name__)
 
@@ -142,6 +143,7 @@ class AlertToast(QWidget):
     def mousePressEvent(self, ev) -> None:
         self._expire()
 
+    @safe_paint
     def paintEvent(self, ev) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)

@@ -18,6 +18,7 @@ from PyQt6.QtGui import QFont, QColor, QPainter, QFontMetrics
 
 from .theme import Theme, DARK
 from .pricegrid import AUTO_STEPS, TARGET_PX_LABELLED, step_ticks
+from ..paintguard import safe_paint
 
 
 class FootprintItem(pg.GraphicsObject):
@@ -129,6 +130,7 @@ class FootprintItem(pg.GraphicsObject):
         return self._bounds
 
     # ---- painting --------------------------------------------------------
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         if not self.bars:
             return

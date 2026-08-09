@@ -26,6 +26,7 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont
 
 from .bookmap import BUY_BUBBLE, SELL_BUBBLE
 from PyQt6.QtGui import QColor as _QColor
+from ..paintguard import safe_paint
 
 # A print that could not be classified is neither a lift nor a hit. Drawing
 # it in either colour asserts a direction the data does not contain, so it
@@ -103,6 +104,7 @@ class TapePrintsItem(_TapeBase):
         self.max_dots = 1000
         self.setZValue(0)
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         if not self.prints:
             return
@@ -171,6 +173,7 @@ class TapeSpeedItem(_TapeBase):
             get = out.get
         return out
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         if not self.prints:
             return
@@ -223,6 +226,7 @@ class TapeCvdItem(_TapeBase):
 
     MAX_POINTS = 1200
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         if not self.prints:
             return

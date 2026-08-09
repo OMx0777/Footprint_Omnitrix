@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import QWidget
 from PyQt6.QtGui import QPainter, QColor, QFont
 from .framegov import GovernedTimer, watch
 from ..render.crosshair import clock_label
+from ..paintguard import safe_paint
 
 BUY = QColor(46, 158, 126)
 SELL = QColor(212, 86, 79)
@@ -51,6 +52,7 @@ class TapeWidget(QWidget):
         with watch("tape_widget"):
             self.update()
 
+    @safe_paint
     def paintEvent(self, _) -> None:
         p = QPainter(self)
         p.fillRect(self.rect(), BG)

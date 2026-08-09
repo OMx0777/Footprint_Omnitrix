@@ -23,6 +23,7 @@ from ..engine.bookmap import _AG_FROM
 from PyQt6.QtCore import QRectF, QPointF, Qt
 from PyQt6.QtGui import (QColor, QPainter, QFont, QPen, QBrush, QRadialGradient,
                          QImage, QPixmap)
+from ..paintguard import safe_paint
 
 # Sampled from a real Bookmap ESU6:CME capture, not chosen by eye.
 #
@@ -357,6 +358,7 @@ class BookHeatmapItem(_BufItem):
         self._buf = None   # kept alive: QImage wraps this memory, never copies
         self.setZValue(-20)
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         if not self.cols:
             return
@@ -519,6 +521,7 @@ class BBOItem(_BufItem):
         super().__init__(tick)
         self.setZValue(-5)
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         if not self.cols:
             return
@@ -1013,6 +1016,7 @@ class BubbleItem(_TapeItem):
         self.min_r = 3.0
         self.max_r = 26.0
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         data = self._binned()
         self.drawn = [(x, y, b, s) for x, y, b, s, _ in data]
@@ -1153,6 +1157,7 @@ class SRLinesItem(pg.GraphicsObject):
     def boundingRect(self) -> QRectF:
         return self._bounds
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         if self.support is None and self.resistance is None:
             return
@@ -1238,6 +1243,7 @@ class ProjectionItem(pg.GraphicsObject):
     def boundingRect(self) -> QRectF:
         return self._bounds
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         col = self.col
         if col is None or not col.book:
@@ -1322,6 +1328,7 @@ class PieItem(_TapeItem):
         return list(zip(x.tolist(), (pv / tot).tolist(),
                         b.tolist(), s.tolist(), tot.tolist()))
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         data = self._by_bin()
         self.drawn = [(x, y, b, s) for x, y, b, s, _ in data]
@@ -1377,6 +1384,7 @@ class BarsItem(PieItem):
     Shares PieItem's per-bin aggregation; only the glyph differs.
     """
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         data = self._by_bin()
         self.drawn = [(x, y, b, s) for x, y, b, s, _ in data]
@@ -1439,6 +1447,7 @@ class DomLadderItem(pg.GraphicsObject):
     def boundingRect(self) -> QRectF:
         return self._bounds
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         col = self.col
         if col is None or not self._rows:
@@ -1495,6 +1504,7 @@ class VolumeBarsItem(_BufItem):
             self._bounds = QRectF()
         self.update()
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         vis, _x_lo, _x_hi = self._visible()
         if not vis:

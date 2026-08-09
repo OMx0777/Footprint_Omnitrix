@@ -14,6 +14,7 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QPointF, QRectF
 from PyQt6.QtGui import QColor, QPainter, QFont, QPainterPath
 from .crosshair import clock_label
+from ..paintguard import safe_paint
 
 
 class EMAItem(pg.GraphicsObject):
@@ -76,6 +77,7 @@ class EMAItem(pg.GraphicsObject):
     def boundingRect(self) -> QRectF:
         return self._bounds
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         n = len(self.emas)
         if n < 2:
@@ -168,6 +170,7 @@ class CPRItem(pg.GraphicsObject):
     def boundingRect(self) -> QRectF:
         return self._bounds
 
+    @safe_paint
     def paint(self, p: QPainter, *args) -> None:
         if not self.spans:
             return
