@@ -93,6 +93,11 @@ MAX_DEMOTIONS_PER_SYNC = 6
 # symbols. 300 columns is about 11 ms of an 80 ms frame; the six-symbol limit
 # above still applies, whichever binds first.
 MAX_FOLD_COLS_PER_SYNC = 300
+# How close (screen px) the cursor must already be to a bar's open/high/low/
+# close before the magnet takes the point. Small enough that a deliberate
+# placement in open space is never moved, large enough to catch the near-miss
+# that magnet mode exists for.
+MAGNET_PX_DEFAULT = 12.0
 
 # Deep scroll-back. A pan emits a range change per mouse move; waiting this
 # long after the last one turns a drag into ONE request instead of forty.
@@ -520,6 +525,10 @@ class OmnitrixWindow(QMainWindow):
         self.chk_vwap = _act(self.menu_overlays, "VWAP", False,
                              self._on_vwap_toggled,
                              "Volume-weighted average price for this chart")
+        self.chk_magnet = _act(self.menu_overlays, "Magnet (snap to OHLC)", True,
+                               self._on_magnet_toggled,
+                               "Snap drawing points to the nearest bar "
+                               "open/high/low/close  (Alt+N)")
         self.chk_cpr = _act(self.menu_overlays, "CPR", False,
                             self._on_cpr_toggled)
         self.chk_ema = _act(self.menu_overlays, "EMAs", False,
@@ -602,6 +611,10 @@ class OmnitrixWindow(QMainWindow):
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, dtb)
         
         self.active_drawing_tool = None
+        # Magnet: snap drawing points to bar extremes. On by default,
+        # like TradingView, because a level drawn a few cents off the wick
+        # is not the level anybody meant.
+        self.magnet_on = True
         self.drawing_items = []
         self._drawing_start_point = None
         # Freehand stroke in progress, or None. Initialised here as well as in
@@ -1521,6 +1534,10 @@ class OmnitrixWindow(QMainWindow):
                Qt.Key.Key_4: "5m", Qt.Key.Key_5: "15m", Qt.Key.Key_6: "30m",
                Qt.Key.Key_7: "1h", Qt.Key.Key_8: "4h", Qt.Key.Key_9: "1d",
                Qt.Key.Key_0: "10s"}
+    MAGNET_PX = MAGNET_PX_DEFAULT
+
+    MAGNET_KEY = Qt.Key.Key_N
+
     TOOL_KEYS = {Qt.Key.Key_T: "Trend", Qt.Key.Key_F: "Fib",
                  Qt.Key.Key_P: "Pen", Qt.Key.Key_M: "Measure",
                  Qt.Key.Key_L: "Long", Qt.Key.Key_S: "Short",
@@ -1541,6 +1558,11 @@ class OmnitrixWindow(QMainWindow):
                 return
 
         # ---- drawing tools, on Alt so bare letters stay the ticker search --
+        if alt and key == self.MAGNET_KEY:
+            self.chk_magnet.setChecked(not self.chk_magnet.isChecked())
+            ev.accept()
+            return
+
         if alt and key in self.TOOL_KEYS:
             t = self.TOOL_KEYS[key]
             if t in self._tool_buttons:
@@ -1992,7 +2014,7 @@ class OmnitrixWindow(QMainWindow):
             self._pen_finish()
             return
 
-        mp = self.price_plot.vb.mapSceneToView(pos)
+        mp = self._magnet(self.price_plot.vb.mapSceneToView(pos))
         # A level needs one click, not two - waiting for a second would leave a
         # rubber band on screen with nothing to rubber-band.
         if self.active_drawing_tool == "HLine":
@@ -2088,6 +2110,51 @@ class OmnitrixWindow(QMainWindow):
         self._drawing_start_point = None
         self._pen_points = None
         self._preview.setVisible(False)
+
+    def _on_magnet_toggled(self, on: bool) -> None:
+        self.magnet_on = bool(on)
+
+    def _magnet(self, mp):
+        """Snap a drawing point to the nearest bar extreme, if magnet is on.
+
+        TradingView's single most-used drawing behaviour, and the reason a
+        trend line drawn by hand never quite touches the high it was drawn to
+        touch. A line anchored a few cents off the wick is not the level the
+        trader meant; it is the level their mouse managed.
+
+        Snaps to the OHLC of the bar under the cursor - never to an arbitrary
+        price - and only when the cursor is ALREADY within MAGNET_PX of one.
+        Outside that radius the raw point is returned unchanged, so the magnet
+        assists a near-miss and never fights a deliberate placement. That
+        threshold is the whole difference between a magnet and a straitjacket.
+        """
+        if not self.magnet_on:
+            return mp
+        s = self.series.get(self.active_symbol) if self.active_symbol else None
+        if s is None:
+            return mp
+        bars = s.view(self.tf_s)
+        if not bars:
+            return mp
+        i = int(round(mp.x()))
+        if not (0 <= i < len(bars)):
+            return mp
+        bar = bars[i]
+        try:
+            _px_w, px_h = self.price_plot.vb.viewPixelSize()
+        except Exception:
+            return mp
+        if not px_h:
+            return mp
+        y = mp.y()
+        # Bar index is the x axis, so snapping x to the bar centre is exact and
+        # costs nothing - a drawing that lands between two bars is ambiguous
+        # about which one it refers to.
+        best = min((bar.open, bar.high, bar.low, bar.close),
+                   key=lambda v: abs(v - y))
+        if abs(best - y) / px_h > self.MAGNET_PX:
+            return mp
+        return QPointF(float(i), float(best))
 
     def _update_preview(self, mp) -> None:
         """Rubber band from the first click to the cursor.
