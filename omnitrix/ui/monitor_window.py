@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 
-from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
+from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget, watch
 from ..engine import metrics
 
 COLS = ["Symbol", "Last", "Chg", "Chg %", "Volume", "Delta", "CVD",
@@ -85,17 +85,18 @@ class MarketMonitorWindow(QMainWindow):
         # are minimised behind the fourth. Measured: paint is 95% of the cost
         # (98.5 ms of 104 ms at four windows), so skipping an unseen one is the
         # cheapest frame in the app.
-        if not self.isVisible() or self.isMinimized():
-            GOVERNOR.set_alive(id(self), False)
-            return
-        GOVERNOR.set_alive(id(self), True)
-        app = self.app
-        for sym in sorted(app.series):
-            if sym not in self._rows:
-                r = self.table.rowCount()
-                self.table.insertRow(r)
-                self._rows[sym] = r
-            self._update_row(sym, self._rows[sym])
+        with watch("monitor"):
+            if not self.isVisible() or self.isMinimized():
+                GOVERNOR.set_alive(id(self), False)
+                return
+            GOVERNOR.set_alive(id(self), True)
+            app = self.app
+            for sym in sorted(app.series):
+                if sym not in self._rows:
+                    r = self.table.rowCount()
+                    self.table.insertRow(r)
+                    self._rows[sym] = r
+                self._update_row(sym, self._rows[sym])
 
     def _update_row(self, sym: str, r: int) -> None:
         app = self.app

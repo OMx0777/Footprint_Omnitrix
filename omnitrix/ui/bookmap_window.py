@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
 )
 
-from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
+from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget, watch
 from ..engine import BookmapBuffer, SRTracker
 from .bookmap_pane import BookmapPane
 from ..render import (
@@ -1031,12 +1031,13 @@ class BookmapWindow(QMainWindow):
         # the app - and returning early is not enough, because the governor
         # would go on counting this window's cost against the shared budget
         # and throttling the window you ARE looking at.
-        if not self.isVisible() or self.isMinimized():
-            GOVERNOR.set_alive(id(self), False)
-            return
-        GOVERNOR.set_alive(id(self), True)
-        for pane in self._visible_panes():
-            self._refresh_pane(pane, initial)
+        with watch("bookmap"):
+            if not self.isVisible() or self.isMinimized():
+                GOVERNOR.set_alive(id(self), False)
+                return
+            GOVERNOR.set_alive(id(self), True)
+            for pane in self._visible_panes():
+                self._refresh_pane(pane, initial)
 
     def _refresh_pane(self, pane, initial: bool = False) -> None:
         # Before anything reads row_ticks: a zoom changes the right grid, and

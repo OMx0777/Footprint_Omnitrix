@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 
 from ..render import TPOItem, VolumeProfileItem
 from ..render.crosshair import Crosshair
-from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
+from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget, watch
 
 BG = "#05070C"
 
@@ -127,28 +127,29 @@ class ProfileWindow(QMainWindow):
         # are minimised behind the fourth. Measured: paint is 95% of the cost
         # (98.5 ms of 104 ms at four windows), so skipping an unseen one is the
         # cheapest frame in the app.
-        if not self.isVisible() or self.isMinimized():
-            GOVERNOR.set_alive(id(self), False)
-            return
-        GOVERNOR.set_alive(id(self), True)
-        prof = self.profile
-        a = prof.analytics(self.va_pct)
-        rows = prof.tpo_rows()
-        br = prof.bracket_range()
-        if not rows or br is None:
-            return
-        self.tpo_item.set_data(rows, br[0], a["poc"], a["vah"], a["val"])
-        self.vp_item.set_data(prof.buy, prof.sell, a["poc"], a["vah"],
-                              a["val"], a["hvn"])
-        if a["poc"] is not None:
-            self.poc_line.setPos(a["poc"] * self.tick)
-            self.vah_line.setPos(a["vah"] * self.tick)
-            self.val_line.setPos(a["val"] * self.tick)
-            self.lbl.setText(
-                f"   POC {a['poc'] * self.tick:.2f}   "
-                f"VAH {a['vah'] * self.tick:.2f}   "
-                f"VAL {a['val'] * self.tick:.2f}   "
-                f"Total {prof.total:,}")
+        with watch("profile"):
+            if not self.isVisible() or self.isMinimized():
+                GOVERNOR.set_alive(id(self), False)
+                return
+            GOVERNOR.set_alive(id(self), True)
+            prof = self.profile
+            a = prof.analytics(self.va_pct)
+            rows = prof.tpo_rows()
+            br = prof.bracket_range()
+            if not rows or br is None:
+                return
+            self.tpo_item.set_data(rows, br[0], a["poc"], a["vah"], a["val"])
+            self.vp_item.set_data(prof.buy, prof.sell, a["poc"], a["vah"],
+                                  a["val"], a["hvn"])
+            if a["poc"] is not None:
+                self.poc_line.setPos(a["poc"] * self.tick)
+                self.vah_line.setPos(a["vah"] * self.tick)
+                self.val_line.setPos(a["val"] * self.tick)
+                self.lbl.setText(
+                    f"   POC {a['poc'] * self.tick:.2f}   "
+                    f"VAH {a['vah'] * self.tick:.2f}   "
+                    f"VAL {a['val'] * self.tick:.2f}   "
+                    f"Total {prof.total:,}")
 
     def _fit(self) -> None:
         a = self.profile.analytics(self.va_pct)

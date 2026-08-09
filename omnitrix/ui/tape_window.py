@@ -30,7 +30,7 @@ from ..engine.model import split_size
 from ..engine.bookmap import _AG_FROM
 from ..render.tape import TapePrintsItem, TapeSpeedItem, TapeCvdItem, TAPE_BG
 from ..render.crosshair import Crosshair, clock_label
-from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
+from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget, watch
 
 # label -> seconds held in view
 SPANS = {"15s": 15, "30s": 30, "1m": 60, "2m": 120, "5m": 300, "10m": 600}
@@ -230,30 +230,31 @@ class TapeWindow(QMainWindow):
         # are minimised behind the fourth. Measured: paint is 95% of the cost
         # (98.5 ms of 104 ms at four windows), so skipping an unseen one is the
         # cheapest frame in the app.
-        if not self.isVisible() or self.isMinimized():
-            GOVERNOR.set_alive(id(self), False)
-            return
-        GOVERNOR.set_alive(id(self), True)
-        vis, lo, hi, (n, vol, delta) = self._window()
-        if not vis:
-            return
-        self.prints_item.set_prints(vis, lo, hi)
-        if self.speed.isVisible():
-            self.speed_item.set_prints(vis, lo, hi)
-        if self.cvd.isVisible():
-            self.cvd_item.set_prints(vis, lo, hi)
+        with watch("tape_window"):
+            if not self.isVisible() or self.isMinimized():
+                GOVERNOR.set_alive(id(self), False)
+                return
+            GOVERNOR.set_alive(id(self), True)
+            vis, lo, hi, (n, vol, delta) = self._window()
+            if not vis:
+                return
+            self.prints_item.set_prints(vis, lo, hi)
+            if self.speed.isVisible():
+                self.speed_item.set_prints(vis, lo, hi)
+            if self.cvd.isVisible():
+                self.cvd_item.set_prints(vis, lo, hi)
 
-        rate = n / self.span if self.span else 0.0
-        self.lbl_stats.setText(
-            f"   {n:,} prints   {rate:,.1f}/s   vol {vol:,}   Δ {delta:+,}   ")
+            rate = n / self.span if self.span else 0.0
+            self.lbl_stats.setText(
+                f"   {n:,} prints   {rate:,.1f}/s   vol {vol:,}   Δ {delta:+,}   ")
 
-        self.last_line.setPos(vis[-1][1])
-        if self._follow:
-            self.main.setXRange(lo, hi, padding=0)
-            y0 = min(q[1] for q in vis)
-            y1 = max(q[1] for q in vis)
-            pad = max((y1 - y0) * 0.12, self.tick * 4)
-            self.main.setYRange(y0 - pad, y1 + pad, padding=0)
+            self.last_line.setPos(vis[-1][1])
+            if self._follow:
+                self.main.setXRange(lo, hi, padding=0)
+                y0 = min(q[1] for q in vis)
+                y1 = max(q[1] for q in vis)
+                pad = max((y1 - y0) * 0.12, self.tick * 4)
+                self.main.setYRange(y0 - pad, y1 + pad, padding=0)
 
     # ---- handlers --------------------------------------------------------
     def _on_manual(self):

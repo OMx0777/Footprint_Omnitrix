@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import QMainWindow, QToolBar, QLabel, QComboBox
 
 import time
 
-from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget
+from .framegov import GOVERNOR, GovernedTimer, GovernedPlotWidget, watch
 from ..engine import metrics
 from ..render.crosshair import Crosshair, clock_label
 from .bookmap_window import TF
@@ -146,38 +146,39 @@ class AnalyticsWindow(QMainWindow):
         # are minimised behind the fourth. Measured: paint is 95% of the cost
         # (98.5 ms of 104 ms at four windows), so skipping an unseen one is the
         # cheapest frame in the app.
-        if not self.isVisible() or self.isMinimized():
-            GOVERNOR.set_alive(id(self), False)
-            return
-        GOVERNOR.set_alive(id(self), True)
-        cols = self.buffer.view(self.agg)
-        if not cols:
-            return
-        cols = cols[-400:]                       # keep the panes responsive
+        with watch("analytics"):
+            if not self.isVisible() or self.isMinimized():
+                GOVERNOR.set_alive(id(self), False)
+                return
+            GOVERNOR.set_alive(id(self), True)
+            cols = self.buffer.view(self.agg)
+            if not cols:
+                return
+            cols = cols[-400:]                       # keep the panes responsive
 
-        # One split serves both panes; computing it twice was half this
-        # window's cost.
-        xs2, bids, asks = metrics.depth_sides(cols)
-        xs, ys = metrics.imbalance_from(xs2, bids, asks)
-        self.imb_curve.setData(xs, ys)
-        self.bid_curve.setData(xs2, bids)
-        self.ask_curve.setData(xs2, asks)
+            # One split serves both panes; computing it twice was half this
+            # window's cost.
+            xs2, bids, asks = metrics.depth_sides(cols)
+            xs, ys = metrics.imbalance_from(xs2, bids, asks)
+            self.imb_curve.setData(xs, ys)
+            self.bid_curve.setData(xs2, bids)
+            self.ask_curve.setData(xs2, asks)
 
-        xs3, sp = metrics.spread_ticks(cols)
-        self.spread_curve.setData(xs3, sp)
-        if sp:
-            self.plots[2].setYRange(0, max(sp) + 1, padding=0)
+            xs3, sp = metrics.spread_ticks(cols)
+            self.spread_curve.setData(xs3, sp)
+            if sp:
+                self.plots[2].setYRange(0, max(sp) + 1, padding=0)
 
-        xs4, vol = metrics.intensity(cols)
-        self.speed_curve.setData(xs4, vol)
-        xs5, cvd = metrics.cvd_series(cols)
-        self.cvd_curve.setData(xs5, cvd)
-        self._sync_cvd()
+            xs4, vol = metrics.intensity(cols)
+            self.speed_curve.setData(xs4, vol)
+            xs5, cvd = metrics.cvd_series(cols)
+            self.cvd_curve.setData(xs5, cvd)
+            self._sync_cvd()
 
-        if ys:
-            imb = ys[-1]
-            bias = "BID" if imb > 0.05 else ("ASK" if imb < -0.05 else "FLAT")
-            self.lbl.setText(
-                f"   Imbalance {imb:+.2f} ({bias})   "
-                f"Spread {sp[-1] if sp else 0}t   "
-                f"CVD {cvd[-1] if cvd else 0:+,}")
+            if ys:
+                imb = ys[-1]
+                bias = "BID" if imb > 0.05 else ("ASK" if imb < -0.05 else "FLAT")
+                self.lbl.setText(
+                    f"   Imbalance {imb:+.2f} ({bias})   "
+                    f"Spread {sp[-1] if sp else 0}t   "
+                    f"CVD {cvd[-1] if cvd else 0:+,}")
