@@ -95,7 +95,16 @@ class BookmapPane:
         vb.setMouseEnabled(x=True, y=True)
 
         self.dom = self.glw.addPlot(row=0, col=1)
-        self.dom.hideAxis("left"); self.dom.showAxis("right")
+        # NO SECOND PRICE AXIS. The DOM is y-linked to the heat pane, so its
+        # own right axis printed the identical price scale a second time, one
+        # narrow column further out - two ladders of the same numbers flanking
+        # the sizes, which is most of why this window read as cluttered.
+        #
+        # The main pane's right axis already sits BETWEEN the heat and the DOM,
+        # so what is left is heat | prices | sizes: the prices are adjacent to
+        # both the field they index and the ladder they label, which is the
+        # arrangement a DOM wants anyway.
+        self.dom.hideAxis("left"); self.dom.hideAxis("right")
         self.dom.hideAxis("bottom")
         self.dom.setYLink(self.main)
         self.dom.setMouseEnabled(x=False, y=False)
@@ -111,7 +120,8 @@ class BookmapPane:
         self.glw.ci.layout.setColumnStretchFactor(0, 14)
         self.glw.ci.layout.setColumnStretchFactor(1, 1)
 
-        for plot in (self.main, self.dom, self.vol):
+        # dom has no axes of its own now - see above.
+        for plot in (self.main, self.vol):
             for ax in ("right", "bottom"):
                 a = plot.getAxis(ax)
                 a.setPen(pg.mkPen("#243040")); a.setTextPen(pg.mkPen("#8A93A6"))
