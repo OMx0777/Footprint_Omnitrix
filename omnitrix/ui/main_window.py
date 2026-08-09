@@ -506,8 +506,14 @@ class OmnitrixWindow(QMainWindow):
         self.chk_cvd = _act(self.menu_overlays, "CVD pane", False,
                             self._on_cvd_pane,
                             "Show the cumulative-delta sub-chart on this chart")
-        self.chk_vwap = _act(self.menu_overlays, "VWAP", True,
-                             self._on_vwap_toggled)
+        # OFF by default, for the same reason as the CVD pane. A 2x2 grid put
+        # a VWAP on all four charts before anyone asked for one, so three
+        # quarters of the lines on screen were unrequested - and an overlay
+        # nobody turned on is chart-junk competing with the flow for
+        # attention. Turning it on for the chart being traded is one click.
+        self.chk_vwap = _act(self.menu_overlays, "VWAP", False,
+                             self._on_vwap_toggled,
+                             "Volume-weighted average price for this chart")
         self.chk_cpr = _act(self.menu_overlays, "CPR", False,
                             self._on_cpr_toggled)
         self.chk_ema = _act(self.menu_overlays, "EMAs", False,
@@ -1828,6 +1834,7 @@ class OmnitrixWindow(QMainWindow):
             stacked_min=v["stacked_min"],
             va_pct=v["va_pct"],
             show_candles=v["show_candles"],
+            cell_style=v["cell_style"],
         )
         self.heatmap.alpha = v["hm_alpha"]
         self.heatmap.gamma = v["hm_gamma"]

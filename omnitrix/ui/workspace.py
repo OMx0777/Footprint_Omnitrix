@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+from ..render.footprint import CELL_STYLES
 
 PATH = os.path.join(os.path.expanduser("~"), ".omnitrix_workspace.json")
 
@@ -40,6 +41,7 @@ def save(win, path: str = PATH) -> bool:
             "value_area": win.chk_va.isChecked(),
             "vwap": win.chk_vwap.isChecked(),
             "show_candles": fp.show_candles,
+            "cell_style": getattr(fp, "cell_style", "histogram"),
             # Alerts are levels somebody chose to watch. Losing them on a
             # restart is losing work, and the app restarts more than it should.
             "alerts": win.alerts.to_list() if hasattr(win, "alerts") else [],
@@ -93,6 +95,12 @@ def restore(win, path: str = PATH) -> bool:
             stacked_min=int(d.get("stacked_min", win.fp.stacked_min)),
             va_pct=float(d.get("va_pct", win.fp.va_pct)),
             show_candles=bool(d.get("show_candles", win.fp.show_candles)),
+            # Validated against the known styles rather than trusted: a
+            # hand-edited or older workspace must not put the renderer into a
+            # branch that does not exist.
+            cell_style=(d.get("cell_style")
+                        if d.get("cell_style") in CELL_STYLES
+                        else win.fp.cell_style),
         )
         win._pending_symbol = d.get("symbol") or ""
         return True

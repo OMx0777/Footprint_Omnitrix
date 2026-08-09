@@ -24,6 +24,15 @@ from ..paintguard import safe_paint
 # One step of the app's 4 px spacing rhythm - see omnitrix/ui/design.py.
 LABEL_PAD_PX = 4
 
+# Footprint cell layouts. The histogram is the default because it carries the
+# shape of the auction without anyone reading a digit; the classic blocks are
+# kept because they are denser and because a reader who already knows them
+# reads them faster than a better layout they have to learn.
+CELL_HISTOGRAM = "histogram"
+CELL_BLOCKS = "blocks"
+CELL_STYLES = (CELL_HISTOGRAM, CELL_BLOCKS)
+CELL_STYLE_LABELS = {CELL_HISTOGRAM: "Histogram (split)", CELL_BLOCKS: "Classic blocks"}
+
 
 class FootprintItem(pg.GraphicsObject):
     BOX_W = 0.66                      # column block width in x-units
@@ -55,6 +64,7 @@ class FootprintItem(pg.GraphicsObject):
         self.tick = tick
         self.theme = theme
         self.mode = "Footprint"       # Footprint | Cluster | Profile | Delta
+        self.cell_style = CELL_HISTOGRAM   # see CELL_STYLES
         self.show_imbalance = True
         self.show_va = True
         self.show_candles = True
@@ -311,7 +321,7 @@ class FootprintItem(pg.GraphicsObject):
                 continue
             is_poc = ti == poc
 
-            if mode == "Footprint":
+            if mode == "Footprint" and self.cell_style == CELL_HISTOGRAM:
                 # A HISTOGRAM EITHER SIDE OF THE CANDLE, not two filled boxes.
                 #
                 # Full-width boxes made every row the same size, so the shape
@@ -336,6 +346,32 @@ class FootprintItem(pg.GraphicsObject):
                     self._cell_two(p, tr, x, y, row_h, half, sell_v, buy_v,
                                    t.poc_text if is_poc else t.cell_text,
                                    ws, wb, hw)
+
+            elif mode == "Footprint":
+                # THE CLASSIC LAYOUT, kept as a choice rather than replaced.
+                #
+                # Two equal-width fields, sell left and buy right, coloured by
+                # aggressor with the imbalances lit. It carries less shape than
+                # the histogram - every row is the same width, so size has to be
+                # read rather than seen - but it is quieter and denser, and a
+                # reader who has spent years on this layout reads it faster than
+                # a better one they have to learn. The default is the histogram;
+                # this is one setting away.
+                c_sell = pal["poc_bg"] if is_poc else pal["bid_bg"]
+                c_buy = pal["poc_bg"] if is_poc else pal["ask_bg"]
+                if ti in sell_imb:
+                    c_sell = t.sell_imb
+                if ti in buy_imb:
+                    c_buy = t.buy_imb
+                p.fillRect(QRectF(x - half, y, half, row_h), c_sell)
+                p.fillRect(QRectF(x, y, half, row_h), c_buy)
+                if show_text:
+                    # Full half-column each side, but still clear of the candle:
+                    # the body is drawn after the cells whichever layout is in
+                    # use, so a label under it disappears either way.
+                    self._cell_two(p, tr, x, y, row_h, half, sell_v, buy_v,
+                                   t.poc_text if is_poc else t.cell_text,
+                                   half, half, hw)
 
             elif mode == "Cluster":
                 bg = pal["poc_bg"] if is_poc else (

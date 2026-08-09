@@ -8,6 +8,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QColor
 
+from ..render.footprint import (CELL_STYLES, CELL_STYLE_LABELS,
+                                CELL_HISTOGRAM)
+
 
 class _ColorButton(QPushButton):
     """A button that opens a colour picker and remembers the chosen QColor."""
@@ -87,6 +90,17 @@ class SettingsDialog(QDialog):
         self.chk_candles = QCheckBox(); self.chk_candles.setChecked(fp.show_candles)
         form.addRow("Show candles", self.chk_candles)
 
+        # Footprint cell layout. Both are real choices, not a legacy toggle:
+        # the histogram shows the shape of the auction without reading a digit,
+        # the classic blocks are denser and are what a long-time reader's eye
+        # already parses. Histogram is the default.
+        self.cell_style = QComboBox()
+        for key in CELL_STYLES:
+            self.cell_style.addItem(CELL_STYLE_LABELS[key], key)
+        i = self.cell_style.findData(getattr(fp, "cell_style", CELL_HISTOGRAM))
+        self.cell_style.setCurrentIndex(max(0, i))
+        form.addRow("Footprint cells", self.cell_style)
+
         # colour pickers
         self.c_bull = _ColorButton(QColor(t.bull))
         self.c_bear = _ColorButton(QColor(t.bear))
@@ -112,6 +126,7 @@ class SettingsDialog(QDialog):
             "hm_alpha": self.hm_alpha.value(),
             "hm_gamma": self.hm_gamma.value(),
             "show_candles": self.chk_candles.isChecked(),
+            "cell_style": self.cell_style.currentData(),
             "bull": self.c_bull.color().name(),
             "bear": self.c_bear.color().name(),
             "buy_imb": self.c_buy.color(),
