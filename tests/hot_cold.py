@@ -315,6 +315,31 @@ check("a stripped bar still answers its cached analytics",
 check("aggregation still works after a demotion", len(bs.view(60)) > 0,
       f"{len(bs.view(60))} bars at 1m")
 
+# ---- 2b-ii. THE BUDGET CONTRACT, on the series side -----------------------
+# _sync_hot rations demotions by counting what set_hot says it released, and
+# the bookmap half of that contract is checked in section 4. The series half
+# was not, and it was broken: the expensive path stripped up to BOOK_BARS bars
+# and then fell off the end of the function, returning None. None is falsy, so
+# the single most expensive thing a demotion does scored as free work and a
+# pass could strip an unbounded number of symbols inside one frame - the exact
+# shape of every freeze this codebase has had.
+#
+# It is invisible from the outside: retention was correct, memory was released,
+# nothing raised. Only the FRAME BUDGET was wrong. Hence a check on the return
+# value itself and not merely on the effect.
+budget, _ = build_bars(200, 1_700_000_900_000)
+check("demoting a series that really strips bars REPORTS the work",
+      budget.set_hot(False) is True,
+      "returned falsy -> _sync_hot would treat a BOOK_BARS strip as free")
+check("...and demoting it again reports nothing, so no slot is wasted",
+      bool(budget.set_hot(False)) is False)
+check("...and promotion reports nothing either - it strips nothing",
+      bool(budget.set_hot(True)) is False)
+short, _ = build_bars(max(1, BAR_COLD - 5), 1_700_001_100_000)
+check("...and a series with nothing behind the cold window is free",
+      bool(short.set_hot(False)) is False,
+      f"{len(short.bars)} bars, COLD_BARS={BAR_COLD}")
+
 # the book window applies even while HOT - the heatmap only draws what is visible
 hot_bs, _ = build_bars(60, 1_700_000_500_000)
 check("a hot series keeps its recent books",

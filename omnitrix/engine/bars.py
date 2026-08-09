@@ -673,6 +673,14 @@ class BarSeries:
         self._agg_cache.clear()
         self._tf_dirty.clear()
         self._version += 1
+        # MUST report the work. This loop is the single most expensive thing
+        # demotion does - up to BOOK_BARS bars stripped in one call - and
+        # _sync_hot budgets MAX_DEMOTIONS_PER_SYNC per frame by counting what
+        # set_hot says it released. Falling off the end returned None, so the
+        # expensive path scored as free and a pass could strip an unbounded
+        # number of symbols in one frame. That is the exact shape of every
+        # freeze in this app: unbounded work on the frame thread.
+        return True
 
     def add_book(self, bk) -> None:
         """Attach an L2 resting-liquidity snapshot to the bar whose time window
