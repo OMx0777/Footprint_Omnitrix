@@ -1,25 +1,39 @@
-"""A paint fault must not kill the terminal.
+"""Contain a failing paint locally instead of re-reporting it every frame.
 
-MEASURED, NOT ASSUMED. Under PyQt6 an unhandled Python exception inside a
-virtual override - QWidget.paintEvent, QGraphicsItem.paint - does not
-propagate. Qt calls qFatal() and the process dies: exit 127, no traceback, no
-line in the log, nothing in the faulthandler file. That is the shape of "it
-just disappeared".
+WHAT THIS IS NOT. It is not what stops a paint fault killing the process -
+app._install_excepthook already does that, and does it for every Qt callback
+rather than only for paint. Under PyQt6 an unhandled Python exception in code
+Qt calls from C++ (a slot, an event handler, QGraphicsItem.paint) reaches
+qFatal() and aborts the process, but ONLY while sys.excepthook is the default
+one. Measured both ways: default hook, exit 0xC0000409 with no traceback
+anywhere; app.py's hook installed, 30 consecutive failing paints and the
+process still running.
 
-It really happened here. The signals dock used clock_label without importing
-it, so the first time a block print was detected the next paint raised
-NameError and took the whole application down with it. One missing import, in
-one side panel, in code that was never painted with rows in it.
+An earlier commit message here claimed a missing import had been terminating
+the app. That was wrong - the excepthook was already catching it - and this
+docstring is the correction.
 
-The lesson is not "audit the imports" - that was done and it found a second
-one. It is that the app must survive a bad paint. A trading terminal that
-vanishes because one panel could not draw a row is worse in every way than one
-that draws that panel blank for a frame.
+WHAT IT ACTUALLY BUYS. The excepthook survives the fault but reports it in
+full, every time. A paint that fails once fails on every frame, so the
+backstop turns one bug into a permanent stream of tracebacks formatted and
+written synchronously on the GUI thread. Measured over 300 failing frames at
+400x300:
+
+    hook only   0.27 ms per frame, 114 kB of log   (~11 kB/s at 30 fps)
+    guarded     0.02 ms per frame, 0.6 kB of log
+
+13x cheaper per frame and 179x less log, because the guard reports a given
+site once per QUIET_S and thereafter just leaves the widget blank. That is the
+right shape for a fault that repeats: loud once, quiet after.
+
+It really happened: the signals dock used clock_label without importing it, so
+from the first detected block print onward that panel painted nothing and the
+log took the same traceback at frame rate.
 
 THE COUNTER IS THE OTHER HALF OF THIS. Swallowing exceptions is how bugs go
 quiet, so every fault is counted per site and the test suite asserts the count
 is zero. The failure stays loud where loud is useful - in the tests - and stops
-being fatal where the user is trying to trade.
+being repetitive where the user is trying to trade.
 
 This module deliberately imports nothing from omnitrix. Every render and ui
 module pulls it in, so anything it touched would become a cycle: render ->

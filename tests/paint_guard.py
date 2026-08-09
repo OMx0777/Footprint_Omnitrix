@@ -1,25 +1,23 @@
-"""A bad paint must not kill the terminal.
+"""Two independent defences against a bad paint, each checked for what it does.
 
-THE MEASUREMENT THAT MOTIVATES THIS. Under PyQt6 an unhandled Python exception
-inside a virtual override does not propagate - Qt calls qFatal() and the
-process dies. Measured on this machine: exit code 127, no traceback on stderr,
-nothing in the log, nothing in the faulthandler file. The window is simply
-gone.
+Under PyQt6 an unhandled Python exception in code Qt calls from C++ reaches
+qFatal() and aborts the process - exit 0xC0000409, no traceback anywhere - but
+ONLY while sys.excepthook is the default one. So:
 
-That is not hypothetical. The signals dock used clock_label without importing
-it, so the first time a block print was detected the next paint raised
-NameError and took the whole application down - which is what "it crashed in
-ten minutes" looks like from the inside.
+  * app._install_excepthook is what keeps the process ALIVE, and it covers
+    every Qt callback, not just paint. That is the load-bearing defence and
+    the first checks below are that it is installed and that it works;
 
-So this checks three separate things:
+  * @safe_paint is what keeps a repeating fault CONTAINED. The excepthook
+    survives the fault but formats and writes the whole traceback every frame,
+    on the GUI thread, forever - so one bug becomes a permanent log stream.
+    The guard reports a site once per QUIET_S and blanks the widget after.
 
-  1. the fatality is REAL, by running an undecorated paint in a subprocess and
-     confirming the process dies. Without this the other two prove nothing -
-     a guard against a danger that does not exist is just noise;
-  2. the SAME paint, decorated, leaves the process alive;
-  3. nothing in the shipped app is quietly relying on the guard. The counter
-     must be zero after exercising every widget, or a real bug is being
-     swallowed - which is the failure mode a broad try/except invites.
+An earlier version of this file asserted the guard was what stopped the app
+dying, which was wrong: the subprocess it tested had no excepthook installed,
+so it measured raw PyQt6 rather than this application. The check below now
+runs BOTH configurations so the difference is explicit and cannot be misread
+again.
 """
 
 import os
@@ -40,10 +38,12 @@ def check(n, ok, d=""):
         FAILS.append(n)
 
 
-# ---- 1 & 2. the fatality, and the guard, in real subprocesses --------------
+# ---- 1. what actually keeps the process alive ------------------------------
 SRC = textwrap.dedent("""
-    import sys
+    import sys, logging
     sys.path.insert(0, {root!r})
+    logging.basicConfig(level=logging.CRITICAL)
+    {hook}
     from PyQt6.QtWidgets import QApplication, QWidget
     from PyQt6.QtGui import QImage
     {imp}
@@ -55,32 +55,56 @@ SRC = textwrap.dedent("""
             raise NameError("name 'clock_label' is not defined")
 
     w = W(); w.resize(60, 40)
-    w.render(QImage(w.size(), QImage.Format.Format_ARGB32))
+    img = QImage(w.size(), QImage.Format.Format_ARGB32)
+    for _ in range(5):
+        w.render(img)
     print("ALIVE")
 """)
 
+HOOK = ("from omnitrix.app import _install_excepthook\n"
+        "_install_excepthook()")
 
-def run(dec: bool):
+
+def run(hook: bool, dec: bool):
     src = SRC.format(
         root=ROOT,
+        hook=HOOK if hook else "",
         imp="from omnitrix.paintguard import safe_paint" if dec else "",
         dec="@safe_paint" if dec else "")
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
     p = subprocess.run([sys.executable, "-c", src], capture_output=True,
-                       text=True, env=env, timeout=120)
+                       text=True, env=env, timeout=180)
     return p.returncode, (p.stdout or "")
 
 
-rc_raw, out_raw = run(dec=False)
-check("an UNGUARDED paint exception really does kill the process - this is "
-      "the danger the guard exists for, not a hypothetical",
-      rc_raw != 0 and "ALIVE" not in out_raw,
-      f"exit {rc_raw}, stdout {out_raw.strip()!r}")
+rc, out = run(hook=False, dec=False)
+check("with the DEFAULT excepthook a paint exception aborts the process - "
+      "this is the raw PyQt6 behaviour the app has to defend against",
+      rc != 0 and "ALIVE" not in out, f"exit {rc}, stdout {out.strip()!r}")
 
-rc_ok, out_ok = run(dec=True)
-check("the SAME exception under @safe_paint leaves the process alive",
-      rc_ok == 0 and "ALIVE" in out_ok,
-      f"exit {rc_ok}, stdout {out_ok.strip()!r}")
+rc, out = run(hook=True, dec=False)
+check("app._install_excepthook alone is what keeps it alive - the guard is "
+      "NOT load-bearing for survival, and saying so was the earlier mistake",
+      rc == 0 and "ALIVE" in out, f"exit {rc}, stdout {out.strip()!r}")
+
+rc, out = run(hook=False, dec=True)
+check("@safe_paint alone also survives, since the exception never reaches Qt",
+      rc == 0 and "ALIVE" in out, f"exit {rc}, stdout {out.strip()!r}")
+
+rc, out = run(hook=True, dec=True)
+check("...and the shipped combination of both survives",
+      rc == 0 and "ALIVE" in out, f"exit {rc}, stdout {out.strip()!r}")
+
+# the app must really install it - this is the defence for every OTHER Qt
+# callback (slots, resize, mouse), which no decorator covers
+import inspect
+from omnitrix import app as omni_app
+src_main = inspect.getsource(omni_app.main)
+check("main() installs the excepthook BEFORE QApplication is constructed",
+      "_install_excepthook()" in src_main
+      and src_main.index("_install_excepthook()")
+      < src_main.index("QApplication("),
+      "order matters: a slot can fire during construction")
 
 # ---- the fault is counted, not silently discarded --------------------------
 from PyQt6.QtGui import QImage
@@ -104,6 +128,40 @@ for _ in range(3):
     b.render(QImage(b.size(), QImage.Format.Format_ARGB32))
 check("a swallowed fault is COUNTED, so it cannot hide from the tests",
       paint_fault_count() == 3, f"{paint_fault_count()} faults {dict(PAINT_FAULTS)}")
+reset_paint_faults()
+
+# ---- 2. WHAT THE GUARD IS FOR: a repeating fault stays quiet ---------------
+# The excepthook survives, but it formats and writes the whole traceback every
+# frame, on the GUI thread. A paint that fails once fails forever, so that is a
+# permanent log stream, not a one-off. This is the property worth having.
+import logging
+
+
+class Count(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.n = 0
+
+    def emit(self, rec):
+        self.n += 1
+
+
+cap = Count()
+pg_log = logging.getLogger("omnitrix.paintguard")
+pg_log.addHandler(cap)
+pg_log.setLevel(logging.ERROR)
+reset_paint_faults()
+b2 = Bad()
+b2.resize(200, 150)
+img2 = QImage(b2.size(), QImage.Format.Format_ARGB32)
+for _ in range(200):
+    b2.render(img2)
+check("200 consecutive failing paints produce ONE log line, not 200 - a "
+      "backstop that re-reports every frame turns one bug into a log flood",
+      cap.n == 1, f"{cap.n} log lines for {paint_fault_count()} faults")
+check("...and every one of them is still counted",
+      paint_fault_count() == 200, f"{paint_fault_count()}")
+pg_log.removeHandler(cap)
 reset_paint_faults()
 
 # ---- 3. every paint site in the app is guarded -----------------------------
