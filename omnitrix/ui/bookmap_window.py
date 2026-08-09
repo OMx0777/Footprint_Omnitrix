@@ -773,7 +773,7 @@ class BookmapWindow(QMainWindow):
             self._select_pane(pane)
         vb = pane.main.getViewBox()
         vr = vb.viewRect()
-        cols = pane.buffer.view(pane.agg)
+        cols = pane.buffer.view_extended(pane.agg)
 
         # If they manually panned away from the live edge, stop following.
         # But if they just zoomed while near the live edge, keep following the
@@ -825,7 +825,7 @@ class BookmapWindow(QMainWindow):
         self.xhair.set(x, price)
 
         ti = int(round(price / self.tick))
-        cols = self.buffer.view(self.agg)
+        cols = self.buffer.view_extended(self.agg)
         latest = cols[-1] if cols else None
 
         secs = x * self.buffer.col_dt * self.agg
@@ -1044,7 +1044,7 @@ class BookmapWindow(QMainWindow):
         pane.resolve_auto_step()
         if pane is self._active_pane:
             self.lbl_step.setText(pane.lbl_step.text())
-        cols = pane.buffer.view(pane.agg)
+        cols = pane.buffer.view_extended(pane.agg)
         if not cols:
             return
         pane.heat.set_cols(cols)

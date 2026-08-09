@@ -27,6 +27,7 @@ import numpy as np
 
 from .model import Aggressor, PriceLadder, EMPTY_LADDER, split_size
 from .instruments import Instruments
+from .heatarchive import SessionArchive
 
 
 # Aggressor <-> uint8, because storing the enum boxes a pointer per trade.
@@ -168,6 +169,19 @@ class BookmapBuffer:
         self.cold_cols = min(COLD_COLS, max_cols)
         self.max_cols = max_cols
         self.cols: dict[int, Column] = {}
+        # THE SESSION ARCHIVE. Every column the live ring evicts is folded into
+        # this before it is dropped, so the whole day survives at the coarse
+        # resolution a zoomed-out chart actually draws. It is fed ONLY from the
+        # eviction path, which means it costs nothing while a symbol is inside
+        # its live window and cannot double-count.
+        #
+        # Kept for cold symbols too - deliberately. Demotion releases live
+        # columns precisely so a symbol nobody is watching stops paying for
+        # second-by-second detail, and the archive is what makes that safe:
+        # the detail goes, the day does not.
+        self.archive = SessionArchive(live_dt=col_dt)
+        # (key, columns) for view_extended - see there.
+        self._arch_cache = None
         # Kept sorted by bucket, not insertion order: two feeds (trades on L1,
         # books on L2) interleave, and a late arrival must not make latest()
         # report an older column or leave columns() non-monotonic in x - the
@@ -268,7 +282,9 @@ class BookmapBuffer:
                 c.bid_ti = prev.bid_ti
                 c.ask_ti = prev.ask_ti
             while len(self.order) > self.max_cols:
-                self.cols.pop(self.order.pop(0), None)
+                gone = self.cols.pop(self.order.pop(0), None)
+                if gone is not None:
+                    self.archive.fold(gone)
                 self._evicted += 1
         self._touch(b)
         return c
@@ -434,7 +450,9 @@ class BookmapBuffer:
         self.max_cols = want
         if len(self.order) > want:
             while len(self.order) > want:
-                self.cols.pop(self.order.pop(0), None)
+                gone = self.cols.pop(self.order.pop(0), None)
+                if gone is not None:
+                    self.archive.fold(gone)
                 self._evicted += 1
             # Every cached fold now describes columns that are gone.
             self._all_cache = None
@@ -565,6 +583,32 @@ class BookmapBuffer:
         self._agg_cache[agg] = (self._version, out, self._evicted)
         self._dirty[agg] = None
         return out
+
+    def view_extended(self, agg: int = 1) -> list:
+        """The live view with the archived session in front of it.
+
+        This is what makes a whole trading day visible. The live ring holds
+        about 23 minutes; everything before that has already been folded into
+        the archive, and this stitches the two into one continuous series so
+        the renderer, the axis and the scrollback all just work.
+
+        CACHED, because it is on the refresh path. Rebuilding ladders for
+        hundreds of archive slots every frame would be exactly the kind of
+        per-frame cost that grows with session length that this codebase keeps
+        removing. The cache turns over only when the archive actually gains a
+        slot, which at the default is once every 30 seconds.
+        """
+        live = self.view(agg)
+        arch = self.archive
+        if not arch.slots():
+            return live
+        # as_columns caches incrementally itself, so there is no second cache
+        # here - two caches over the same data is how they get out of step.
+        cut = live[0].bucket if live else None
+        head = arch.as_columns(agg, before_bucket=cut)
+        if not head:
+            return live
+        return head + live
 
     def _fold(self, agg: int, start: int) -> list[Column]:
         groups: dict[int, Column] = {}
