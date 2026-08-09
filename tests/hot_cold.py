@@ -618,6 +618,51 @@ drain_demotions(win)
 check("...and repeated passes clear the expensive ones too",
       all(win.bookmaps[x].max_trades <= TAPE_COLD for x in exp),
       f"{sum(1 for x in exp if win.bookmaps[x].max_trades > TAPE_COLD)} left")
+# ---- 4b. THE BUDGET IS IN COLUMNS, because the work is per column ---------
+# Every evicted column is folded into the session archive at a measured 30 us,
+# so demoting one symbol with a full 1,400-column ring is 38-47 ms - and six of
+# those in a pass is 282 ms. The watchdog caught exactly that at 200 symbols:
+#     SLOW FRAME 239 ms - sync_hot 216ms
+# A budget counting SYMBOLS cannot see work that is per COLUMN, which is the
+# same mistake as a budget counting calls instead of work.
+from omnitrix.ui.main_window import MAX_FOLD_COLS_PER_SYNC
+
+big = [x for x in win.bookmaps if x not in hot2][:8]
+ts_f = 1_700_001_500_000
+for x in big:
+    bb = win.bookmaps[x]
+    bb.set_hot(True)
+    for i in range(600):
+        ts_f += 1000
+        bb.add_trade(Trade(x, 400.0, 10, Aggressor.BUY, ts_f))
+        bb.add_book(BookSnapshot(x, {399.99: 500}, {400.01: 500}, ts_f))
+win._demote_cursor = 0
+over_before = sum(win.bookmaps[x].over_cap() for x in big)
+stale_ = time.monotonic() - DEMOTE_GRACE_S - 1
+for x in big:
+    win._cold_since[x] = stale_
+    win._ever_hot.add(x)
+for x in big:
+    win.bookmaps[x].max_cols = win.bookmaps[x].cold_cols
+after = []
+for _ in range(3):
+    before = sum(b._evicted for b in win.bookmaps.values())
+    win._sync_hot()
+    after.append(sum(b._evicted for b in win.bookmaps.values()) - before)
+check("one pass never releases more columns than the budget allows, however "
+      "many symbols are eligible",
+      all(n <= MAX_FOLD_COLS_PER_SYNC + 2 for n in after),
+      f"columns released per pass: {after}, budget {MAX_FOLD_COLS_PER_SYNC}")
+check("...and it really does release something each pass, rather than "
+      "deadlocking below the budget",
+      any(n > 0 for n in after), f"{after}")
+for _ in range(80):
+    win._sync_hot()
+check("...and the backlog still drains to zero",
+      all(win.bookmaps[x].over_cap() == 0 for x in big),
+      f"{sum(win.bookmaps[x].over_cap() for x in big)} columns left of "
+      f"{over_before}")
+
 drain_demotions(win)
 drained = sum(1 for x, b in win.bookmaps.items()
               if x not in hot2 and b.max_cols == b.cold_cols)

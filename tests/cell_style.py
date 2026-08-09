@@ -160,6 +160,16 @@ check("...and a full-width row still labels both sides in both layouts",
 
 # ---- 4. the setting survives a workspace round-trip ------------------------
 from omnitrix.ui import workspace
+
+# NEUTER THE MODULE FUNCTIONS, then keep the originals to call with an explicit
+# path. `def save(win, path=PATH)` binds the default at import time, so
+# reassigning workspace.PATH does nothing - and a window that closes or a
+# settings apply anywhere in this file would otherwise write the operator's
+# real ~/.omnitrix_workspace.json. tests/clock_guard.py scans for exactly this.
+_real_save, _real_restore = workspace.save, workspace.restore
+workspace.save = lambda *a, **k: None
+workspace.restore = lambda *a, **k: None
+
 from omnitrix.engine import Instruments, SyntheticFeed
 from omnitrix.ui.main_window import OmnitrixWindow
 
@@ -174,14 +184,14 @@ check("VWAP is OFF by default - a 2x2 grid must not draw four of them before "
 tmp = os.path.join(tempfile.mkdtemp(), "ws.json")
 win.fp.cell_style = CELL_BLOCKS
 win.chk_vwap.setChecked(True)
-workspace.save(win, tmp)
+_real_save(win, tmp)
 raw = json.load(open(tmp, encoding="utf-8"))
 check("the layout choice is written to the workspace",
       raw.get("cell_style") == CELL_BLOCKS, f"{raw.get('cell_style')!r}")
 
 win.fp.cell_style = CELL_HISTOGRAM
 win.chk_vwap.setChecked(False)
-workspace.restore(win, tmp)
+_real_restore(win, tmp)
 check("...and comes back on restore", win.fp.cell_style == CELL_BLOCKS,
       f"{win.fp.cell_style!r}")
 check("...and so does an explicitly enabled VWAP - the new default must not "
@@ -192,7 +202,7 @@ check("...and so does an explicitly enabled VWAP - the new default must not "
 raw["cell_style"] = "spiral"
 json.dump(raw, open(tmp, "w", encoding="utf-8"))
 win.fp.cell_style = CELL_HISTOGRAM
-workspace.restore(win, tmp)
+_real_restore(win, tmp)
 check("an unknown style in a hand-edited or older workspace falls back rather "
       "than putting the painter in a branch that does not exist",
       win.fp.cell_style in CELL_STYLES, f"{win.fp.cell_style!r}")

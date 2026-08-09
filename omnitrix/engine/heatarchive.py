@@ -243,8 +243,17 @@ class SessionArchive:
             ti, sz = book.arrays()
             # Floor division, correct for negative tick indices too.
             bins = np.floor_divide(ti.astype(np.int64), step)
-            uniq, inv = np.unique(bins, return_inverse=True)
-            tot = np.bincount(inv, weights=sz.astype(np.float64))
+            # A PriceLadder is ASCENDING by contract, so the bins are too and
+            # the group boundaries are just where the value changes. np.unique
+            # sorts again to find that out, which is the dominant cost of a
+            # fold - and a fold runs once per evicted column, up to 300 a
+            # frame. reduceat uses the order the data already has.
+            cuts = np.flatnonzero(np.diff(bins))
+            starts = np.empty(cuts.size + 1, dtype=np.intp)
+            starts[0] = 0
+            starts[1:] = cuts + 1
+            uniq = bins[starts]
+            tot = np.add.reduceat(sz.astype(np.float64), starts)
             rest = op.rest
             for k, v in zip(uniq.tolist(), tot.tolist()):
                 rest[k] = rest.get(k, 0.0) + v

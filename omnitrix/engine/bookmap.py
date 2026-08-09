@@ -416,7 +416,7 @@ class BookmapBuffer:
             self._version += 1
         return filled
 
-    def set_hot(self, hot: bool) -> bool:
+    def set_hot(self, hot: bool, max_evict: int | None = None) -> bool:
         """How much per-column history this symbol is worth keeping.
 
         Returns whether it actually RELEASED anything. The caller budgets on
@@ -442,26 +442,53 @@ class BookmapBuffer:
         rather than an empty chart that fills in. Promotion is instant;
         demotion evicts on the spot rather than waiting for the next column,
         because the point is to release the memory.
+
+        `max_evict` bounds how many columns one call may release. It defaults
+        to unbounded, which is what every direct caller wants and what this has
+        always done. The FRAME path passes a budget, because every evicted
+        column is now also folded into the session archive at a measured 38 us,
+        so demoting one symbol with a full ring is 47 ms and the six a sync
+        pass allows came to 282 ms - a budget that counts SYMBOLS cannot see
+        work that is per COLUMN. See _sync_hot.
         """
         worked = self._set_tape_cap(self.tape_hot if hot else self.tape_cold)
         want = self.hot_cols if hot else min(self.cold_cols, self.hot_cols)
         if want == self.max_cols:
             return worked
         self.max_cols = want
-        if len(self.order) > want:
-            while len(self.order) > want:
-                gone = self.cols.pop(self.order.pop(0), None)
-                if gone is not None:
-                    self.archive.fold(gone)
-                self._evicted += 1
+        if self.trim_to_cap(max_evict):
+            worked = True
+        return worked
+
+    def trim_to_cap(self, budget: int | None = None) -> int:
+        """Evict columns above `max_cols`, at most `budget` of them.
+
+        Returns how many were released, so a caller on the frame thread can
+        budget on work actually done. Every eviction folds the column into the
+        session archive first - that is what makes the day survive the ring,
+        and it is also why this has to be bounded.
+        """
+        n = 0
+        order = self.order
+        cap = self.max_cols
+        while len(order) > cap and (budget is None or n < budget):
+            gone = self.cols.pop(order.pop(0), None)
+            if gone is not None:
+                self.archive.fold(gone)
+            self._evicted += 1
+            n += 1
+        if n:
             # Every cached fold now describes columns that are gone.
             self._all_cache = None
             self._agg_cache.clear()
             for agg in self._dirty:
                 self._dirty[agg] = None
             self._version += 1
-            worked = True
-        return worked
+        return n
+
+    def over_cap(self) -> int:
+        """How many columns are still waiting to be released."""
+        return max(0, len(self.order) - self.max_cols)
 
     def _touch(self, bucket: int) -> None:
         """Record that `bucket` changed, for every cached aggregation."""

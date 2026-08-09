@@ -87,6 +87,12 @@ DRAIN_BUSY_AT = 2_000            # backlog that switches to the busy budget
 # protect. The queue drains over the following seconds and a symbol waiting its
 # turn is only holding memory it already held.
 MAX_DEMOTIONS_PER_SYNC = 6
+# ...and a second, harder budget in COLUMNS. Demotion evicts columns, and every
+# eviction folds one into the session archive at a measured 38 us, so the real
+# cost of a pass is the number of COLUMNS released and not the number of
+# symbols. 300 columns is about 11 ms of an 80 ms frame; the six-symbol limit
+# above still applies, whichever binds first.
+MAX_FOLD_COLS_PER_SYNC = 300
 
 # Deep scroll-back. A pan emits a range change per mouse move; waiting this
 # long after the last one turns a drag into ONE request instead of forty.
@@ -996,6 +1002,7 @@ class OmnitrixWindow(QMainWindow):
             self._cold_since.pop(sym, None)
             self._ever_hot.add(sym)
         done = 0
+        fold_left = MAX_FOLD_COLS_PER_SYNC
         syms = self._demote_cursor = getattr(self, "_demote_cursor", 0)
         keys = list(self.bookmaps)
         n = len(keys)
@@ -1030,12 +1037,36 @@ class OmnitrixWindow(QMainWindow):
             # backlog draining six a pass while the free ones ahead of it used
             # every slot. Measured at 1,000 symbols: a 760-deep queue that
             # never cleared. set_hot reports whether it released anything.
-            worked = self.bookmaps[sym].set_hot(False)
+            # THE BUDGET IS IN COLUMNS, NOT SYMBOLS.
+            #
+            # Every evicted column is now folded into the session archive, at a
+            # measured 38 us. A symbol with a full 1,400-column ring therefore
+            # costs 47 ms to demote, and six of those in one pass is 282 ms -
+            # caught by the watchdog at 200 symbols as
+            #     SLOW FRAME 239 ms - sync_hot 216ms
+            # A budget that counts symbols cannot see work that is per column,
+            # which is the same mistake as a budget that counts calls.
+            buf = self.bookmaps[sym]
+            # Lower the cap and shrink the tape, but evict NOTHING here - the
+            # eviction is the part that has to be budgeted, and set_hot returns
+            # early once the cap is already down, so a symbol part-way through
+            # demotion would never finish if the trim lived in there.
+            tape_worked = (buf.set_hot(False, max_evict=0)
+                           if buf.max_cols != buf.cold_cols else False)
+            released = buf.trim_to_cap(fold_left)
+            fold_left -= released
+            # Still counting WORK DONE, not calls. A symbol registered a moment
+            # ago has no columns to evict and no ring to shrink, so it consumes
+            # no slot - counting it left a thousand-symbol backlog draining six
+            # a pass while the free ones ahead used every one.
+            worked = tape_worked or released > 0
             ser = self.series.get(sym)
             if ser is not None:
                 worked = ser.set_hot(False) or worked
             if worked:
                 done += 1
+            if fold_left <= 0:
+                break
 
     def _bind_pane(self, pane) -> None:
         """Point the window's chart attributes at `pane`.
