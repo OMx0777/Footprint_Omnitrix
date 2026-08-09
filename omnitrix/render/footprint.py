@@ -20,6 +20,10 @@ from .theme import Theme, DARK
 from .pricegrid import AUTO_STEPS, TARGET_PX_LABELLED, step_ticks
 from ..paintguard import safe_paint
 
+# Horizontal breathing room for a cell label inside its bar, in screen px.
+# One step of the app's 4 px spacing rhythm - see omnitrix/ui/design.py.
+LABEL_PAD_PX = 4
+
 
 class FootprintItem(pg.GraphicsObject):
     BOX_W = 0.66                      # column block width in x-units
@@ -229,7 +233,7 @@ class FootprintItem(pg.GraphicsObject):
         body stays legible over them.
         """
         cx = float(x)
-        hw = self.CANDLE_HW if (self.draw_cells and bar.has_cells())             else self.CANDLE_HW_PLAIN
+        hw = self._candle_hw(bar)
         p.setPen(pen2)
         p.drawLine(QPointF(cx, bar.low), QPointF(cx, bar.high))
         top = max(bar.open, bar.close)
@@ -244,11 +248,23 @@ class FootprintItem(pg.GraphicsObject):
         p.setPen(self._body_pen)
         p.drawRect(QRectF(cx - hw, bot, hw * 2, top - bot))
 
+    def _candle_hw(self, bar) -> float:
+        """Half-width of the candle body, in x units.
+
+        ONE definition, because the cell labels have to know exactly how much
+        room the candle takes so they can stay clear of it. When this was
+        written out at the candle and merely assumed at the cells, the labels
+        were placed straight under the body and the leading digits vanished.
+        """
+        return (self.CANDLE_HW if (self.draw_cells and bar.has_cells())
+                else self.CANDLE_HW_PLAIN)
+
     def _paint_block(self, p, x, bar, half, row_h, show_text, pal,
                      base_y=None) -> None:
         """`bar` is already folded onto the drawn grid; its cell keys are BUCKET
         indices and one row spans `row_h` in price."""
         t = self.theme
+        hw = self._candle_hw(bar)
         # Sealed bars have no dict - see Bar.arrays(). Boxing once here is the
         # same cost the dict iteration used to be, and every cell is drawn
         # individually anyway.
@@ -319,7 +335,7 @@ class FootprintItem(pg.GraphicsObject):
                 if show_text:
                     self._cell_two(p, tr, x, y, row_h, half, sell_v, buy_v,
                                    t.poc_text if is_poc else t.cell_text,
-                                   ws, wb)
+                                   ws, wb, hw)
 
             elif mode == "Cluster":
                 bg = pal["poc_bg"] if is_poc else (
@@ -371,28 +387,88 @@ class FootprintItem(pg.GraphicsObject):
                 and rect.height() >= fm.height() - 2)
 
     def _cell_two(self, p, tr, x, y, row_h, half, sell_v, buy_v, color,
-                  ws=None, wb=None) -> None:
-        # Numbers sit against the OUTER end of their own bar, never over the
-        # candle in the middle. Given the bar widths they follow the histogram
-        # out; without them (other modes) they fall back to the half-column.
+                  ws=None, wb=None, hw=0.0) -> None:
+        """Numbers at the OUTER end of their own bar, clear of the candle.
+
+        This used to say that and do the opposite. Both rects reached to the
+        centre line and were aligned INWARD - sell right-aligned at x-0.01, buy
+        left-aligned at x+0.01 - so both labels came to rest exactly where the
+        candle body is. The candle is painted after the cells, so it covered
+        the leading digits and rows read as ".4K" and ".2K" with the tens and
+        hundreds hidden underneath.
+
+        _fits could not catch it: the text genuinely fitted its rect. It was
+        never a clipping problem, it was two objects drawn in the same place.
+
+        So the rects now STOP at the candle's half-width, and the alignment
+        follows the histogram outward - sell grows left so its label sits at
+        the left tip, buy grows right so its label sits at the right tip. A bar
+        too short to hold its number then fails _fits and is dropped, which is
+        the correct outcome: no number at all beats half a number.
+        """
         lw = half if ws is None else max(ws, 0.0)
         rw = half if wb is None else max(wb, 0.0)
-        rb = tr.mapRect(QRectF(x - max(lw, 0.02), y, max(lw, 0.02) - 0.01, row_h))
-        ra = tr.mapRect(QRectF(x + 0.01, y, max(rw, 0.02) - 0.01, row_h))
+        # Keep clear of the candle body, and of the wick when there is no body.
+        gap = max(hw, 0.01) + 0.01
+        lw_txt = max(lw - gap, 0.0)
+        rw_txt = max(rw - gap, 0.0)
+        # Breathing room inside the bar, on the app's 4 px rhythm. Without it
+        # the digits sit flush against the tip and read as overflowing it -
+        # _fits only guarantees the glyphs are complete, not that they look
+        # deliberate. (Hard-coded rather than imported from ui.design because
+        # render must not depend on ui: omnitrix.ui imports main_window, which
+        # imports this module.)
+        pad = LABEL_PAD_PX
         s_txt, b_txt = _fmt(sell_v), _fmt(buy_v)
-        s_ok, b_ok = self._fits(rb, s_txt), self._fits(ra, b_txt)
-        if not (s_ok or b_ok):
+
+        # INSIDE THE BAR FIRST, OUTSIDE IT SECOND.
+        #
+        # Confining the label to its own bar is correct but throws away most of
+        # them: a short bar has no room, and dropping the number leaves the row
+        # blank even though the rest of the column is empty. So a label that
+        # will not fit inside falls out past the tip, into space nothing else
+        # uses, butted against the bar so it still reads as belonging to it.
+        # That is the arrangement every established footprint uses, and it is
+        # why they stay readable at rows this thin.
+        def place(inner_a, inner_b, outer_a, outer_b, text, inside_align):
+            """Return (rect, align, outside?) or None."""
+            r_in = tr.mapRect(QRectF(min(inner_a, inner_b), y,
+                                     abs(inner_b - inner_a), row_h))
+            r_in.adjust(pad, 0, -pad, 0)
+            if self._fits(r_in, text):
+                return r_in, inside_align, False
+            r_out = tr.mapRect(QRectF(min(outer_a, outer_b), y,
+                                      abs(outer_b - outer_a), row_h))
+            r_out.adjust(pad, 0, -pad, 0)
+            # Outside, the text hugs the bar tip - the OPPOSITE alignment.
+            flip = (Qt.AlignmentFlag.AlignRight
+                    if inside_align == Qt.AlignmentFlag.AlignLeft
+                    else Qt.AlignmentFlag.AlignLeft)
+            if self._fits(r_out, text):
+                return r_out, flip, True
+            return None
+
+        sell_tip = x - gap - lw_txt
+        buy_tip = x + gap + rw_txt
+        s = place(sell_tip, x - gap, x - half, sell_tip, s_txt,
+                  Qt.AlignmentFlag.AlignLeft)
+        b = place(x + gap, buy_tip, buy_tip, x + half, b_txt,
+                  Qt.AlignmentFlag.AlignRight)
+        if s is None and b is None:
             return
         p.save()
         p.resetTransform()
         p.setFont(self.font)
-        p.setPen(pg.mkPen(color))
-        if s_ok:
-            p.drawText(rb, Qt.AlignmentFlag.AlignVCenter
-                       | Qt.AlignmentFlag.AlignRight, s_txt)
-        if b_ok:
-            p.drawText(ra, Qt.AlignmentFlag.AlignVCenter
-                       | Qt.AlignmentFlag.AlignLeft, b_txt)
+        for placed, text in ((s, s_txt), (b, b_txt)):
+            if placed is None:
+                continue
+            rect, align, outside = placed
+            # A label that landed OUTSIDE its bar is on the chart background,
+            # not on the bar - so it must not use the on-bar colour. On a POC
+            # row that colour is near-black against a white cell, and drawing
+            # it out here would put black text on a near-black chart.
+            p.setPen(pg.mkPen(self.theme.cell_text if outside else color))
+            p.drawText(rect, Qt.AlignmentFlag.AlignVCenter | align, text)
         p.restore()
 
     def _cell_one(self, p, tr, x, y, row_h, half, text, color,

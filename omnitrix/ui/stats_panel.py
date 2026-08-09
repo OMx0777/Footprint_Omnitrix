@@ -10,6 +10,7 @@ from .framegov import GovernedTimer, watch
 from PyQt6.QtGui import QPainter, QColor, QFont
 from PyQt6.QtWidgets import QWidget
 from ..paintguard import safe_paint
+from . import design
 
 BG = QColor(8, 11, 17)
 HEAD = QColor(143, 160, 182)
@@ -36,8 +37,8 @@ class StatsPanel(QWidget):
         super().__init__(parent)
         self.app = app_window
         self.setMinimumWidth(232)
-        self.f_head = QFont("Consolas", 9, QFont.Weight.Bold)
-        self.f_row = QFont("Consolas", 9)
+        self.f_head = design.font(design.DATA_STRONG)
+        self.f_row = design.font(design.DATA)
         # Governed for the same reason as the signals panel: a side panel
         # must be throttleable when the chart is struggling, and its cost has
         # to be visible to the watchdog rather than landing in "unmarked".

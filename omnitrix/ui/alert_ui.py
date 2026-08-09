@@ -23,6 +23,8 @@ from PyQt6.QtWidgets import QWidget
 
 from ..render.crosshair import clock_label
 from ..paintguard import safe_paint
+from . import design
+from .design import SPACE
 
 log = logging.getLogger(__name__)
 
@@ -105,17 +107,66 @@ class AlertToast(QWidget):
 
     dismissed = pyqtSignal()
 
+    # How far off the right edge the toast sits when hidden. It enters from
+    # there and leaves back to there - see _slide_to.
+    OFFSCREEN_PAD = 12
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.hide()
         self._rows: list[tuple[str, float, float]] = []   # sym, price, ts
-        self._font = QFont("Segoe UI", 11, QFont.Weight.Bold)
-        self._small = QFont("Segoe UI", 9)
+        self._font = design.font(design.HEADING)
+        self._small = design.font(design.DATA_SM)
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._expire)
         self.setFixedWidth(330)
+        # ONE SPRING OVER x. The toast lives at the right edge, so the only
+        # axis it travels on is x - and a spring per axis is the rule anyway: a
+        # single 2D spring desyncs the moment the two axes carry different
+        # velocities.
+        self._x = design.Spring(0.0, *design.SPRING_UI)
+        self._x.on_change = self._on_x
+        self._leaving = False
+        # OWN STATE, not Qt's. isVisible() is False whenever an ANCESTOR is
+        # hidden, so using it as "am I already on screen" made show_alerts
+        # re-snap to the hidden position on every alert - which teleported the
+        # toast instead of retargeting it, defeating the whole point of a
+        # spring. A widget's animation state has to be the widget's own.
+        self._on_screen = False
+
+    # ---- motion ---------------------------------------------------------
+    def _rest_x(self) -> float:
+        p = self.parentWidget()
+        w = p.width() if p is not None else self.width()
+        return max(0.0, w - self.width() - SPACE.XXL)
+
+    def _hidden_x(self) -> float:
+        p = self.parentWidget()
+        return float(p.width() + self.OFFSCREEN_PAD) if p is not None else 0.0
+
+    def _on_x(self, x: float) -> None:
+        self.move(int(round(x)), SPACE.XXL * 2 + SPACE.XL)
+
+    def _slide_to(self, x: float, leaving: bool) -> None:
+        """Move along the ONE path this toast owns.
+
+        It enters from beyond the right edge and it leaves back out the same
+        way. Entering from the right and dismissing downward would read as two
+        unrelated objects; a thing that returns the way it came is a thing the
+        eye can keep track of.
+        """
+        self._leaving = leaving
+        design.animate(self._x, x,
+                       on_settle=self._after_leave if leaving else None)
+
+    def _after_leave(self) -> None:
+        if self._leaving:
+            self.hide()
+            self._on_screen = False
+            self._rows.clear()
+            self.dismissed.emit()
 
     def show_alerts(self, alerts) -> None:
         now = time.time()
@@ -124,23 +175,37 @@ class AlertToast(QWidget):
         # Keep the most recent handful; a toast is a notification, not a log.
         self._rows = self._rows[-6:]
         self.setFixedHeight(34 + 26 * len(self._rows))
-        self._reposition()
-        self.show()
+        if not self._on_screen:
+            # Seed OFF screen so the first frame does not flash at the rest
+            # position before the spring has moved anything.
+            self._x.snap(self._hidden_x())
+            self._on_x(self._x.value)
+            self.show()
+            self._on_screen = True
         self.raise_()
+        # INTERRUPTIBLE: a second alert arriving while the first is sliding out
+        # simply retargets the same spring from wherever it currently is,
+        # carrying its velocity. It does not restart, and it does not jump.
+        self._slide_to(self._rest_x(), leaving=False)
         self.update()
         self._timer.start(int(TOAST_SECONDS * 1000))
 
     def _expire(self) -> None:
-        self._rows.clear()
-        self.hide()
-        self.dismissed.emit()
+        self._slide_to(self._hidden_x(), leaving=True)
 
     def _reposition(self) -> None:
-        p = self.parentWidget()
-        if p is not None:
-            self.move(max(0, p.width() - self.width() - 24), 64)
+        """Re-anchor after the parent resizes, without animating."""
+        if self._on_screen and not self._leaving:
+            self._x.snap(self._rest_x())
+            self._on_x(self._x.value)
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        self._reposition()
 
     def mousePressEvent(self, ev) -> None:
+        # Dismiss on PRESS, not release. Feedback that waits for the button to
+        # come back up reads as lag however fast the code behind it is.
         self._expire()
 
     @safe_paint

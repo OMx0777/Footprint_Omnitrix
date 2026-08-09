@@ -15,6 +15,7 @@ from PyQt6.QtGui import QPainter, QColor, QFont
 from .framegov import GovernedTimer, watch
 from ..render.crosshair import clock_label
 from ..paintguard import safe_paint
+from . import design
 
 BUY = QColor(46, 158, 126)
 SELL = QColor(212, 86, 79)
@@ -38,8 +39,8 @@ class TapeWidget(QWidget):
         self._dt_fn = dt_fn or (lambda: 1.0)
         self.block_size = block_size
         self.setMinimumWidth(220)
-        self.font = QFont("Consolas", 9)
-        self.header_font = QFont("Consolas", 9, QFont.Weight.Bold)
+        self.font = design.font(design.DATA)
+        self.header_font = design.font(design.DATA_STRONG)
         # Governed. A bare timer cannot be throttled when the chart is
         # already late, and its cost is invisible to the watchdog - a stall
         # here would be reported as "unmarked", which is the state that made

@@ -15,6 +15,7 @@ from ..engine import signals
 # quietly disagree with the chart's own axis by nine and a half hours.
 from ..render.crosshair import clock_label
 from ..paintguard import safe_paint
+from . import design
 
 BG = QColor(8, 11, 17)
 HEAD = QColor(143, 160, 182)
@@ -58,8 +59,8 @@ class SignalsPanel(QWidget):
         super().__init__(parent)
         self.app = app_window
         self.setMinimumWidth(250)
-        self.f_head = QFont("Consolas", 9, QFont.Weight.Bold)
-        self.f_row = QFont("Consolas", 9)
+        self.f_head = design.font(design.DATA_STRONG)
+        self.f_row = design.font(design.DATA)
         self._events: list = []
         # GOVERNED, not a bare QTimer. detect_all costs 26.7 ms on a full
         # 1400-column buffer, so this panel alone is ~3% of a core running

@@ -18,6 +18,7 @@ from PyQt6.QtGui import QPainter, QColor, QFont
 from PyQt6.QtWidgets import QWidget, QMainWindow
 from .framegov import GovernedTimer, watch
 from ..paintguard import safe_paint
+from . import design
 
 BG = QColor(11, 14, 20)
 GRID = QColor(30, 36, 47)
@@ -48,8 +49,8 @@ class DomLadderWidget(QWidget):
         super().__init__(parent)
         self.app = app_window
         self.setMinimumWidth(460)
-        self.f_head = QFont("Consolas", 9, QFont.Weight.Bold)
-        self.f_row = QFont("Consolas", 9)
+        self.f_head = design.font(design.DATA_STRONG)
+        self.f_row = design.font(design.DATA)
         # Governed. A bare timer cannot be throttled when the chart is
         # already late, and its cost is invisible to the watchdog - a stall
         # here would be reported as "unmarked", which is the state that made

@@ -42,6 +42,7 @@ from .analytics_window import AnalyticsWindow
 from .monitor_window import MarketMonitorWindow
 from .dom_ladder import DomLadderWindow
 from . import workspace
+from . import design
 from .tape_widget import TapeWidget
 from .stats_panel import StatsPanel
 from .signals_panel import SignalsPanel
@@ -783,48 +784,13 @@ class OmnitrixWindow(QMainWindow):
         # bull accent turned the toolbars into a wall of teal that competed with
         # the chart for attention; controls are now neutral, with the accent
         # reserved for the armed drawing tool.
-        self.setStyleSheet(
-            f"QMainWindow {{ background:{t.bg}; }}"
-            f" QToolBar {{ background:{t.panel}; border:none; padding:4px;"
-            f"   spacing:3px; }}"
-            f" QToolBar::separator {{ background:{t.axis}; width:1px; height:1px;"
-            f"   margin:4px 6px; }}"
-            f" QLabel {{ color:{t.text}; font-size:12px; font-weight:600; }}"
-            f" QCheckBox {{ color:{t.text}; font-size:12px; font-weight:600;"
-            f"   padding:0 4px; }}"
-            f" QComboBox {{ background:{t.grid}; color:{t.text};"
-            f"   border:1px solid {t.axis}; border-radius:4px; padding:3px 8px;"
-            f"   font-size:12px; }}"
-            f" QComboBox::drop-down {{ border:none; }}"
-            f" QComboBox QAbstractItemView {{ background:{t.panel};"
-            f"   color:{t.text}; selection-background-color:{t.grid};"
-            f"   border:1px solid {t.axis}; }}"
-            f" QPushButton {{ background:{t.grid}; color:{t.text};"
-            f"   border:1px solid {t.axis}; border-radius:4px; padding:4px 10px;"
-            f"   font-weight:600; font-size:12px; }}"
-            f" QPushButton:hover {{ background:{t.axis}; }}"
-            f" QPushButton:checked {{ background:{t.bull}; color:#FFFFFF;"
-            f"   border:1px solid {t.bull}; }}"
-            f" QDockWidget {{ color:{t.text}; font-size:11px; font-weight:700; }}"
-            f" QDockWidget::title {{ background:{t.panel}; padding:5px 8px;"
-            f"   border-bottom:1px solid {t.axis}; }}"
-            f" QTabBar::tab {{ background:{t.panel}; color:{t.text};"
-            f"   padding:5px 12px; border:none; font-size:11px; }}"
-            f" QTabBar::tab:selected {{ background:{t.grid};"
-            f"   border-bottom:2px solid {t.bull}; }}"
-            # Chrome that Qt otherwise draws from the DEFAULT palette, which is
-            # a light blue-grey however dark the rest of the app is. The
-            # separator between the central chart and the docks, and the
-            # splitter handles between panes, were being drawn in it - that is
-            # the pale blue outline that appeared to box in the chart.
-            f" QMainWindow::separator {{ background:{t.panel};"
-            f"   width:3px; height:3px; }}"
-            f" QMainWindow::separator:hover {{ background:{t.axis}; }}"
-            f" QSplitter {{ background:{t.bg}; }}"
-            f" QSplitter::handle {{ background:{t.panel}; }}"
-            f" QSplitter::handle:hover {{ background:{t.axis}; }}"
-            f" QDockWidget > QWidget {{ background:{t.bg}; }}"
-        )
+        # ONE SOURCE OF TRUTH, not thirteen typed-in paddings. Every
+        # number in the stylesheet is now a token from ui/design.py, so a
+        # spacing or radius decision is made once and holds everywhere -
+        # which is the difference between a composed interface and an
+        # assembled one. See that module for the reasoning, including the
+        # places Apple's guidance is deliberately NOT followed.
+        self.setStyleSheet(design.qss(t))
         for pane in self._panes:
             for plot in (pane.price_plot, pane.cvd_plot):
                 for ax_name in ("bottom", "right"):
