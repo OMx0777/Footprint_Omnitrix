@@ -286,6 +286,9 @@ class OmnitrixWindow(QMainWindow):
         self._sess_fetchers: dict = {}
         self._sess_done: set = set()
         self._sess_queue: list = []
+        # Symbols seen but not yet added to the pickers - see
+        # _register_symbol / _flush_symbol_items.
+        self._pending_sym_items: list = []
         self._bf_since = 0.0
         self._bf_dropped_at = 0
         self._bf_seam: dict = {}
@@ -819,7 +822,10 @@ class OmnitrixWindow(QMainWindow):
                 _lbl.fill = pg.mkBrush(t.cvd)
                 _lbl.update()
             pane.glw.setBackground(t.bg)
-            pane.container.setStyleSheet(pane.container.styleSheet())
+            # Re-applying the SAME sheet forces a full re-polish for nothing.
+            # The pane owns its border state and reapplies it when it changes;
+            # a theme change goes through _apply_theme on the window itself.
+            pass
         # Restrained, terminal-like chrome. Painting every QPushButton in the
         # bull accent turned the toolbars into a wall of teal that competed with
         # the chart for attention; controls are now neutral, with the accent
@@ -970,6 +976,8 @@ class OmnitrixWindow(QMainWindow):
         if self._link_tick % 25 == 0:
             with watch("sync_hot"):
                 self._sync_hot()
+        with watch("symbols"):
+            self._flush_symbol_items()
         with watch("history_fold"):
             self._fold_pending()
         if self._bf_zombies:
@@ -1322,30 +1330,65 @@ class OmnitrixWindow(QMainWindow):
         return True
 
     def _register_symbol(self, sym: str) -> None:
+        """Note a newly seen symbol. The COMBOS are updated later, in a batch.
+
+        This ran inside the drain and did, for every new symbol, a findText -
+        a linear scan of the item list - plus an addItem and a setCurrentText
+        on EVERY pane's picker. At 200 symbols and four panes a burst of eight
+        new names between two budget checks is thousands of Qt operations with
+        nothing watching the clock, and the watchdog caught it as
+
+            SLOW FRAME 149 ms - drain 148ms  redraw 1ms
+
+        which is far more than the drain's own worst event (0.7 ms) could
+        explain. Membership is now recorded in O(1) and the pickers are filled
+        once a frame from the pending set, with a single addItems call instead
+        of one per symbol per pane.
+        """
         self._known_symbols.add(sym)
+        self._pending_sym_items.append(sym)
+
+    def _flush_symbol_items(self) -> None:
+        """Push newly seen symbols into every picker, in one batch.
+
+        Runs outside the drain, once a frame. addItems is one call for the
+        whole batch, and the current text is read and restored once rather
+        than per symbol - setCurrentText on an editable combo is the expensive
+        half of what this used to do per name per pane.
+        """
+        pend = self._pending_sym_items
+        if not pend:
+            return
+        self._pending_sym_items = []
         self.sym_combo.blockSignals(True)
-        self.sym_combo.addItem(sym)
+        self.sym_combo.addItems(pend)
         self.sym_combo.blockSignals(False)
-        # Every pane's own picker offers the same list, so switching one chart
-        # to a symbol another pane discovered does not need it typed again.
         for pane in getattr(self, "_panes", ()):
-            if pane.sym_combo.findText(sym) < 0:
-                pane.sym_combo.blockSignals(True)
-                keep = pane.sym_combo.currentText()
-                pane.sym_combo.addItem(sym)
-                pane.sym_combo.setCurrentText(keep)
-                pane.sym_combo.blockSignals(False)
-        # prefer the symbol restored from the saved workspace once it arrives
+            combo = pane.sym_combo
+            combo.blockSignals(True)
+            keep = combo.currentText()
+            combo.addItems(pend)
+            if combo.currentText() != keep:
+                combo.setCurrentText(keep)
+            combo.blockSignals(False)
+        for sym in pend:
+            if (self._pending_symbol and sym == self._pending_symbol)                     or not self.active_symbol:
+                self._select_pending_symbol(sym)
+    def _select_pending_symbol(self, sym: str) -> None:
+        """Adopt a newly arrived symbol if we were waiting for it.
+
+        Either it is the one the saved workspace asked for, or nothing is
+        selected yet and the first symbol to print is a better default than an
+        empty chart.
+        """
         if self._pending_symbol and sym == self._pending_symbol:
             self._pending_symbol = ""
-            self.active_symbol = sym
-            self.sym_combo.setCurrentText(sym)
-            self.fp.tick = self.instruments.tick(sym)
-            self._dirty = True
-        elif not self.active_symbol:
-            self.active_symbol = sym
-            self.sym_combo.setCurrentText(sym)
-            self.fp.tick = self.instruments.tick(sym)
+        elif self.active_symbol:
+            return
+        self.active_symbol = sym
+        self.sym_combo.setCurrentText(sym)
+        self.fp.tick = self.instruments.tick(sym)
+        self._dirty = True
 
     def _redraw(self) -> None:
         """Redraw the focused pane every frame, the others in turn.

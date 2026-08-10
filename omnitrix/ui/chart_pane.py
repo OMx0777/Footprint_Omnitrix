@@ -68,6 +68,8 @@ class ChartPane:
         # mode. The window redraws non-focused panes in turn, and a change
         # the user just made must not wait for that turn.
         self.needs_redraw = True
+        # Last stylesheet actually applied to the container - see set_active.
+        self._style_now = None
         self.auto_y = True
 
         # The pane is a container, not just a plot: in a grid each chart needs
@@ -297,10 +299,14 @@ class ChartPane:
         to be identifiable, not advertised.
         """
         self.header.setVisible(multi)
-        if not multi:
-            # Single chart: nothing to distinguish it from, so no border at all.
-            self.container.setStyleSheet("")
-            return
-        self.container.setStyleSheet(
-            "#omnipane { border:1px solid %s; }"
-            % ("#6E747E" if active else "#242830"))
+        want = ("" if not multi else
+                "#omnipane { border:1px solid %s; }"
+                % ("#6E747E" if active else "#242830"))
+        # ONLY WHEN IT CHANGES. setStyleSheet re-parses and re-polishes the
+        # whole widget subtree whether or not the sheet differs, and this runs
+        # for every pane on every selection and every layout change - profiled
+        # at 21 ms of a 60 ms layout switch, four calls, none of which usually
+        # altered anything.
+        if want != self._style_now:
+            self._style_now = want
+            self.container.setStyleSheet(want)
