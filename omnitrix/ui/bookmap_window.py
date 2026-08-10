@@ -921,69 +921,91 @@ class BookmapWindow(QMainWindow):
         vb = self.main.getViewBox()
         vb.scaleBy((factor, 1.0))            # zoom time axis about centre
 
+    # THE TOOLBAR DRIVES EVERY VISIBLE BOOK, not just the focused one.
+    #
+    # Each of these used to act on `self._active_pane`, so in a 2x2 grid the
+    # timeframe, price step, bubble size, colour ramp and every other control
+    # moved ONE book and left the other three alone - the toolbar looked broken
+    # because for three quarters of the window it was. Symbol stays per-pane
+    # (that is what a grid is for); everything else is a display setting and
+    # applies to all of them.
+
     def _on_tf(self, txt: str):
-        p = self._active_pane
-        p.agg = self.agg = TF.get(txt, 1)
-        p.apply_tape()
+        self.agg = TF.get(txt, 1)
+        for p in self._visible_panes():
+            p.agg = self.agg
+            p.apply_tape()
         self._reset_view()
 
     def _on_minsize(self, txt: str):
         mult = {"All": 0, "100": 100, "250": 250, "500": 500, "1K": 1000,
                 "2.5K": 2500, "5K": 5000, "10K": 10000}
         m = mult.get(txt, 0)
-        self.bubbles.min_size = self.pie.min_size = self.bars.min_size = m
-        self.bubbles.update(); self.pie.update(); self.bars.update()
+        for p in self._visible_panes():
+            for it in (p.bubbles, p.pie, p.bars):
+                it.min_size = m
+                it.update()
 
     def _on_gaps(self, on: bool):
-        self.heat.dim_unobserved = on
-        self.heat.update()
+        for p in self._visible_panes():
+            p.heat.dim_unobserved = on
+            p.heat.update()
 
     def _on_btf(self, txt: str):
-        p = self._active_pane
-        p.bubble_bin = self.bubble_bin = float(BUBBLE_TF.get(txt, 1))
-        p.apply_tape()
+        self.bubble_bin = float(BUBBLE_TF.get(txt, 1))
+        for p in self._visible_panes():
+            p.bubble_bin = self.bubble_bin
+            p.apply_tape()
         self.refresh()
 
     def _on_step(self, txt: str):
         dollars = PRICE_STEP.get(txt, 0.0)
         # -1 = Auto (resolved per refresh from the zoom); 0 = exactly one tick,
         # whatever the instrument's tick happens to be.
-        p = self._active_pane
-        p.auto_step = self.auto_step = dollars < 0
-        if not p.auto_step:
+        self.auto_step = dollars < 0
+        for p in self._visible_panes():
+            p.auto_step = self.auto_step
+            if not p.auto_step:
+                p.lbl_step.setText("")
+                p.set_row_ticks(1 if dollars <= 0 else
+                                max(1, int(round(dollars / p.tick))))
+            else:
+                p.resolve_auto_step()
+        if not self.auto_step:
             self.lbl_step.setText("")          # the combo already names it
-            p.lbl_step.setText("")
-            p.set_row_ticks(1 if dollars <= 0 else
-                            max(1, int(round(dollars / p.tick))))
-        else:
-            p.resolve_auto_step()
         self.refresh()
 
     def _on_size(self, txt: str):
         sc = SIZE_STEPS.get(txt, 1.0)
-        for it in (self.bubbles, self.pie, self.bars):
-            it.size_scale = sc
-            it.update()
+        for p in self._visible_panes():
+            for it in (p.bubbles, p.pie, p.bars):
+                it.size_scale = sc
+                it.update()
 
     def _on_sr(self, on: bool):
-        self.sr_item.setVisible(on)
+        for p in self._visible_panes():
+            p.sr_item.setVisible(on)
 
     def _on_volpane(self, on: bool):
-        self.vol.setVisible(on)
-        # Collapse the row entirely, otherwise hiding the plot leaves its empty
-        # band holding a fifth of the window.
-        self.glw.ci.layout.setRowStretchFactor(1, 1 if on else 0)
-        self.glw.ci.layout.setRowMinimumHeight(1, 0)
+        for p in self._visible_panes():
+            p.vol.setVisible(on)
+            # Collapse the row entirely, otherwise hiding the plot leaves its
+            # empty band holding a fifth of the pane.
+            p.glw.ci.layout.setRowStretchFactor(1, 1 if on else 0)
+            p.glw.ci.layout.setRowMinimumHeight(1, 0)
 
     def _on_look(self, txt: str):
         lut, bg = LOOKS.get(txt, LOOKS["Bookmap"])
-        self.heat.lut = lut
-        self.glw.setBackground(bg)
-        self.heat.update()
+        for p in self._visible_panes():
+            p.heat.lut = lut
+            p.glw.setBackground(bg)
+            p.heat.update()
 
     def _on_recency(self, txt: str):
-        self.heat.recency = RECENCY.get(txt, 0.0)
-        self.heat.update()
+        r = RECENCY.get(txt, 0.0)
+        for p in self._visible_panes():
+            p.heat.recency = r
+            p.heat.update()
 
     def _apply_tape(self) -> None:
         """Push the tape binning onto the ACTIVE pane's three overlays."""
@@ -996,16 +1018,18 @@ class BookmapWindow(QMainWindow):
         mult, floor = {"Sensitive": (2.5, 2000),
                        "Normal": (4.0, 4000),
                        "Strict": (7.0, 10000)}.get(txt, (4.0, 4000))
-        self.projection.wall_mult = mult
-        self.projection.wall_floor = floor
-        self.projection.update()
+        for p in self._visible_panes():
+            p.projection.wall_mult = mult
+            p.projection.wall_floor = floor
+            p.projection.update()
 
     def _on_style(self, txt: str):
-        self._active_pane.style = txt
         self.style = txt
-        self.bubbles.setVisible(txt == "Bubbles")
-        self.pie.setVisible(txt == "Pie")
-        self.bars.setVisible(txt == "Bars")
+        for p in self._visible_panes():
+            p.style = txt
+            p.bubbles.setVisible(txt == "Bubbles")
+            p.pie.setVisible(txt == "Pie")
+            p.bars.setVisible(txt == "Bars")
         self.refresh()
 
     # ---- lifecycle -------------------------------------------------------
@@ -1036,8 +1060,30 @@ class BookmapWindow(QMainWindow):
                 GOVERNOR.set_alive(id(self), False)
                 return
             GOVERNOR.set_alive(id(self), True)
-            for pane in self._visible_panes():
-                self._refresh_pane(pane, initial)
+            panes = self._visible_panes()
+            if initial or len(panes) <= 1:
+                for pane in panes:
+                    self._refresh_pane(pane, initial)
+                return
+            # THE FOCUSED BOOK EVERY FRAME, THE OTHERS IN TURN.
+            #
+            # The heat field is the most expensive thing this application
+            # draws, and a 2x2 grid draws four of them. With four charts open
+            # as well the governor measured total demand at 2.0x budget and
+            # stretched every interval to fit - nothing late, simply half as
+            # many frames, which is what "it started lagging" means from the
+            # chair.
+            #
+            # Refreshing a pane is what marks its items dirty, so a pane that
+            # is skipped is a pane Qt does not repaint. Four paints a frame
+            # become two, and the book being watched is untouched.
+            active = self._active_pane
+            others = [p for p in panes if p is not active]
+            self._refresh_turn = getattr(self, "_refresh_turn", 0) + 1
+            turn = others[self._refresh_turn % len(others)] if others else None
+            for pane in panes:
+                if pane is active or pane is turn:
+                    self._refresh_pane(pane, initial)
 
     def _refresh_pane(self, pane, initial: bool = False) -> None:
         # Before anything reads row_ticks: a zoom changes the right grid, and

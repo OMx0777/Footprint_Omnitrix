@@ -24,13 +24,14 @@ from ..paintguard import safe_paint
 # One step of the app's 4 px spacing rhythm - see omnitrix/ui/design.py.
 LABEL_PAD_PX = 4
 
-# Footprint cell layouts. The histogram is the default because it carries the
-# shape of the auction without anyone reading a digit; the classic blocks are
-# kept because they are denser and because a reader who already knows them
-# reads them faster than a better layout they have to learn.
+# Footprint cell layouts. CLASSIC BLOCKS ARE THE DEFAULT, at the operator's
+# request: they are denser, every row is the same width so the columns line up
+# down the whole bar, and an eye that has read that layout for years reads it
+# faster than a better one it has to learn. The split histogram carries more
+# shape - size is visible without reading a digit - and is one setting away.
 CELL_HISTOGRAM = "histogram"
 CELL_BLOCKS = "blocks"
-CELL_STYLES = (CELL_HISTOGRAM, CELL_BLOCKS)
+CELL_STYLES = (CELL_BLOCKS, CELL_HISTOGRAM)
 CELL_STYLE_LABELS = {CELL_HISTOGRAM: "Histogram (split)", CELL_BLOCKS: "Classic blocks"}
 
 
@@ -64,7 +65,7 @@ class FootprintItem(pg.GraphicsObject):
         self.tick = tick
         self.theme = theme
         self.mode = "Footprint"       # Footprint | Cluster | Profile | Delta
-        self.cell_style = CELL_HISTOGRAM   # see CELL_STYLES
+        self.cell_style = CELL_BLOCKS      # see CELL_STYLES
         self.show_imbalance = True
         self.show_va = True
         self.show_candles = True
@@ -379,7 +380,8 @@ class FootprintItem(pg.GraphicsObject):
                 p.fillRect(QRectF(x - half, y, self.BOX_W, row_h), bg)
                 if show_text:
                     self._cell_one(p, tr, x, y, row_h, half, _fmt(tot),
-                                   t.poc_text if is_poc else t.cell_text)
+                                   t.poc_text if is_poc else t.cell_text,
+                                   hw=hw)
 
             elif mode == "Profile":
                 w = self.BOX_W * (tot / max_tot)
@@ -389,7 +391,7 @@ class FootprintItem(pg.GraphicsObject):
                 p.fillRect(QRectF(x - half, y, w, row_h), col)
                 if show_text:
                     self._cell_one(p, tr, x, y, row_h, half, _fmt(tot),
-                                   t.cell_text, align_left=True)
+                                   t.cell_text, align_left=True, hw=hw)
 
             elif mode == "Delta":
                 d = buy_v - sell_v
@@ -400,7 +402,8 @@ class FootprintItem(pg.GraphicsObject):
                 p.fillRect(QRectF(x - half, y, self.BOX_W, row_h), col)
                 if show_text:
                     self._cell_one(p, tr, x, y, row_h, half,
-                                   f"{'+' if d > 0 else ''}{_fmt(d)}", t.cell_text)
+                                   f"{'+' if d > 0 else ''}{_fmt(d)}",
+                                   t.cell_text, hw=hw)
 
         if self.show_imbalance and mode == "Footprint":
             self._paint_stacks(p, x, row_h, half, sorted(buy_imb),
@@ -508,8 +511,25 @@ class FootprintItem(pg.GraphicsObject):
         p.restore()
 
     def _cell_one(self, p, tr, x, y, row_h, half, text, color,
-                  align_left=False) -> None:
-        r = tr.mapRect(QRectF(x - half + 0.03, y, self.BOX_W - 0.06, row_h))
+                  align_left=False, hw=0.0) -> None:
+        """One value per row - Cluster, Profile and Delta.
+
+        CENTRED IN THE LEFT CLEAR REGION, not across the whole column. It used
+        to centre on the column, and the column's centre is exactly where the
+        candle body is drawn - and the candle is painted after the cells, so it
+        came down through the middle of every number. That is the Cluster
+        overlap, and it is the same defect the footprint cells had: two things
+        drawn in the same place, which no width or fit check can see.
+
+        The left region rather than the right because these values read as a
+        column down the bar, and a consistent left edge keeps that column
+        aligned; alternating sides to chase the wider gap would make the
+        numbers jitter as the candle body changed size.
+        """
+        gap = max(hw, 0.0) + 0.01
+        r = tr.mapRect(QRectF(x - half, y, (half - gap), row_h))
+        pad = LABEL_PAD_PX
+        r.adjust(pad, 0, -pad, 0)
         if not self._fits(r, text):
             return
         p.save()

@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QColor
 
 from ..render.footprint import (CELL_STYLES, CELL_STYLE_LABELS,
-                                CELL_HISTOGRAM)
+                                CELL_BLOCKS)
 
 
 class _ColorButton(QPushButton):
@@ -97,7 +97,7 @@ class SettingsDialog(QDialog):
         self.cell_style = QComboBox()
         for key in CELL_STYLES:
             self.cell_style.addItem(CELL_STYLE_LABELS[key], key)
-        i = self.cell_style.findData(getattr(fp, "cell_style", CELL_HISTOGRAM))
+        i = self.cell_style.findData(getattr(fp, "cell_style", CELL_BLOCKS))
         self.cell_style.setCurrentIndex(max(0, i))
         form.addRow("Footprint cells", self.cell_style)
 

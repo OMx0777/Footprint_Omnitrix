@@ -128,14 +128,28 @@ check("window aliases follow the selection",
 check("the toolbar acts on the selected book only", bm.buffer.symbol == "AAPL",
       f"{bm.buffer.symbol}")
 
-# ---- a toolbar change must not touch the other three ---------------------
-others = [(p.agg, p.row_ticks) for p in bm._panes if p is not bm._active_pane]
+# ---- A TOOLBAR CHANGE DRIVES EVERY VISIBLE BOOK --------------------------
+# This asserted the opposite until the operator ran a 2x2 grid: a display
+# setting that moved one book of four made the toolbar look broken, because
+# for three quarters of the window it was. SYMBOL stays per-pane - that is what
+# a grid is for - and everything else is a view setting that applies to all of
+# them, the way it does in every other multi-chart layout in the app.
 bm.tf_combo.setCurrentText("10s")
 app.processEvents()
-after = [(p.agg, p.row_ticks) for p in bm._panes if p is not bm._active_pane]
-check("changing the timeframe changes ONLY the selected book",
-      after == others and bm._active_pane.agg == 10,
-      f"selected agg={bm._active_pane.agg}, others {after}")
+aggs = [p.agg for p in bm._visible_panes()]
+check("changing the timeframe changes EVERY visible book",
+      aggs and all(a == 10 for a in aggs), f"aggs {aggs}")
+
+syms_before = [p.buffer.symbol for p in bm._visible_panes()]
+bm.type_combo.setCurrentText("Bars")
+app.processEvents()
+styles = [p.style for p in bm._visible_panes()]
+check("...and so does the tape style", all(s_ == "Bars" for s_ in styles),
+      f"{styles}")
+check("...while each book keeps its OWN symbol - a grid exists to watch "
+      "different names at once",
+      [p.buffer.symbol for p in bm._visible_panes()] == syms_before,
+      f"{syms_before}")
 
 # ---- headers --------------------------------------------------------------
 check("pane headers appear in a grid",

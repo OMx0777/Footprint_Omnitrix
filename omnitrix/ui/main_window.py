@@ -718,6 +718,12 @@ class OmnitrixWindow(QMainWindow):
         self._active_pane = self._panes[0]
         self._bind_pane(self._panes[0])
         self._apply_layout(1)
+        # APPLY the overlay defaults, do not merely store them. _act sets the
+        # checked state before connecting `toggled`, so nothing fired at
+        # startup and every pane kept its constructor default - which for a
+        # PlotDataItem is visible. That is why VWAP drew on charts whose switch
+        # was off.
+        self.apply_overlays()
 
         # TradingView-style ticker search: start typing a symbol anywhere on the
         # chart and a floating box appears; Enter opens it, Escape cancels.
@@ -878,7 +884,22 @@ class OmnitrixWindow(QMainWindow):
             # 32 costs 40 ns per check spread over 32 events - about 1 ns each,
             # against the 47 us average this queue actually carries. The
             # original concern is a rounding error at this granularity.
-            if not (drained & 31) and time.perf_counter() > deadline:
+            # ...AND EVERY 8, NOT EVERY 32.
+            #
+            # 32 was already a correction from 256, made when a deep book was
+            # measured at 93 us against a trade's 1.7 us. With 200 symbols and
+            # four charts plus four books open, the watchdog still caught
+            #     SLOW FRAME 84 ms - drain 80ms  redraw 4ms
+            # against a 22 ms busy budget: a window of 32 events is 32 events
+            # of overshoot, and the events that arrive together are the
+            # expensive ones, because a burst of book snapshots is what a busy
+            # queue is MADE of.
+            #
+            # perf_counter is ~40 ns, so checking every 8 costs 5 ns per event
+            # against the tens of microseconds an event of this kind actually
+            # takes. The budget is what protects the frame; it has to be
+            # consulted often enough to mean something.
+            if not (drained & 7) and time.perf_counter() > deadline:
                 break
             ev = q.popleft()
             drained += 1
@@ -1147,6 +1168,8 @@ class OmnitrixWindow(QMainWindow):
         n = max(1, min(MAX_PANES, int(n)))
         rows, cols = next((r, c) for (p, r, c) in LAYOUTS.values() if p == n)
         self._n_panes = n
+        for _p in self._panes:
+            _p.needs_redraw = True
         for pane in self._panes:
             # HIDE, do not unparent. setParent(None) hands the widget to Python
             # while Qt still owns its QGraphicsScene and every signal connected
@@ -1212,6 +1235,7 @@ class OmnitrixWindow(QMainWindow):
             self._syncing_rows = False
 
     def _on_pane_symbol(self, pane, sym: str) -> None:
+        pane.needs_redraw = True
         """Change the ticker of ONE chart, leaving the other three alone."""
         sym = (sym or "").strip().upper()
         if not sym or sym == pane.symbol:
@@ -1236,6 +1260,7 @@ class OmnitrixWindow(QMainWindow):
         self._dirty = True
 
     def _on_pane_mode(self, pane, name: str) -> None:
+        pane.needs_redraw = True
         """Chart type per pane - footprint here, delta there, heatmap next."""
         pane.set_mode(*MODES.get(name, ("Footprint", True, False)))
         if pane is self._active_pane and self.mode_combo.currentText() != name:
@@ -1303,10 +1328,43 @@ class OmnitrixWindow(QMainWindow):
             self.fp.tick = self.instruments.tick(sym)
 
     def _redraw(self) -> None:
-        """Redraw every VISIBLE pane, each against its own symbol."""
+        """Redraw the focused pane every frame, the others in turn.
+
+        THE COST IS THE PAINT, NOT THIS CALLBACK. Measured, _redraw itself is
+        0.41 ms for one chart and 1.35 ms for four - it only pushes data. What
+        it also does is mark items dirty, and Qt then repaints them, which is
+        where the milliseconds actually go.
+
+        With four charts and four books open the frame governor measured total
+        demand at 2.0x the budget and stretched every window's interval to
+        match. Nothing was LATE - there were simply half as many frames, which
+        from the chair is exactly what "it started lagging" means.
+
+        So a pane that is not being interacted with updates on its turn instead
+        of every frame: four panes become two paints per frame rather than
+        four. This is the same trade the governor already makes between
+        windows - protect the one being looked at, stretch the rest - applied
+        inside a window, and the chart being traded from is unaffected.
+
+        A pane that has just changed symbol, timeframe or mode is redrawn
+        immediately regardless, so nothing waits its turn to show a change the
+        user just asked for.
+        """
         with watch("redraw"):
-            for pane in self._visible_panes():
-                self._redraw_pane(pane)
+            panes = self._visible_panes()
+            if len(panes) <= 1:
+                for pane in panes:
+                    self._redraw_pane(pane)
+                return
+            active = self._active_pane
+            others = [p for p in panes if p is not active]
+            self._redraw_turn = (getattr(self, "_redraw_turn", 0) + 1)
+            turn = others[self._redraw_turn % len(others)]
+            for pane in panes:
+                if (pane is active or pane is turn
+                        or getattr(pane, "needs_redraw", False)):
+                    pane.needs_redraw = False
+                    self._redraw_pane(pane)
 
     def _redraw_pane(self, pane) -> None:
         # A tick change (or a symbol selected before its first print) leaves the
@@ -1365,10 +1423,31 @@ class OmnitrixWindow(QMainWindow):
             pane.sync_price_tag()
             pane.price_line.setPos(bars[-1].close)
             if pane.auto_scroll:
+                # FOLLOW AT THE USER'S ZOOM, not at a fixed 22 bars.
+                #
+                # This used to snap the range to (n-22, n+3) on every frame it
+                # ran. Zooming in near the live edge leaves auto_scroll on -
+                # the right edge is still at the end of the data, which is what
+                # "following" means - so the next frame threw the zoom away and
+                # put 25 bars back. That is the "I cannot zoom in, it zooms
+                # itself out" report, and it happened about thirty times a
+                # second, which is why it felt like the chart was fighting.
+                #
+                # Following means keeping the newest bar in view. It does not
+                # mean choosing the width. So the width is preserved and only
+                # the position moves.
                 n = len(bars)
-                vr = pane.price_plot.getViewBox().viewRect()
+                vb = pane.price_plot.getViewBox()
+                vr = vb.viewRect()
                 if vr.right() < n + 1:
-                    pane.price_plot.setXRange(max(-1, n - 22), n + 3, padding=0)
+                    w = vr.width()
+                    # A degenerate width (first paint, or a pane that has never
+                    # been sized) must not be preserved, or the chart sticks at
+                    # whatever pyqtgraph happened to start with.
+                    if not (w == w) or w < 2.0 or w > max(40.0, n * 4.0):
+                        w = 25.0
+                    right = n + 3
+                    vb.setXRange(right - w, right, padding=0)
             if pane.header.isVisible():
                 b = bars[-1]
                 pane.lbl_last.setText(
@@ -1721,20 +1800,42 @@ class OmnitrixWindow(QMainWindow):
             self.tf_combo.blockSignals(False)
         self._dirty = True
 
-    def _on_vwap_toggled(self, on: bool) -> None:
-        self.vwap_curve.setVisible(on)
-        for _, c in self.vwap_bands:
-            c.setVisible(on)
+    def apply_overlays(self) -> None:
+        """Push every overlay switch onto EVERY pane.
+
+        These used to act on `self.vwap_curve`, which is the ACTIVE pane's
+        curve - so in a 2x2 grid the switch moved one chart and left the other
+        three showing whatever their items happened to be constructed with,
+        which for a PlotDataItem is visible. That is why VWAP appeared on the
+        other charts however the menu was set, and why turning it off only ever
+        cleared one of them.
+
+        It also has to run at STARTUP and after a layout change. `_act` sets
+        the action's checked state before connecting `toggled`, so the initial
+        value never fired a handler and a default of off was stored but never
+        applied - and a pane created later starts from its own constructor
+        defaults, not from the menu.
+        """
+        vwap = self.chk_vwap.isChecked()
+        cpr = self.chk_cpr.isChecked()
+        ema = self.chk_ema.isChecked()
+        for pane in self._panes:
+            pane.vwap_curve.setVisible(vwap)
+            for _mult, c in pane.vwap_bands:
+                c.setVisible(vwap)
+            pane.cpr_item.setVisible(cpr)
+            pane.ema9_item.setVisible(ema)
+            pane.ema21_item.setVisible(ema)
         self._dirty = True
 
-    def _on_cpr_toggled(self, on: bool) -> None:
-        self.cpr_item.setVisible(on)
-        self._dirty = True
+    def _on_vwap_toggled(self, _on: bool) -> None:
+        self.apply_overlays()
 
-    def _on_ema_toggled(self, on: bool) -> None:
-        self.ema9_item.setVisible(on)
-        self.ema21_item.setVisible(on)
-        self._dirty = True
+    def _on_cpr_toggled(self, _on: bool) -> None:
+        self.apply_overlays()
+
+    def _on_ema_toggled(self, _on: bool) -> None:
+        self.apply_overlays()
 
     def _on_mode(self, name: str) -> None:
         """The toolbar drives the ACTIVE pane; the pane header mirrors it."""

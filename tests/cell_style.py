@@ -45,8 +45,15 @@ def check(n, ok, d=""):
 app = QApplication.instance() or QApplication([])
 
 # ---- 1. the styles are declared coherently ---------------------------------
-check("the histogram is the DEFAULT - the new layout is what a new user gets",
-      FootprintItem(0.01).cell_style == CELL_HISTOGRAM)
+# THE DEFAULT IS THE CLASSIC BLOCKS, at the operator's request. The histogram
+# shipped as the default first and was changed back after use: the blocks are
+# denser, every row is the same width so the columns line up down the whole
+# bar, and an eye that has read that layout for years reads it faster than a
+# better one it has to learn.
+check("classic blocks are the DEFAULT layout",
+      FootprintItem(0.01).cell_style == CELL_BLOCKS)
+check("...and the histogram is offered as the alternative",
+      CELL_HISTOGRAM in CELL_STYLES)
 check("both styles are offered, and each has a label for the dialog",
       set(CELL_STYLES) == {CELL_HISTOGRAM, CELL_BLOCKS}
       and all(k in CELL_STYLE_LABELS for k in CELL_STYLES),

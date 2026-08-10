@@ -64,6 +64,10 @@ class ChartPane:
         self.tf_explicit = False
         self._needs_center = True
         self.auto_scroll = True
+        # Set when something about THIS pane changed - symbol, timeframe,
+        # mode. The window redraws non-focused panes in turn, and a change
+        # the user just made must not wait for that turn.
+        self.needs_redraw = True
         self.auto_y = True
 
         # The pane is a container, not just a plot: in a grid each chart needs
