@@ -372,7 +372,7 @@ class FootprintItem(pg.GraphicsObject):
                     # use, so a label under it disappears either way.
                     self._cell_two(p, tr, x, y, row_h, half, sell_v, buy_v,
                                    t.poc_text if is_poc else t.cell_text,
-                                   half, half, hw)
+                                   half, half, hw, centred=True)
 
             elif mode == "Cluster":
                 bg = pal["poc_bg"] if is_poc else (
@@ -426,7 +426,7 @@ class FootprintItem(pg.GraphicsObject):
                 and rect.height() >= fm.height() - 2)
 
     def _cell_two(self, p, tr, x, y, row_h, half, sell_v, buy_v, color,
-                  ws=None, wb=None, hw=0.0) -> None:
+                  ws=None, wb=None, hw=0.0, centred=False) -> None:
         """Numbers at the OUTER end of their own bar, clear of the candle.
 
         This used to say that and do the opposite. Both rects reached to the
@@ -480,19 +480,34 @@ class FootprintItem(pg.GraphicsObject):
                                       abs(outer_b - outer_a), row_h))
             r_out.adjust(pad, 0, -pad, 0)
             # Outside, the text hugs the bar tip - the OPPOSITE alignment.
-            flip = (Qt.AlignmentFlag.AlignRight
-                    if inside_align == Qt.AlignmentFlag.AlignLeft
-                    else Qt.AlignmentFlag.AlignLeft)
+            # A CENTRED label stays centred: it has no tip to hug, and
+            # flipping it would jump it to an edge for the one row that did
+            # not fit, which reads as a mistake rather than a fallback.
+            if inside_align == Qt.AlignmentFlag.AlignHCenter:
+                flip = inside_align
+            else:
+                flip = (Qt.AlignmentFlag.AlignRight
+                        if inside_align == Qt.AlignmentFlag.AlignLeft
+                        else Qt.AlignmentFlag.AlignLeft)
             if self._fits(r_out, text):
                 return r_out, flip, True
             return None
 
         sell_tip = x - gap - lw_txt
         buy_tip = x + gap + rw_txt
-        s = place(sell_tip, x - gap, x - half, sell_tip, s_txt,
-                  Qt.AlignmentFlag.AlignLeft)
-        b = place(x + gap, buy_tip, buy_tip, x + half, b_txt,
-                  Qt.AlignmentFlag.AlignRight)
+        # THE HISTOGRAM PUTS THE NUMBER AT THE BAR'S TIP, because the tip is
+        # where the eye already is - the bar's length IS the value, and the
+        # digits confirm it. The CLASSIC BLOCKS have no tip: every cell is the
+        # full half-width, so an outward-aligned number sits against the outer
+        # edge with a field of empty colour beside it. Centring each value in
+        # its own half is what that layout has always looked like, and it is
+        # why it reads as two columns of figures rather than two margins.
+        align_s = (Qt.AlignmentFlag.AlignHCenter if centred
+                   else Qt.AlignmentFlag.AlignLeft)
+        align_b = (Qt.AlignmentFlag.AlignHCenter if centred
+                   else Qt.AlignmentFlag.AlignRight)
+        s = place(sell_tip, x - gap, x - half, sell_tip, s_txt, align_s)
+        b = place(x + gap, buy_tip, buy_tip, x + half, b_txt, align_b)
         if s is None and b is None:
             return
         p.save()
