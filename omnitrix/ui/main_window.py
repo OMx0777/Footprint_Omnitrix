@@ -150,6 +150,11 @@ BACKFILL_HOLD_MAX_S = 45.0
 # depth moves 934 MB so the buffer can discard 94% of it.
 BACKFILL_SESSION_H = 7.0
 BACKFILL_L2_MIN = 23.0
+# How many session fetches may be in flight at once. Measured on the operator's
+# server: one symbol is 7.7 MB in 3.95 s, and eight panes bind in the same
+# instant on a workspace restore. Two at a time keeps the server responsive and
+# the GIL available to the live decode; the queue drains behind it.
+MAX_SESSION_FETCHES = 2
 # How long to wait for the multicast seam before giving up on history. The join
 # buffers for a second before publishing first_live_seq, so this only has to
 # cover a slow start - not a slow load, which has its own cap.
@@ -280,6 +285,7 @@ class OmnitrixWindow(QMainWindow):
         # Session-history merge for symbols selected after startup.
         self._sess_fetchers: dict = {}
         self._sess_done: set = set()
+        self._sess_queue: list = []
         self._bf_since = 0.0
         self._bf_dropped_at = 0
         self._bf_seam: dict = {}
@@ -2561,6 +2567,23 @@ class OmnitrixWindow(QMainWindow):
             return False
         if symbol in self._sess_fetchers or symbol in self._sess_done:
             return False
+        # CAP THE CONCURRENCY, QUEUE THE REST.
+        #
+        # Each fetch is a thread pulling a session over TCP - measured on the
+        # operator's own server at 7.7 MB in 3.95 s for one symbol. A 2x2 chart
+        # grid plus a 2x2 book grid puts eight symbols on screen at once, and a
+        # workspace restore binds them in the same instant, so without a cap
+        # eight threads hit the server simultaneously on the very frame the
+        # terminal opens - each one slower for the others being there, and all
+        # of them competing with the live multicast decode for the GIL.
+        #
+        # Serialising them costs nothing the user can perceive: history fills
+        # in behind a chart that is already live, and the symbol being traded
+        # is fetched first because _hot_symbols yields it first.
+        if len(self._sess_fetchers) >= MAX_SESSION_FETCHES:
+            if symbol not in self._sess_queue:
+                self._sess_queue.append(symbol)
+            return False
         now_ms = int(time.time() * 1000)
         day_ms = now_ms - int(BACKFILL_SESSION_H * 3600 * 1000)
         f = StartupFetcher(host, getattr(self.feed, "replay_port", 9998),
@@ -2584,6 +2607,7 @@ class OmnitrixWindow(QMainWindow):
             series.set_hot(True)
             log.info("session history: %s installed whole (%s)", symbol, rep)
             self._dirty = True
+            self._pump_session_queue()
             return
         try:
             got = live.prepend_history(series)
@@ -2593,11 +2617,29 @@ class OmnitrixWindow(QMainWindow):
         log.info("session history: %s merged %s", symbol, got)
         if got.get("added"):
             self._dirty = True
+        self._pump_session_queue()
 
     def _on_session_failed(self, symbol, err) -> None:
         self._sess_fetchers.pop(symbol, None)
         self._sess_done.add(symbol)
         log.warning("session history: %s unavailable (%s)", symbol, err)
+        self._pump_session_queue()
+
+    def _pump_session_queue(self) -> None:
+        """Start whatever the cap was holding back.
+
+        Symbols that have since left the screen are dropped rather than
+        fetched: by the time a slot frees, a queue built during a workspace
+        restore can be full of symbols nobody is looking at any more, and
+        spending a session transfer on those is spending it on nothing.
+        """
+        if not self._sess_queue:
+            return
+        hot = self._hot_symbols()
+        while self._sess_queue and len(self._sess_fetchers) < MAX_SESSION_FETCHES:
+            sym = self._sess_queue.pop(0)
+            if sym in hot and sym not in self._sess_done:
+                self.request_session_history(sym)
 
     def _on_backfill_failed(self, symbol, err) -> None:
         log.warning("startup backfill: %s unavailable (%s)", symbol, err)
