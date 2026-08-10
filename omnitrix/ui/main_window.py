@@ -2616,6 +2616,19 @@ class OmnitrixWindow(QMainWindow):
             return
         log.info("session history: %s merged %s", symbol, got)
         if got.get("added"):
+            # THE PROFILE GETS IT TOO. It is fed only from the live drain loop,
+            # so without this a backfilled symbol had a chart going back hours
+            # and a volume profile that began when the app did - and the
+            # profile is one of the main reasons to want the history at all.
+            n = got["added"]
+            try:
+                pv = self.profiles.get(symbol)
+                if pv is not None:
+                    got["profile_vol"] = pv.add_bars(live.bars[:n],
+                                                     live.base_tf_s)
+            except Exception:
+                log.exception("session history: profile merge failed for %s",
+                              symbol)
             self._dirty = True
         self._pump_session_queue()
 

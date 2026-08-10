@@ -9,7 +9,7 @@ Volume Profile answers "where did size trade?"; Market Profile (TPO) answers
 
 from __future__ import annotations
 
-from .model import Trade, Aggressor
+from .model import split_size, Trade, Aggressor
 from .instruments import Instruments
 
 
@@ -30,14 +30,17 @@ class SessionProfile:
     # ---- ingestion -------------------------------------------------------
     def add_trade(self, tr: Trade) -> None:
         ti = self.instruments.to_index(self.symbol, tr.price)
-        if tr.aggressor is Aggressor.BUY:
-            self.buy[ti] = self.buy.get(ti, 0) + tr.size
-        elif tr.aggressor is Aggressor.SELL:
-            self.sell[ti] = self.sell.get(ti, 0) + tr.size
-        else:
-            h = tr.size // 2
-            self.buy[ti] = self.buy.get(ti, 0) + h
-            self.sell[ti] = self.sell.get(ti, 0) + tr.size - h
+        # THROUGH THE SHARED DEFINITION, not a local one. This split an UNKNOWN
+        # print as size//2 to buy and the remainder to sell - a FIXED side for
+        # the odd share, which is exactly the bias split_size exists to remove:
+        # a 1-lot unclassified print counted as a whole sell here and as an
+        # alternating share everywhere else, so the profile's delta drifted
+        # from the footprint's over the same session with nothing to show why.
+        b, sl = split_size(tr.size, tr.aggressor, ti)
+        if b:
+            self.buy[ti] = self.buy.get(ti, 0) + b
+        if sl:
+            self.sell[ti] = self.sell.get(ti, 0) + sl
         self.total += tr.size
 
         b = tr.ts_ms // 1000 // self.tpo_secs
@@ -47,6 +50,48 @@ class SessionProfile:
         s.add(b)
         self.brackets.add(b)
         self._version += 1
+
+    def add_bars(self, bars, tf_s: int) -> int:
+        """Ingest sealed bars' footprints - for history that arrives as BARS.
+
+        The profile was fed only from the live drain loop, so a symbol whose
+        session was backfilled had a chart going back hours and a profile that
+        began when the application did. The volume profile is one of the main
+        reasons to have the history at all, so it has to receive it too.
+
+        A bar's footprint is already split by aggressor through split_size at
+        ingestion, so this adds the arrays directly rather than re-deriving the
+        split - re-deriving is how four consumers ended up disagreeing about
+        the same print in the first place.
+
+        TPO brackets come from the bar's own start_ts, which is market time,
+        not arrival time - a replayed bar belongs to the bracket it traded in.
+
+        Returns the volume added, so a caller can report what was gained.
+        """
+        added = 0
+        for bar in bars:
+            ti_a, sell_a, buy_a = bar.arrays()
+            if not ti_a.size:
+                continue
+            bracket = bar.start_ts // self.tpo_secs
+            self.brackets.add(bracket)
+            for ti, sv, bv in zip(ti_a.tolist(), sell_a.tolist(),
+                                  buy_a.tolist()):
+                if bv:
+                    self.buy[ti] = self.buy.get(ti, 0) + bv
+                if sv:
+                    self.sell[ti] = self.sell.get(ti, 0) + sv
+                added += bv + sv
+                s_ = self.tpo.get(ti)
+                if s_ is None:
+                    s_ = self.tpo[ti] = set()
+                s_.add(bracket)
+        if added:
+            self.total += added
+            self._version += 1
+            self._cache.clear()
+        return added
 
     # ---- analytics (cached per version) ----------------------------------
     def _totals(self) -> dict[int, int]:
