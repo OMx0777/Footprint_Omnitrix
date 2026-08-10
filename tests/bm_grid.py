@@ -73,7 +73,16 @@ bm = bms[0]
 bm.show()
 app.processEvents()
 
-check("it holds four panes", len(bm._panes) == 4)
+# PANES ARE BUILT ON DEMAND. Counting pre-built ones asserted an
+# implementation detail; opening this window used to construct all four
+# regardless - 216 ms of the 219 ms it took - and three of them were never
+# shown. The property that matters to a user is that selecting the 4-book
+# layout GIVES four books.
+from omnitrix.ui.bookmap_window import MAX_PANES
+check("the grid can hold four books", MAX_PANES == 4)
+check("...and it does not build them before they are asked for",
+      len(bm._panes) < 4, f"{len(bm._panes)} built while showing "
+                          f"{bm._n_panes}")
 bm.layout_combo.setCurrentText("4 books")
 for _ in range(30):
     app.processEvents()

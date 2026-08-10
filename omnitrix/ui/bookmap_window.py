@@ -386,23 +386,20 @@ class BookmapWindow(QMainWindow):
         _cv.addWidget(self._grid_host)
         self.setCentralWidget(host)
 
+        # PANES ARE BUILT ON DEMAND, not all four up front.
+        #
+        # Profiled: opening this window cost 219 ms, of which 216 ms was four
+        # BookmapPane constructions - twelve pyqtgraph addPlot calls - and
+        # three of those panes are not on screen. That is a fifth of a second
+        # of frozen UI on a button click, for work that is usually thrown away
+        # when the window closes on one book.
+        #
+        # _pane(i) builds and wires one, and _apply_layout asks for the ones a
+        # layout actually needs. Everything else still indexes self._panes, so
+        # the rest of the file is unchanged.
+        self._first_buffer = buffer
         self._panes = []
-        for i in range(MAX_PANES):
-            # Pane 0 gets the buffer we were opened for; the rest start empty
-            # and are filled when the user picks a symbol for them.
-            buf = buffer if i == 0 else self._empty_buffer()
-            pane = BookmapPane(self, id(self), buf, self.tick, i, TimeAxisSecs)
-            self._panes.append(pane)
-            pane.main.getViewBox().sigRangeChangedManually.connect(
-                lambda *_a, p=pane: self._on_manual(p))
-            pane.glw.scene().sigMouseClicked.connect(
-                lambda ev, p=pane: self._on_click(ev, p))
-            pane.glw.scene().sigMouseMoved.connect(
-                lambda pos, p=pane: self._on_mouse_move(pos, p))
-            pane.sym_combo.currentTextChanged.connect(
-                lambda t, p=pane: self._on_pane_symbol(p, t))
-            pane.sym_combo.lineEdit().returnPressed.connect(
-                lambda p=pane: self._on_pane_symbol(p, p.sym_combo.currentText()))
+        self._pane(0)
         self._active_pane = self._panes[0]
         self._bind_pane(self._panes[0])
         self._apply_layout(1)
@@ -421,6 +418,25 @@ class BookmapWindow(QMainWindow):
         self.sym_search.hide()
         self.sym_search.returnPressed.connect(self._apply_sym_search)
         self.sym_search.installEventFilter(self)
+
+    def _pane(self, i: int):
+        """The i-th pane, built and wired on first use."""
+        while len(self._panes) <= i:
+            k = len(self._panes)
+            buf = self._first_buffer if k == 0 else self._empty_buffer()
+            pane = BookmapPane(self, id(self), buf, self.tick, k, TimeAxisSecs)
+            self._panes.append(pane)
+            pane.main.getViewBox().sigRangeChangedManually.connect(
+                lambda *_a, p=pane: self._on_manual(p))
+            pane.glw.scene().sigMouseClicked.connect(
+                lambda ev, p=pane: self._on_click(ev, p))
+            pane.glw.scene().sigMouseMoved.connect(
+                lambda pos, p=pane: self._on_mouse_move(pos, p))
+            pane.sym_combo.currentTextChanged.connect(
+                lambda t, p=pane: self._on_pane_symbol(p, t))
+            pane.sym_combo.lineEdit().returnPressed.connect(
+                lambda p=pane: self._on_pane_symbol(p, p.sym_combo.currentText()))
+        return self._panes[i]
 
     def _empty_buffer(self) -> BookmapBuffer:
         """A placeholder book for a pane with no symbol yet.
@@ -460,7 +476,7 @@ class BookmapWindow(QMainWindow):
             pane.container.setVisible(False)
         for i in range(n):
             row = self._rows[i // cols]
-            pane = self._panes[i]
+            pane = self._pane(i)          # built on first use - see _pane
             if pane.container.parent() is not row:
                 row.addWidget(pane.container)
             pane.container.setVisible(True)
