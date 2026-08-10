@@ -554,6 +554,77 @@ class BarSeries:
                 "skipped": skipped, "partial": partial,
                 "mismatched": mismatched}
 
+    def prepend_history(self, other: "BarSeries") -> dict:
+        """Splice in the part of `other` that is strictly OLDER than this one.
+
+        WHY THIS EXISTS. The startup backfill built a complete session off the
+        GUI thread and then refused to install it whenever the live slot had
+        already counted bars - which, on a multicast feed carrying the whole
+        basket, is every symbol within seconds of launch. So history loaded for
+        the one symbol on screen at startup and was discarded for every symbol
+        selected afterwards: the chart began at the moment the app did.
+
+        Replacing the live series was rightly refused, because it holds volume
+        and delta the replay knows nothing about. Merging does not have that
+        problem, and the reason is the seam: only bars STRICTLY OLDER than the
+        oldest live bar are taken. Old and new never describe the same bucket,
+        so nothing can be counted twice - the one failure mode that would be
+        silent and unrecoverable.
+
+        The partially-live boundary bar is deliberately NOT merged. The replay
+        holds only the part of it that arrived before the client connected, and
+        adding that to a bar the live stream is still filling would produce a
+        bar that is neither. One bar of lost detail at the seam is the honest
+        price; a wrong bar is not.
+
+        Returns a report, so a caller can log what was actually gained rather
+        than assume.
+        """
+        if not other.bars:
+            return {"added": 0, "reason": "replay empty"}
+        if not self.bars:
+            # Nothing live yet - take the lot, seam included.
+            cut = None
+        else:
+            cut = self.bars[0].start_ts
+        add = [b for b in other.bars if cut is None or b.start_ts < cut]
+        if not add:
+            return {"added": 0, "reason": "replay has nothing older"}
+
+        self.bars[:0] = add
+        for b in add:
+            self._bar_by_ts[b.start_ts] = b
+        # Honour the cap from the FRONT, which is where the oldest are.
+        if len(self.bars) > self.max_bars:
+            drop = len(self.bars) - self.max_bars
+            for b in self.bars[:drop]:
+                self._bar_by_ts.pop(b.start_ts, None)
+            del self.bars[:drop]
+            self._evicted += drop
+
+        # Session figures gain the prepended flow. These are what the monitor
+        # and the stats panel report, and a session that starts mid-morning
+        # because the app did is exactly the wrongness this fixes.
+        vol = sum(b.volume for b in add)
+        dlt = sum(b.delta for b in add)
+        self.sess_volume += vol
+        self.sess_delta += dlt
+        hi = max(b.high for b in add)
+        lo = min(b.low for b in add)
+        self.sess_high = max(self.sess_high, hi) if self.sess_open is not None else hi
+        self.sess_low = min(self.sess_low, lo) if self.sess_open is not None else lo
+        # The session OPEN is now the oldest bar's open, not whatever price
+        # happened to print when the client attached.
+        self.sess_open = self.bars[0].open
+        if self.sess_last == 0.0:
+            self.sess_last = self.bars[-1].close
+
+        self._agg_cache.clear()
+        self._tf_dirty.clear()
+        self._version += 1
+        return {"added": len(add), "volume": vol, "delta": dlt,
+                "from_ts": add[0].start_ts, "to_ts": add[-1].start_ts}
+
     def _stat_trade(self, tr: Trade) -> None:
         if self.sess_open is None:
             self.sess_open = self.sess_high = self.sess_low = tr.price

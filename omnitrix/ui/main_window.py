@@ -277,6 +277,9 @@ class OmnitrixWindow(QMainWindow):
         # Startup backfill: "idle" until asked, "holding" while history loads,
         # then "done" or "live_only". Only "holding" gates the drain.
         self._bf_state = "idle"
+        # Session-history merge for symbols selected after startup.
+        self._sess_fetchers: dict = {}
+        self._sess_done: set = set()
         self._bf_since = 0.0
         self._bf_dropped_at = 0
         self._bf_seam: dict = {}
@@ -1009,6 +1012,17 @@ class OmnitrixWindow(QMainWindow):
     def _sync_hot(self) -> None:
         """Apply the hot set. Cheap: set_hot returns at once when unchanged."""
         hot = self._hot_symbols()
+        # A SYMBOL BEING DRAWN FOR THE FIRST TIME GETS ITS SESSION.
+        #
+        # _sync_hot already knows precisely when a symbol goes on screen, which
+        # is the moment its history is wanted and the only moment it is worth
+        # fetching. One request per symbol per run - request_session_history
+        # keeps its own done-set - so switching back and forth costs nothing.
+        if getattr(self.feed, "replay_host", ""):
+            for sym in hot:
+                if sym not in self._sess_done and sym not in self._sess_fetchers:
+                    self.request_session_history(sym)
+
         # PROMOTIONS FIRST AND ALWAYS. A symbol the user just selected must be
         # at full retention before the next frame draws it; there is no budget
         # worth trading against that.
@@ -2518,6 +2532,72 @@ class OmnitrixWindow(QMainWindow):
                 p_.lbl_last.setText("")
         self._bf_done.add(symbol)
         self._maybe_finish_backfill()
+
+    # ---- session history for a symbol selected LATER ----------------------
+    def request_session_history(self, symbol: str) -> bool:
+        """Fetch this symbol's session and MERGE the part older than we have.
+
+        The startup backfill only ever covered `_hot_symbols()` - the one or
+        two symbols on screen when the app opened - and refused to install
+        anything into a slot that had already counted live bars. On a multicast
+        feed carrying the whole basket that is every symbol within seconds, so
+        selecting a symbol later gave a chart that began when the APP began,
+        with no session behind it. That is the missing footprint and profile
+        history.
+
+        Merging is safe where replacing was not: prepend_history takes only
+        bars strictly OLDER than the oldest live bar, so the replay and the
+        live stream never describe the same bucket and nothing is double
+        counted. See BarSeries.prepend_history.
+
+        L2 is deliberately NOT re-fetched here. The heat ring holds about
+        twenty minutes and the operator has said that is enough; pulling hours
+        of depth to have the buffer discard it is transfer nobody sees.
+        """
+        if not symbol:
+            return False
+        host = getattr(self.feed, "replay_host", "")
+        if not host:
+            return False
+        if symbol in self._sess_fetchers or symbol in self._sess_done:
+            return False
+        now_ms = int(time.time() * 1000)
+        day_ms = now_ms - int(BACKFILL_SESSION_H * 3600 * 1000)
+        f = StartupFetcher(host, getattr(self.feed, "replay_port", 9998),
+                           getattr(self.feed, "token", ""), symbol,
+                           day_ms, now_ms, self.instruments,
+                           seam=None, l2_start_ms=now_ms, parent=self)
+        f.built.connect(self._on_session_built)
+        f.failed.connect(self._on_session_failed)
+        self._sess_fetchers[symbol] = f
+        f.start()
+        log.info("session history: fetching %s", symbol)
+        return True
+
+    def _on_session_built(self, symbol, series, buf, rep) -> None:
+        """GUI thread. Splice the older part in front of what is live."""
+        self._sess_fetchers.pop(symbol, None)
+        self._sess_done.add(symbol)
+        live = self.series.get(symbol)
+        if live is None:
+            self.series[symbol] = series
+            series.set_hot(True)
+            log.info("session history: %s installed whole (%s)", symbol, rep)
+            self._dirty = True
+            return
+        try:
+            got = live.prepend_history(series)
+        except Exception:
+            log.exception("session history: merging %s failed", symbol)
+            return
+        log.info("session history: %s merged %s", symbol, got)
+        if got.get("added"):
+            self._dirty = True
+
+    def _on_session_failed(self, symbol, err) -> None:
+        self._sess_fetchers.pop(symbol, None)
+        self._sess_done.add(symbol)
+        log.warning("session history: %s unavailable (%s)", symbol, err)
 
     def _on_backfill_failed(self, symbol, err) -> None:
         log.warning("startup backfill: %s unavailable (%s)", symbol, err)
