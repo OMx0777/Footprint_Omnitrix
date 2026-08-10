@@ -435,4 +435,71 @@ except Exception as e:                                   # noqa: BLE001
 g.check(err is None and sum(x.volume for x in ser.bars) == before + 50 * 250,
         f"a late tick into a sealed bar is recorded, not a crash ({err})")
 
+# ---- ONE DEFINITION OF THE SPLIT, ENFORCED ---------------------------------
+# split_size's own docstring records four consumers that each decided this for
+# themselves and three that were wrong, all leaning the same way. A fifth turned
+# up later in SessionProfile, splitting an UNKNOWN print with a FIXED side for
+# the odd share - so its delta drifted from the footprint's over the same
+# session with nothing on screen to say why.
+#
+# Reasoning about it clearly is not enough; it has now happened five times. So
+# the invariant is enforced two ways: nothing outside model.py may compute a
+# split, and the three consumers that hold per-price volume must agree exactly
+# on a stream built to make a local split show up.
+import ast as _ast
+import pathlib as _pl
+
+_offenders = []
+for _f in sorted(_pl.Path(__file__).resolve().parents[1].joinpath("omnitrix")
+                 .rglob("*.py")):
+    if _f.name == "model.py":
+        continue                      # the one place allowed to define it
+    _src = _f.read_text(encoding="utf-8")
+    _tree = _ast.parse(_src, str(_f))
+    for _n in _ast.walk(_tree):
+        # A `// 2` inside a function that branches on the AGGRESSOR is the
+        # shape every one of these bugs had. Keying on the word UNKNOWN would
+        # have missed the real one: SessionProfile.add_trade branched on BUY
+        # and SELL and put the split in the bare `else`, never naming UNKNOWN
+        # at all. A check that would not have caught the bug it is named for
+        # is theatre.
+        if isinstance(_n, _ast.FunctionDef) and "aggressor" in _ast.dump(_n):
+            for _m in _ast.walk(_n):
+                if (isinstance(_m, _ast.BinOp)
+                        and isinstance(_m.op, _ast.FloorDiv)
+                        and isinstance(_m.right, _ast.Constant)
+                        and _m.right.value == 2):
+                    _offenders.append(f"{_f.name}:{_m.lineno} in {_n.name}()")
+g.check(not _offenders,
+        f"no consumer outside model.py splits an UNKNOWN print itself "
+        f"({_offenders or 'clean'})")
+
+from omnitrix.engine.profile import SessionProfile
+from omnitrix.engine.bookmap import BookmapBuffer
+
+_inst = Instruments(default_tick=0.01)
+_pf = SessionProfile("XS", _inst)
+_bs = BarSeries("XS", _inst)
+_bm = BookmapBuffer("XS", _inst)
+_t0 = 1_700_000_000_000
+for _i in range(900):
+    # ODD sizes and UNKNOWN aggressors: the only case where a local split can
+    # differ, and the case that was wrong every time.
+    _tr = Trade("XS", round(300.0 + (_i % 31) * 0.01, 2), 1 + (_i % 9) * 2,
+                (B, S, U)[_i % 3], _t0 + _i * 250)
+    _pf.add_trade(_tr)
+    _bs.add_trade(_tr)
+    _bm.add_trade(_tr)
+_pb, _ps = sum(_pf.buy.values()), sum(_pf.sell.values())
+_bb = _bsell = 0
+for _bar in _bs.bars:
+    _ti, _sv, _bv = _bar.arrays()
+    _bb += int(_bv.sum())
+    _bsell += int(_sv.sum())
+_mb = sum(sum(c.buy.values()) for c in _bm.columns())
+_ms = sum(sum(c.sell.values()) for c in _bm.columns())
+g.check((_pb, _ps) == (_bb, _bsell) == (_mb, _ms),
+        f"profile, footprint and bookmap agree on buy/sell for the SAME "
+        f"prints - profile({_pb},{_ps}) bars({_bb},{_bsell}) book({_mb},{_ms})")
+
 raise SystemExit(g.finish())
