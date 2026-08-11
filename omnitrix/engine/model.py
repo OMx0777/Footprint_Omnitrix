@@ -26,6 +26,44 @@ class Aggressor(str, Enum):
     UNKNOWN = "unknown"
 
 
+# A price this far from anything real is not a price. The bound is generous on
+# purpose - the job is to reject the impossible, not to have an opinion about
+# what an instrument may cost - but it MUST hold, because a tick index is an
+# int32 in every array this app stores and a price of 1e12 overflows it:
+#
+#     OverflowError: Python int too large to convert to C long
+#
+# raised inside Bar.seal, which then poisons every later paint of that bar. NaN
+# is worse than an overflow: it does not raise, it propagates, and one NaN high
+# makes the whole price axis unusable with nothing on screen to say why.
+MAX_PRICE = 1e9
+MAX_SIZE = 1 << 40
+
+
+def sane_trade(tr) -> bool:
+    """Is this print safe to ingest?
+
+    Called at the boundary where external data enters - the drain and the
+    history loader. Two float comparisons and a range check, about 50 ns
+    against the tens of microseconds an event costs downstream.
+
+    NOT a filter for "unlikely" values. A wide stop or a fat-finger print is
+    real data and must be charted. This rejects only what cannot be charted at
+    all: non-finite prices, non-positive prices, sizes that cannot be summed
+    into an int64, and prices whose tick index would not fit the int32 arrays
+    the whole storage layer is built on.
+    """
+    p = tr.price
+    # `p != p` is the NaN test; NaN fails every comparison, so an ordinary
+    # range check would let it through.
+    if p != p or p <= 0.0 or p > MAX_PRICE:
+        return False
+    sz = tr.size
+    if sz < 0 or sz > MAX_SIZE:
+        return False
+    return bool(tr.symbol)
+
+
 def split_size(size: int, aggressor: Aggressor, tick_index: int) -> tuple[int, int]:
     """One print -> (buy_volume, sell_volume). THE definition of the split.
 
@@ -191,6 +229,20 @@ class BookSnapshot:
             sz = np.concatenate((
                 np.fromiter(self.bids.values(), dtype=np.int64, count=nb),
                 np.fromiter(self.asks.values(), dtype=np.int64, count=na)))
+            # DROP UNCHARTABLE LEVELS BEFORE THE CAST. astype(np.int32) on a
+            # NaN or a price of 1e12 does not raise - it wraps to garbage, and
+            # a garbage tick index puts a phantom wall at an arbitrary price
+            # that looks exactly like real liquidity. Filtering first is the
+            # difference between a level that is missing and a level that is
+            # invented, and only one of those is survivable.
+            good = np.isfinite(px) & (px > 0.0) & (px <= MAX_PRICE)
+            if not good.all():
+                px = px[good]
+                sz = sz[good]
+            if px.size == 0:
+                lad = EMPTY_LADDER
+                cache[:] = (tick, lad)
+                return lad
             ti = np.rint(px / tick).astype(np.int32)
             # np.unique over the REVERSED arrays: its "first" occurrence is the
             # last in original order, so asks override bids, and the returned

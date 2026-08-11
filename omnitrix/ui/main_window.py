@@ -27,7 +27,7 @@ from .chart_pane import ChartPane
 from ..engine import (
     Instruments, BarSeries, BookmapBuffer, SessionProfile, Feed,
 )
-from ..engine.model import Trade, BookSnapshot
+from ..engine.model import Trade, BookSnapshot, sane_trade
 from ..render import (
     FootprintItem, HeatmapItem, DARK, LIGHT, TimeAxis, PriceAxis, Crosshair,
     FibRetracement, PositionDrawer, FixedVolumeProfile, PenDrawing,
@@ -289,6 +289,8 @@ class OmnitrixWindow(QMainWindow):
         # Symbols seen but not yet added to the pickers - see
         # _register_symbol / _flush_symbol_items.
         self._pending_sym_items: list = []
+        # Events rejected at the boundary as unchartable - see the drain.
+        self._dropped_bad = 0
         self._bf_since = 0.0
         self._bf_dropped_at = 0
         self._bf_seam: dict = {}
@@ -919,6 +921,20 @@ class OmnitrixWindow(QMainWindow):
             ev = q.popleft()
             drained += 1
             if isinstance(ev, Trade):
+                # VALIDATE AT THE BOUNDARY. A price of 1e12 overflows the int32
+                # tick index every array in the storage layer uses and raises
+                # inside Bar.seal, which then makes every later paint of that
+                # bar fail; a NaN price does not raise at all - it propagates
+                # into high/low and makes the price axis unusable with nothing
+                # on screen to say why. Both were reproduced by injecting them.
+                #
+                # COUNTED, not silently dropped. This app does not discard data
+                # without saying so - `dropped_bad` is reported by the link
+                # status, so a feed sending nonsense is visible rather than
+                # quietly thinned.
+                if not sane_trade(ev):
+                    self._dropped_bad += 1
+                    continue
                 s = self.series.get(ev.symbol)
                 if s is None:
                     s = self.series[ev.symbol] = BarSeries(ev.symbol, self.instruments)
