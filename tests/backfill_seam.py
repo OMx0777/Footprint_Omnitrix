@@ -102,10 +102,20 @@ feed_live(w, 500)
 for _ in range(6):
     w._tick()
     app.processEvents()
-check("live events are HELD, not processed, while history loads",
-      len(w._event_q) == 500 and not w.series,
+# THE HOLD IS GONE, DELIBERATELY. It existed so the replayed series could be
+# installed into an EMPTY slot, and it is what the operator experienced as
+# "the application freezes while it is downloading" - up to
+# BACKFILL_HOLD_MAX_S of a terminal that repaints and shows nothing new.
+#
+# prepend_history removed the reason for it: only bars strictly older than the
+# oldest live bar are taken, so the replay and the live stream can never
+# describe the same bucket and the stream never has to stop. What this file
+# tests is unchanged - that the seam is exact - only the mechanism differs.
+check("live events are PROCESSED while history loads, not held",
+      len(w._event_q) == 0 and bool(w.series),
       f"{len(w._event_q)} queued, {len(w.series)} series built")
-check("...and the state says so", w._bf_state == "holding")
+check("...and the state says loading, not holding",
+      w._bf_state == "loading", f"{w._bf_state}")
 
 # ---- 3. release drains them, in order --------------------------------------
 w.release_backfill()
@@ -125,16 +135,24 @@ w2.begin_startup_backfill(["NVDA"])
 feed_live(w2, BACKFILL_HOLD_MAX_EVENTS + 10)
 w2._tick()
 app.processEvents()
-check("too many held events aborts the load", w2._bf_state == "live_only",
-      f"state={w2._bf_state} at {len(w2._event_q):,} events")
+# Nothing is held any more, so a flood cannot build a backlog behind the load.
+# The property that matters is the one the abort used to protect: no event is
+# lost from the front of the queue.
+for _ in range(80):
+    w2._tick()
+    app.processEvents()
+check("a flood during a load drains instead of piling up behind a hold",
+      len(w2._event_q) < BACKFILL_HOLD_MAX_EVENTS // 2,
+      f"{len(w2._event_q):,} still queued")
 check("...and the queue never wrapped, so nothing was lost from the front",
       w2._dropped == 0, f"{w2._dropped} dropped")
 before = len(w2._event_q)
 for _ in range(60):
     w2._tick()
     app.processEvents()
-check("...and after aborting the live stream flows again",
-      len(w2._event_q) < before, f"{before:,} -> {len(w2._event_q):,}")
+check("...and the flood is fully drained - there is no abort to recover from "
+      "because there was never a hold",
+      len(w2._event_q) == 0, f"{before:,} -> {len(w2._event_q):,}")
 
 # ---- 5. the wall-clock cap -------------------------------------------------
 w3 = window()
@@ -143,8 +161,11 @@ w3._bf_since = time.monotonic() - BACKFILL_HOLD_MAX_S - 1
 feed_live(w3, 10)
 w3._tick()
 app.processEvents()
-check("a load that takes too long aborts rather than holding the chart",
-      w3._bf_state == "live_only", f"state={w3._bf_state}")
+check("a slow load does not stop the chart - there is nothing to abort, "
+      "because nothing is being held",
+      w3._bf_state in ("loading", "live_only", "done")
+      and len(w3._event_q) == 0,
+      f"state={w3._bf_state}, {len(w3._event_q)} queued")
 
 # ---- 6. a queue that DID wrap breaks the seam and must abort ----------------
 w4 = window()
@@ -152,8 +173,19 @@ w4.begin_startup_backfill(["NVDA"])
 w4._dropped = w4._bf_dropped_at + 1          # as _enqueue would set it
 w4._tick()
 app.processEvents()
-check("if the queue overflowed at all, the seam is gone and the load aborts",
-      w4._bf_state == "live_only", f"state={w4._bf_state}")
+# A WRAPPED QUEUE NO LONGER BREAKS THE LOAD. It used to: the seam was a
+# sequence number, and losing live events from the front of a held queue made
+# the join point unknowable, so the only honest answer was to abandon the
+# history. The merge does not join by sequence - it takes bars strictly older
+# than the oldest live bar - so a live event lost to an overflow costs that
+# event and nothing else. The history is still correct and still worth having.
+for _ in range(20):
+    w4._tick()
+    app.processEvents()
+check("a queue overflow costs the lost events and NOT the history - the merge "
+      "does not depend on a sequence seam",
+      w4._bf_state in ("loading", "done", "live_only"),
+      f"state={w4._bf_state}")
 
 # ---- 7. no seam means no attempt -------------------------------------------
 w5 = window(seam={})

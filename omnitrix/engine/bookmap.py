@@ -460,6 +460,44 @@ class BookmapBuffer:
             worked = True
         return worked
 
+    def prepend_columns(self, other: "BookmapBuffer") -> dict:
+        """Splice in the part of `other` that is strictly OLDER than this one.
+
+        The bar-series counterpart of BarSeries.prepend_history, and it exists
+        for the same reason: the startup load stopped holding the live stream,
+        so a replayed buffer now arrives alongside one that has already been
+        filling. Replacing would lose the live columns; merging by the same
+        strict-seam rule cannot double count, because a bucket is either older
+        than the oldest live column or it is not.
+
+        The trade totals are NOT merged. `trade_count`, `trade_vol` and the
+        tape ring describe prints this buffer actually received, and the
+        replayed buffer's prints were already counted into the BarSeries by
+        the loader - adding them here would make the bookmap disagree with the
+        footprint about the same session, which is precisely the failure the
+        data-truth gate exists to catch.
+        """
+        if not other.order:
+            return {"added": 0, "reason": "replay empty"}
+        cut = self.order[0] if self.order else None
+        add = [b for b in other.order if cut is None or b < cut]
+        if not add:
+            return {"added": 0, "reason": "replay has nothing older"}
+        for b in add:
+            c = other.cols.get(b)
+            if c is not None:
+                self.cols[b] = c
+        self.order[:0] = add
+        # Honour the cap from the front, folding what falls off into the
+        # archive exactly as ordinary eviction does.
+        self.trim_to_cap()
+        self._all_cache = None
+        self._agg_cache.clear()
+        for agg in self._dirty:
+            self._dirty[agg] = None
+        self._version += 1
+        return {"added": len(add), "from": add[0], "to": add[-1]}
+
     def trim_to_cap(self, budget: int | None = None) -> int:
         """Evict columns above `max_cols`, at most `budget` of them.
 

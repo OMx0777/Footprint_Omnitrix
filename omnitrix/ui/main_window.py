@@ -144,6 +144,11 @@ BACKFILL_HOLD_MAX_EVENTS = 40_000
 # And a wall-clock bound, because a server that never answers must not hold the
 # chart forever. A 6.5 h single-symbol load measured ~12 s of ingest.
 BACKFILL_HOLD_MAX_S = 45.0
+# Whether the live queue is HELD while history loads. Off: the hold is what a
+# user experiences as a freeze, and prepend_history made it unnecessary. Kept
+# as a switch rather than deleted because the hold is the only thing that makes
+# a seam exact, and if a future loader needs that again this is where it lives.
+HOLD_FOR_BACKFILL = False
 # How far back a startup load reaches. L1 covers the session because the bars,
 # the footprints and the volume profile all come from it; L2 is capped to what
 # the 1400-column ring can physically hold, because fetching a full day of
@@ -279,8 +284,9 @@ class OmnitrixWindow(QMainWindow):
         # Symbols that have been on screen at least once. Only these earn the
         # demotion grace period - see _sync_hot.
         self._ever_hot: set = set()
-        # Startup backfill: "idle" until asked, "holding" while history loads,
-        # then "done" or "live_only". Only "holding" gates the drain.
+        # Startup backfill: "idle" until asked, "loading" while history is
+        # being fetched, then "done" or "live_only". Nothing gates the drain
+        # any more - see HOLD_FOR_BACKFILL.
         self._bf_state = "idle"
         # Session-history merge for symbols selected after startup.
         self._sess_fetchers: dict = {}
@@ -858,7 +864,7 @@ class OmnitrixWindow(QMainWindow):
     def _drain_and_draw(self) -> None:
         drained = 0
         q = self._event_q
-        if self._bf_state in ("arming", "holding"):
+        if self._bf_state in ("arming", "holding") and HOLD_FOR_BACKFILL:
             # HOLD THE DRAIN, NOT THE DRAW.
             #
             # The events stay in the queue and are drained in order once the
@@ -874,7 +880,7 @@ class OmnitrixWindow(QMainWindow):
             # frozen as far as anyone using it is concerned. The frame still
             # runs; only the queue is left alone.
             self._check_backfill_hold()
-            if self._bf_state in ("arming", "holding"):
+            if self._bf_state in ("arming", "holding") and HOLD_FOR_BACKFILL:
                 self._update_link()
                 self._redraw()
                 return
@@ -1644,7 +1650,11 @@ class OmnitrixWindow(QMainWindow):
         # holding the whole session; the difference has to be on screen, not
         # only in a log file nobody reads until something has already gone
         # wrong.
-        if self._bf_state in ("arming", "holding"):
+        # NOT gated on HOLD_FOR_BACKFILL. Whether the stream is held is an
+        # implementation choice; whether this chart yet holds the session is a
+        # fact about the data, and the user needs it either way. Gating the
+        # indicator on the hold hid it the moment the hold was removed.
+        if self._bf_state in ("arming", "holding", "loading"):
             txt += "   ⏳ loading history…"
             # ON THE PANES TOO. The toolbar is one line at the top of one
             # window; a trader looking at a four-chart grid needs to know which
@@ -2511,7 +2521,7 @@ class OmnitrixWindow(QMainWindow):
 
         Returns whether the hold was actually taken.
         """
-        if self._bf_state == "holding":
+        if self._bf_state in ("holding", "loading"):
             return False
         seam = dict(getattr(self.feed, "first_live_seq", {}) or {})
         if not seam or not getattr(self.feed, "replay_host", ""):
@@ -2529,7 +2539,20 @@ class OmnitrixWindow(QMainWindow):
         self._bf_symbols = list(syms)
         self._bf_since = time.monotonic()
         self._bf_dropped_at = self._dropped
-        self._bf_state = "holding"
+        # NO HOLD. This used to stop draining the live queue until every
+        # symbol's history had landed - up to BACKFILL_HOLD_MAX_S seconds of a
+        # terminal that repaints but shows nothing new, which is exactly what
+        # "the application freezes while it is downloading" describes. The
+        # server log showed the same symbol pulled three times in two minutes:
+        # a user killing and restarting a frozen app.
+        #
+        # The hold existed for a real reason - installing a replayed series
+        # over one that had already counted live trades would lose those
+        # trades. prepend_history removes that reason: it takes only bars
+        # STRICTLY OLDER than the oldest live bar, so the two can never
+        # describe the same bucket and the live stream can keep running the
+        # whole time. See _on_backfill_built.
+        self._bf_state = "loading"
         self._bf_done = set()
         self._bf_failed = set()
         self._bf_fetchers = {}
@@ -2578,9 +2601,42 @@ class OmnitrixWindow(QMainWindow):
             return
         old = self.series.get(symbol)
         if old is not None and old.bars:
-            log.warning("startup backfill for %s discarded: %d live bars were "
-                        "already counted, and replacing them would lose them",
-                        symbol, len(old.bars))
+            # MERGE, do not replace. Replacing would discard the live trades
+            # this series has already counted; taking only the strictly older
+            # bars keeps both, and is why the live stream no longer has to be
+            # held while the download runs.
+            try:
+                got = old.prepend_history(series)
+            except Exception:
+                log.exception("startup backfill: merging %s failed", symbol)
+                self._bf_done.add(symbol)
+                self._maybe_finish_backfill()
+                return
+            if got.get("added"):
+                try:
+                    pv = self.profiles.get(symbol)
+                    if pv is not None:
+                        pv.add_bars(old.bars[:got["added"]], old.base_tf_s)
+                except Exception:
+                    log.exception("startup backfill: profile merge failed "
+                                  "for %s", symbol)
+                self._dirty = True
+            # THE HEAT FIELD TOO. Merging only the bars left the bookmap with
+            # whatever the live stream had managed - ten columns on a cold
+            # start - next to a chart showing the whole session.
+            try:
+                live_buf = self.bookmaps.get(symbol)
+                if live_buf is None:
+                    self.bookmaps[symbol] = buf
+                    buf.set_hot(True)
+                    got["columns"] = len(buf.order)
+                else:
+                    got["columns"] = live_buf.prepend_columns(buf).get("added", 0)
+            except Exception:
+                log.exception("startup backfill: heat merge failed for %s",
+                              symbol)
+            log.info("startup backfill: %s merged %s", symbol, got)
+            self._sess_done.add(symbol)      # the session path need not repeat it
             self._bf_done.add(symbol)
             self._maybe_finish_backfill()
             return
@@ -2673,6 +2729,12 @@ class OmnitrixWindow(QMainWindow):
         except Exception:
             log.exception("session history: merging %s failed", symbol)
             return
+        try:
+            lb = self.bookmaps.get(symbol)
+            if lb is not None and buf is not None:
+                got["columns"] = lb.prepend_columns(buf).get("added", 0)
+        except Exception:
+            log.exception("session history: heat merge failed for %s", symbol)
         log.info("session history: %s merged %s", symbol, got)
         if got.get("added"):
             # THE PROFILE GETS IT TOO. It is fed only from the live drain loop,
@@ -2723,8 +2785,8 @@ class OmnitrixWindow(QMainWindow):
         self._maybe_finish_backfill()
 
     def _maybe_finish_backfill(self) -> None:
-        """Release the held stream once every symbol has answered."""
-        if self._bf_state != "holding":
+        """Mark the load complete once every symbol has answered."""
+        if self._bf_state not in ("holding", "loading"):
             return
         if not set(self._bf_symbols) <= self._bf_done:
             return
@@ -2794,7 +2856,7 @@ class OmnitrixWindow(QMainWindow):
 
     def release_backfill(self) -> None:
         """History is in. Let the held live events through, in order."""
-        if self._bf_state != "holding":
+        if self._bf_state not in ("holding", "loading"):
             return
         self._bf_state = "done"
         log.info("startup backfill complete: releasing %d held events",
