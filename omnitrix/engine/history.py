@@ -354,10 +354,47 @@ class StartupFetcher(HistoryFetcher):
         for tr in trades:
             series.add_trade(tr)
             buf.add_trade(tr)
+
+        # ONE BOOK PER COLUMN. The buffer buckets sweeps into col_dt-second
+        # columns and a later sweep in the same column REPLACES the earlier
+        # one - so ingesting every snapshot builds a full PriceLadder for each
+        # and throws almost all of them away.
+        #
+        # From the operator's server log: ch2 9412740..10517322 for SPY is
+        # 1.1 MILLION batches over a 23-minute window - roughly 800 sweeps a
+        # second against columns one second wide. 799 of every 800 ladders
+        # were built and discarded, on a worker thread, holding the GIL for
+        # tens of seconds while the terminal sat unable to draw. That is the
+        # "as soon as the previous data is loaded it just gets stuck".
+        #
+        # Keeping the last per column is not an approximation: it is exactly
+        # what the buffer would have retained anyway.
+        dt = buf.col_dt
+        last: dict[int, list] = {}
         for bk in books:
+            b = int((bk.ts_ms / 1000.0) // dt)
+            slot = last.get(b)
+            if slot is None:
+                last[b] = [bk, 1]
+            else:
+                slot[0] = bk
+                slot[1] += 1
+        collapsed = 0
+        for b in sorted(last):
+            bk, n = last[b]
             buf.add_book(bk)
+            if n > 1:
+                # `sweeps` means "how many sweeps were really measured in this
+                # column", and >1 has always meant several collapsed with only
+                # the last surviving. Skipping the work must not change what
+                # the column reports about itself.
+                col = buf.cols.get(b)
+                if col is not None:
+                    col.sweeps += n - 1
+                collapsed += n - 1
         return series, buf, {
             "trades": len(trades), "books": len(books),
+            "books_ingested": len(last), "books_collapsed": collapsed,
             "bars": len(series.bars), "columns": len(buf.order),
             "dropped": series.dropped_late,
             "volume": series.sess_volume,
