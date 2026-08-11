@@ -483,6 +483,15 @@ class BookmapBuffer:
         add = [b for b in other.order if cut is None or b < cut]
         if not add:
             return {"added": 0, "reason": "replay has nothing older"}
+        # ONLY WHAT SURVIVES THE CAP. Splicing a whole replayed day in and then
+        # trimming it back to max_cols runs the archive fold - 30 us a column -
+        # over thousands of columns synchronously, on the frame thread, for
+        # columns that are discarded in the same call.
+        room = self.max_cols - len(self.order)
+        if room <= 0:
+            return {"added": 0, "reason": "no room under max_cols"}
+        if len(add) > room:
+            add = add[-room:]
         for b in add:
             c = other.cols.get(b)
             if c is not None:

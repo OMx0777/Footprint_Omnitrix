@@ -9,6 +9,8 @@ Volume Profile answers "where did size trade?"; Market Profile (TPO) answers
 
 from __future__ import annotations
 
+import numpy as np
+
 from .model import split_size, Trade, Aggressor
 from .instruments import Instruments
 
@@ -64,29 +66,65 @@ class SessionProfile:
         split - re-deriving is how four consumers ended up disagreeing about
         the same print in the first place.
 
-        TPO brackets come from the bar's own start_ts, which is market time,
-        not arrival time - a replayed bar belongs to the bracket it traded in.
+        VECTORISED, because this runs on the GUI thread the moment a merge
+        lands. Walking every price level of every bar in Python measured
+        194 ms for one 6.5-hour session, and a four-chart grid merges four of
+        them - which is the stall reported as "freezing after past data
+        loads". Bars hold sorted int32 arrays, so the whole batch is summed
+        with bincount and only the DISTINCT price levels are touched in
+        Python: a few hundred instead of tens of thousands.
+
+        TPO brackets come from each bar's own start_ts, which is market time,
+        so a replayed bar lands in the bracket it actually traded in.
 
         Returns the volume added, so a caller can report what was gained.
         """
-        added = 0
+        if not bars:
+            return 0
+        # Group the batch by TPO bracket; a session is a dozen or so, and the
+        # bracket is the only per-bar thing the profile needs.
+        by_bracket: dict[int, list] = {}
         for bar in bars:
-            ti_a, sell_a, buy_a = bar.arrays()
-            if not ti_a.size:
+            by_bracket.setdefault(bar.start_ts // self.tpo_secs, []).append(bar)
+
+        added = 0
+        for bracket, group in by_bracket.items():
+            tis, sells, buys = [], [], []
+            for bar in group:
+                t, sv, bv = bar.arrays()
+                if t.size:
+                    tis.append(t)
+                    sells.append(sv)
+                    buys.append(bv)
+            if not tis:
                 continue
-            bracket = bar.start_ts // self.tpo_secs
+            ti = tis[0] if len(tis) == 1 else np.concatenate(tis)
+            sv = sells[0] if len(sells) == 1 else np.concatenate(sells)
+            bv = buys[0] if len(buys) == 1 else np.concatenate(buys)
+            # bincount over a zero-based index is far cheaper than a dict per
+            # level; the offset makes negative tick indices safe.
+            lo = int(ti.min())
+            idx = (ti - lo).astype(np.intp)
+            n = int(idx.max()) + 1
+            s_tot = np.bincount(idx, weights=sv.astype(np.float64), minlength=n)
+            b_tot = np.bincount(idx, weights=bv.astype(np.float64), minlength=n)
+            nz = np.nonzero(s_tot + b_tot)[0]
             self.brackets.add(bracket)
-            for ti, sv, bv in zip(ti_a.tolist(), sell_a.tolist(),
-                                  buy_a.tolist()):
-                if bv:
-                    self.buy[ti] = self.buy.get(ti, 0) + bv
-                if sv:
-                    self.sell[ti] = self.sell.get(ti, 0) + sv
-                added += bv + sv
-                s_ = self.tpo.get(ti)
-                if s_ is None:
-                    s_ = self.tpo[ti] = set()
-                s_.add(bracket)
+            tpo = self.tpo
+            buy_d, sell_d = self.buy, self.sell
+            for k in nz.tolist():
+                key = lo + k
+                b_ = int(b_tot[k])
+                s_ = int(s_tot[k])
+                if b_:
+                    buy_d[key] = buy_d.get(key, 0) + b_
+                if s_:
+                    sell_d[key] = sell_d.get(key, 0) + s_
+                added += b_ + s_
+                st = tpo.get(key)
+                if st is None:
+                    st = tpo[key] = set()
+                st.add(bracket)
         if added:
             self.total += added
             self._version += 1

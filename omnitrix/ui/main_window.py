@@ -2556,6 +2556,12 @@ class OmnitrixWindow(QMainWindow):
         self._bf_done = set()
         self._bf_failed = set()
         self._bf_fetchers = {}
+        # CLAIM THEM, so the session path does not fetch the same symbols at
+        # the same time. The server log showed NVDA pulled twice concurrently -
+        # two sockets, two 15.5 MB transfers, two full-day model builds holding
+        # the GIL - because _sync_hot asks for the history of every symbol on
+        # screen and the startup backfill was already asking for exactly those.
+        self._sess_done.update(syms)
         now_ms = int(time.time() * 1000)
         day_ms = now_ms - int(BACKFILL_SESSION_H * 3600 * 1000)
         # L2 only as far back as the column ring can hold - anything older
@@ -2682,6 +2688,8 @@ class OmnitrixWindow(QMainWindow):
             return False
         if symbol in self._sess_fetchers or symbol in self._sess_done:
             return False
+        if symbol in getattr(self, "_bf_fetchers", {}):
+            return False        # the startup backfill owns this one
         # CAP THE CONCURRENCY, QUEUE THE REST.
         #
         # Each fetch is a thread pulling a session over TCP - measured on the

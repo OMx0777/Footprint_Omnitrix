@@ -590,6 +590,17 @@ class BarSeries:
         add = [b for b in other.bars if cut is None or b.start_ts < cut]
         if not add:
             return {"added": 0, "reason": "replay has nothing older"}
+        # ONLY WHAT WILL BE KEPT. A full-day replay can carry far more bars
+        # than max_bars allows, and splicing them all in only to evict them a
+        # moment later is work done on the GUI thread for a result nobody can
+        # ever see - and every one of those bars is also walked by the profile
+        # merge. Take the NEWEST of the older bars, which is the part that
+        # survives the cap anyway.
+        room = self.max_bars - len(self.bars)
+        if room <= 0:
+            return {"added": 0, "reason": "no room under max_bars"}
+        if len(add) > room:
+            add = add[-room:]
 
         self.bars[:0] = add
         for b in add:
