@@ -298,8 +298,8 @@ feed2._on_l1 = lambda c, o: None
 lost_state = {"n": 0}
 feed2.on_disconnect = lambda: lost_state.__setitem__("n", lost_state["n"] + 1)
 feed2.gaps.observe(wire.CH_L2, 10)
-with feed2._pending_lock:
-    feed2._pending.append((wire.CH_L2, 11, 14))
+with feed2._repair_lock:
+    feed2._repair_q.append((wire.CH_L2, 11, 14))
 feed2._repair_pending()
 check("with no repair available the book state is DROPPED",
       lost_state["n"] == 1 and feed2.unrepaired == 1,

@@ -237,8 +237,26 @@ class MulticastFeed(TakionDecoder):
         self.connected = {"multicast": False, "replay": False}
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
-        self._pending: list[tuple[int, int, int]] = []   # (ch, from, to)
-        self._pending_lock = threading.Lock()
+        # NAMED FOR WHAT IT IS, and deliberately not `_pending`.
+        #
+        # MulticastFeed subclasses TakionDecoder, which already owns a
+        # `_pending` - the trades it holds back until the exchange clock offset
+        # is known, as (Trade, raw_ts) PAIRS. This list held (channel, from,
+        # to) TRIPLES, and the subclass attribute silently replaced the
+        # parent's.
+        #
+        # Nothing went wrong until the first gap. Then a triple landed in the
+        # list the decoder unpacks as pairs:
+        #
+        #     File "takion_decode.py", line 423, in _on_l1
+        #     ValueError: too many values to unpack (expected 2, got 3)
+        #
+        # raised on the receive thread, which stopped. The terminal stayed
+        # perfectly responsive - 21 fps, empty queue, nothing dropped - and
+        # never received another byte. That is the "it just gets stuck,
+        # nothing updates".
+        self._repair_q: list[tuple[int, int, int]] = []   # (ch, from, to)
+        self._repair_lock = threading.Lock()
         self.repairs = 0
         self.repair_bytes = 0
         self.unrepaired = 0
@@ -399,21 +417,21 @@ class MulticastFeed(TakionDecoder):
             # here - the repair is about to restore precisely those bytes, and
             # throwing the book away first would discard state the replay is
             # going to rebuild on top of.
-            with self._pending_lock:
+            with self._repair_lock:
                 # Bounded. If loss is bad enough that repairs cannot keep up,
                 # queueing every range forever turns a bandwidth problem into
                 # an unbounded memory one, and the repairs get further behind
                 # the longer the list is. Past this point the honest move is to
                 # drop the state and let the next sweep rebuild it.
-                if len(self._pending) >= MAX_PENDING_REPAIRS:
+                if len(self._repair_q) >= MAX_PENDING_REPAIRS:
                     self.unrepaired += 1
-                    self._pending.clear()
+                    self._repair_q.clear()
                     log.warning("gap repair is not keeping up; dropping book "
                                 "state rather than queueing more")
                     (self.on_disconnect() if ch == wire.CH_L2
                      else self.on_l1_disconnect())
                 else:
-                    self._pending.append((ch, seq - missed, seq - 1))
+                    self._repair_q.append((ch, seq - missed, seq - 1))
             log.warning("multicast gap: ch%d missing %d..%d (%d batches)",
                         ch, seq - missed, seq - 1, missed)
         body = bytearray(dg[wire.HEADER_SIZE:])
@@ -588,10 +606,10 @@ class MulticastFeed(TakionDecoder):
         return off
 
     def _repair_pending(self) -> None:
-        with self._pending_lock:
-            if not self._pending:
+        with self._repair_lock:
+            if not self._repair_q:
                 return
-            todo, self._pending = self._pending, []
+            todo, self._repair_q = self._repair_q, []
         if not self.replay_host:
             # Nothing can repair it, so the state it invalidated must go.
             # An honest hole beats a phantom wall.

@@ -150,8 +150,8 @@ for i in range(MAX_PENDING_REPAIRS + 20):
     # every other sequence, so each one is a fresh gap
     feed._on_datagram(batch(3 + i * 2))
 check("the pending-repair queue is bounded",
-      len(feed._pending) <= MAX_PENDING_REPAIRS,
-      f"{len(feed._pending)} queued, ceiling {MAX_PENDING_REPAIRS}")
+      len(feed._repair_q) <= MAX_PENDING_REPAIRS,
+      f"{len(feed._repair_q)} queued, ceiling {MAX_PENDING_REPAIRS}")
 check("...and hitting the ceiling drops book state rather than queueing more",
       dropped["n"] >= 1,
       "unbounded queueing turns sustained loss into an unbounded memory problem")
