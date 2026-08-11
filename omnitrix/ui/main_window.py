@@ -986,6 +986,31 @@ class OmnitrixWindow(QMainWindow):
 
         # Refresh the live indicator ~2x/sec even when no data is flowing, so
         # "waiting for Takion" is visible before the first tick arrives.
+        # A HEARTBEAT IN THE LOG, so a stuck terminal says WHY.
+        #
+        # Three rounds of this have been diagnosed from a server log that shows
+        # what was requested and nothing about what the client then did with
+        # it. When the app "sticks", the question is always the same and has
+        # never been answerable from outside: is the GUI thread busy, is the
+        # feed still delivering, is the queue backing up, or is a loader still
+        # running? One line every few seconds answers all four.
+        self._hb = getattr(self, "_hb", 0) + 1
+        if self._hb % 150 == 0:
+            now = time.monotonic()
+            prev = getattr(self, "_hb_at", now)
+            self._hb_at = now
+            fps = 150.0 / max(now - prev, 1e-6)
+            fd = self.feed
+            log.info("health: %.1f fps | queue %d | dropped %d | bad %d | "
+                     "feed lost %s repaired %s | loaders bf=%d sess=%d q=%d | "
+                     "state=%s | syms %d",
+                     fps, len(self._event_q), self._dropped,
+                     self._dropped_bad,
+                     getattr(getattr(fd, "gaps", None), "lost", "-"),
+                     getattr(fd, "repaired", "-"),
+                     len(getattr(self, "_bf_fetchers", {})),
+                     len(self._sess_fetchers), len(self._sess_queue),
+                     self._bf_state, len(self.series))
         self._link_tick = getattr(self, "_link_tick", 0) + 1
         if self._link_tick % 15 == 0:
             self._update_link()
